@@ -54,7 +54,7 @@ const generateProductsTsv = async (exportId) => {
     const header = 'Naziv\tKategorija\n';
     const tsvRows = products.map(p => {
         // Find the category that matches the requested exportId
-        const categoryInfo = p.categories?.find(cat => cat.exportId === exportId);
+        const categoryInfo = p.ai_categories?.find(cat => cat.exportId === exportId);
         const categoryName = categoryInfo ? categoryInfo.categoryName : '';
         return `${p.product_name}\t${categoryName}`;
     });

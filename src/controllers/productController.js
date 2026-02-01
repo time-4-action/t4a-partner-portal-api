@@ -24,7 +24,8 @@ exports.getProductByIdentifier = async (req, res) => {
 
 exports.getProductsAsTsv = async (req, res) => {
     try {
-        const tsv = await productService.generateProductsTsv();
+        const { exportId } = req.params;
+        const tsv = await productService.generateProductsTsv(exportId);
 
         res.header('Content-Type', 'text/tab-separated-values');
         res.header('Content-Disposition', 'attachment; filename="products.tsv"');

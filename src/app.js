@@ -21,14 +21,11 @@ app.set('trust proxy', true);
 app.use(express.static(path.join(__dirname, '..', 'public')));
 
 // API Routes
+const healthRoutes = require('./routes/healthRoutes');
+// Mount public health check route
+app.use('/api/export/health', healthRoutes);
 // Mount export-related routes under the /api/export path
 app.use('/api/export', exportRoutes);
-
-// Health Check Endpoint
-// Provides a simple endpoint to verify that the API is running and responsive
-app.get('/', (req, res) => {
-    res.send('Automation API is running...');
-});
 
 // Export the configured Express app and the job initialization function for use by the main server file
 module.exports = { app, initJobs };
