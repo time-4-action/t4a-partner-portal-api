@@ -17,7 +17,8 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "start": "cross-env NODE_ENV=production node index.js",
-    "dev": "cross-env NODE_ENV=development node index.js"
+    "dev": "cross-env NODE_ENV=development node index.js",
+    "docs": "jsdoc2md src/**/*.js > README.md"
   },
   "keywords": [],
   "dependencies": {
@@ -36,6 +37,7 @@
   "devDependencies": {
     "cross-env": "^7.0.3",
     "docdash": "^2.0.2",
-    "jsdoc": "^4.0.5"
+    "jsdoc": "^4.0.5",
+    "jsdoc-to-markdown": "^9.1.3"
   }
 }

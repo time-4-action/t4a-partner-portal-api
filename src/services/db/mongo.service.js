@@ -1,6 +1,10 @@
 const { MongoClient } = require('mongodb');
 
 /**
+ * @typedef {mongodb.Db} MongoDb
+ */
+
+/**
  * MongoDB connection URI.
  * @type {string}
  */
@@ -19,8 +23,7 @@ if (!mongoUri || !dbName) {
 // This is necessary if the user's credentials are not stored in the 'admin' database.
 const client = new MongoClient(mongoUri, { authSource: dbName });
 /**
- * The database instance.
- * @type {import('mongodb').Db}
+ * @type {MongoDb}
  */
 let db;
 
@@ -45,7 +48,7 @@ const connectToDb = async () => {
 
 /**
  * Returns the database instance. Throws an error if not connected.
- * @returns {import('mongodb').Db} The MongoDB database instance.
+ * @returns {MongoDb} The MongoDB database instance.
  */
 const getDb = () => {
     if (!db) {
