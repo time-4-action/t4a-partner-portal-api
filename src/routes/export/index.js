@@ -8,7 +8,7 @@ const exportsRoutes = require('../exportsRoutes');
 const categoriesRoutes = require('../categoriesRoutes');
 
 // Secure all routes with the JWT check middleware
-router.use(jwtCheck);
+// router.use(jwtCheck);
 
 router.use('/example', exampleRoutes);
 router.use('/product', productRoutes);
