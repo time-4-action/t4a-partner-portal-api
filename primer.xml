@@ -1,0 +1,58 @@
+<products>
+  <product>
+    <id>PATRIK_S_WAVE</id>
+    <name>Patrik S-Wave</name>
+
+    <descriptionSI><![CDATA[
+<p>GROWNUPS SURF REAL WAVES &amp; KIDS LEARN HOW TO WINDSURF.</p>
+    ]]></descriptionSI>
+
+    <descriptionEN><![CDATA[
+<p>GROWNUPS SURF REAL WAVES &amp; KIDS LEARN HOW TO WINDSURF.</p>
+    ]]></descriptionEN>
+
+    <features>
+      <feature>
+        <name>Category</name>
+        <value>Katalog / SUP</value>
+        <description></description>
+      </feature>
+    </features>
+
+    <images>
+      <image>https://www.patrikinternational.com/assets/shop_product/s-wave-9-2.jpg</image>
+      <image>https://www.patrikinternational.com/assets/shop_product_pic/s-wave-9-2-action1.jpg</image>
+      <image>https://www.patrikinternational.com/assets/shop_product_pic/patrik-inflatable-sup1.jpg</image>
+      <image>https://www.patrikinternational.com/assets/shop_product_pic/patrik-inflatable-sup3.jpg</image>
+    </images>
+
+    <variants>
+      <variant>
+        <id>P03200001092</id>
+        <ean>4262431692971</ean>
+        <name>Patrik S-Wave 9'2</name>
+        <stock>2</stock>
+        <recommendedRetailPriceWithVat>799.00</recommendedRetailPriceWithVat>
+
+        <images>
+          <image>https://www.patrikinternational.com/assets/shop_product/s-wave-9-2.jpg</image>
+        </images>
+
+        <!-- če ima varianta specifične lastnosti, jih daš tukaj -->
+        <features>
+          <feature>
+            <name>Volumen deske [L]</name>
+            <value>106</value>
+            <description>106 litrov</description>
+          </feature>
+          <feature>
+            <name>Teža</name>
+            <value>1.6</value>
+            <description>1.6 kg</description>
+          </feature>
+        </features>
+      </variant>
+    </variants>
+
+  </product>
+</products>

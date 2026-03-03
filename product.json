@@ -1,0 +1,86 @@
+{
+  "_id": {
+    "$oid": "69764c8296a395a849012c0e"
+  },
+  "code": "PATRIK_S_WAVE",
+  "active": true,
+  "archived": false,
+  "cart": true,
+  "categories": [
+    "SPECIALS"
+  ],
+  "child_products": [
+    {
+      "code": "P03200001092",
+      "ean_code": "4262431692971",
+      "product_name": "Patrik S-Wave 9'2",
+      "token": "p03200001092",
+      "short_description": "",
+      "detailed_description": "",
+      "categories": [],
+      "images": [
+        "https://www.patrikinternational.com/assets/shop_product/s-wave-9-2.jpg"
+      ],
+      "published": true,
+      "archived": false,
+      "cart": true,
+      "mission": false,
+      "new": false,
+      "recomended": false,
+      "stock_amount": 2,
+      "pricelist": [
+        {
+          "name": "RRP 2025",
+          "valid_from": {
+            "$date": "2025-08-07T22:00:00.000Z"
+          },
+          "price": 654.92,
+          "vat": 22
+        },
+        {
+          "name": "RRP 2026",
+          "valid_from": {
+            "$date": "2025-10-31T22:00:00.000Z"
+          },
+          "price": 799,
+          "vat": 0
+        }
+      ]
+    }
+  ],
+  "createdAt": {
+    "$date": "2026-01-25T17:01:54.349Z"
+  },
+  "detailed_description": "<p>Our line of SUPs covers inflatable SUPs (iSUP) of superior quality and a advanced and computer-optimised high-accuracy construction that makes our boards <strong>stiffer and stronger</strong> than other boards on the market. Our \"control-flex\" construction technology was developed over four years of intense testing and non-stop R&amp;D in close cooperation with our production factory which is highly specialised in high-performance dinghys, rafts and ribs.</p>\n<p>In this unique construction we are able to reproduce different <strong>bottom shapes on inflatable SUPs</strong> with umatched precision. This allows us to give a Vee bottom to some of our boards in the range and a single concave depending on the shape concept.</p>\n<p>All inflatable boards come with a wheeled multi compartment bag and a 3-piece paddle that fits into this bag. Switchable 2-way Pump, Fin and Repairkit included.</p>",
+  "ean_code": "",
+  "images": [
+    "https://www.patrikinternational.com/assets/shop_product/s-wave-9-2.jpg",
+    "https://www.patrikinternational.com/assets/shop_product_pic/s-wave-9-2-action1.jpg",
+    "https://www.patrikinternational.com/assets/shop_product_pic/patrik-inflatable-sup1.jpg",
+    "https://www.patrikinternational.com/assets/shop_product_pic/patrik-inflatable-sup3.jpg"
+  ],
+  "mission": false,
+  "new": true,
+  "pricelist": [],
+  "product_name": "Patrik S-Wave",
+  "published": true,
+  "recomended": false,
+  "short_description": "<p>GROWNUPS SURF REAL WAVES &amp; KIDS LEARN HOW TO WINDSURF.</p>",
+  "stock_amount": 0,
+  "token": "patrik-s-wave",
+  "updatedAt": {
+    "$date": "2026-02-06T15:55:40.528Z"
+  },
+  "ai_categories": [
+    {
+      "exportId": "697683072c3bb2b9b7a91d5c",
+      "categoryId": "697686c32c3bb2b9b7a91ea6",
+      "categoryName": "Katalog / SUP"
+    },
+    {
+      "exportId": "69768c2d2c3bb2b9b7a91f00",
+      "categoryId": "69768c752c3bb2b9b7a91f03",
+      "categoryName": "Windsurf / Boards"
+    }
+  ]
+}

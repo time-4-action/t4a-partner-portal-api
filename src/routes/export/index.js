@@ -6,6 +6,8 @@ const exampleRoutes = require('../exampleRoutes');
 const productRoutes = require('../productRoutes');
 const exportsRoutes = require('../exportsRoutes');
 const categoriesRoutes = require('../categoriesRoutes');
+const customExportRoutes = require('../customExportRoutes');
+const rechargeRoutes = require('../rechargeRoutes');
 
 // Secure all routes with the JWT check middleware
 // router.use(jwtCheck);
@@ -14,6 +16,8 @@ router.use('/example', exampleRoutes);
 router.use('/product', productRoutes);
 router.use('/exports', exportsRoutes);
 router.use('/categories', categoriesRoutes);
+router.use('/custom-export', customExportRoutes);
+router.use('/recharge', rechargeRoutes);
 
 // Custom error handler for JWT authentication errors
 router.use((err, req, res, next) => {
