@@ -1,12 +1,2 @@
-const cron = require('node-cron');
-const { pnvProductSyncJob } = require("./pnvProductsSync.job");
-
-
-// Schedule to run
-const setupPnvProductSyncJob = () => {
-    cron.schedule(process.env.PRODUCTS_DOWNLOAD_SCHEDULE, async () => {
-        pnvProductSyncJob();
-    });
-};
-
-module.exports = setupPnvProductSyncJob;
+// Scheduling has been moved to n8n.
+// Trigger the sync via POST /api/export/webhooks/sync/pnv with x-api-key header.

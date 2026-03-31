@@ -34,7 +34,11 @@ const handleError = (res, error) => {
  */
 exports.createConfig = async (req, res) => {
     try {
-        const config = await customExportService.createExportConfig(req.body);
+        const ownerContext = {
+            sub: req.auth?.payload?.sub || null,
+            email: req.auth?.payload?.email || null
+        };
+        const config = await customExportService.createExportConfig(req.body, ownerContext);
         res.status(201).json({ success: true, data: config });
     } catch (error) {
         handleError(res, error);
@@ -61,7 +65,12 @@ exports.getAllConfigs = async (req, res) => {
             options.sort = { [sortField]: sortOrder };
         }
 
-        const configs = await customExportService.getAllExportConfigs(options);
+        const authContext = {
+            sub: req.auth?.payload?.sub,
+            email: req.auth?.payload?.email
+        };
+
+        const configs = await customExportService.getAllExportConfigs(options, authContext);
         res.json({ success: true, count: configs.length, data: configs });
     } catch (error) {
         handleError(res, error);
@@ -139,6 +148,22 @@ exports.generateJson = async (req, res) => {
     try {
         const data = await customExportService.generateJsonExport(req.params.id);
         res.json(data);
+    } catch (error) {
+        handleError(res, error);
+    }
+};
+
+/**
+ * GET /custom-export/:id/xml - Generate XML export
+ */
+exports.generateXml = async (req, res) => {
+    try {
+        const { xml, filename } = await customExportService.generateXmlExport(req.params.id);
+        res.setHeader('Content-Type', 'application/xml; charset=utf-8');
+        if (req.query.download === 'true') {
+            res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+        }
+        res.send(xml);
     } catch (error) {
         handleError(res, error);
     }

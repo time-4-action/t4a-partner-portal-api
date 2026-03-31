@@ -1,60 +1,91 @@
 const express = require('express');
 const router = express.Router();
+
+const jwtCheck = require('../middleware/auth0');
+const requireExportRole = require('../middleware/requireExportRole');
+const dualAuth = require('../middleware/dualAuth');
+const { requireExportAccess, requireOwner } = require('../middleware/requireExportAccess');
+
 const customExportController = require('../controllers/customExportController');
+const apiKeyController = require('../controllers/apiKeyController');
+const accessController = require('../controllers/accessController');
 
-/**
- * @route   POST /custom-export
- * @desc    Create a new export configuration
- * @access  Public (or Protected based on your auth setup)
- */
-router.post('/', customExportController.createConfig);
+// ─── JWT-only CRUD (require 'export' role) ────────────────────────────────────
 
-/**
- * @route   GET /custom-export
- * @desc    Get all export configurations
- * @query   active - Filter by active status (default: true)
- * @query   preset - Filter by preset type (shopify|simple|detailed|inventory)
- * @query   sort - Sort field (prefix with - for descending, default: -createdAt)
- * @query   limit - Max results (default: 50)
- * @access  Public (or Protected based on your auth setup)
- */
-router.get('/', customExportController.getAllConfigs);
+router.post('/',
+    jwtCheck, requireExportRole,
+    customExportController.createConfig
+);
 
-/**
- * @route   GET /custom-export/:id
- * @desc    Get a single export configuration by ID
- * @access  Public (or Protected based on your auth setup)
- */
-router.get('/:id', customExportController.getConfigById);
+router.get('/',
+    jwtCheck, requireExportRole,
+    customExportController.getAllConfigs
+);
 
-/**
- * @route   PUT /custom-export/:id
- * @desc    Update an export configuration
- * @access  Public (or Protected based on your auth setup)
- */
-router.put('/:id', customExportController.updateConfig);
+router.get('/:id',
+    jwtCheck, requireExportRole, requireExportAccess,
+    customExportController.getConfigById
+);
 
-/**
- * @route   DELETE /custom-export/:id
- * @desc    Delete an export configuration (soft delete by default)
- * @query   hard - If true, permanently delete the configuration
- * @access  Public (or Protected based on your auth setup)
- */
-router.delete('/:id', customExportController.deleteConfig);
+router.put('/:id',
+    jwtCheck, requireExportRole, requireExportAccess, requireOwner,
+    customExportController.updateConfig
+);
 
-/**
- * @route   GET /custom-export/:id/csv
- * @desc    Generate and download CSV export based on configuration
- * @query   download - If true, sets Content-Disposition for file download
- * @access  Public (or Protected based on your auth setup)
- */
-router.get('/:id/csv', customExportController.generateCsv);
+router.delete('/:id',
+    jwtCheck, requireExportRole, requireExportAccess, requireOwner,
+    customExportController.deleteConfig
+);
 
-/**
- * @route   GET /custom-export/:id/json
- * @desc    Generate JSON export based on configuration
- * @access  Public (or Protected based on your auth setup)
- */
-router.get('/:id/json', customExportController.generateJson);
+// ─── Dual-auth download endpoints (JWT with role OR valid API key) ────────────
+
+router.get('/:id/csv',
+    dualAuth, requireExportAccess,
+    customExportController.generateCsv
+);
+
+router.get('/:id/json',
+    dualAuth, requireExportAccess,
+    customExportController.generateJson
+);
+
+router.get('/:id/xml',
+    dualAuth, requireExportAccess,
+    customExportController.generateXml
+);
+
+// ─── API key management (JWT only, owner only) ────────────────────────────────
+
+router.get('/:id/keys',
+    jwtCheck, requireExportRole, requireExportAccess, requireOwner,
+    apiKeyController.listKeys
+);
+
+router.post('/:id/keys',
+    jwtCheck, requireExportRole, requireExportAccess, requireOwner,
+    apiKeyController.createKey
+);
+
+router.delete('/:id/keys/:keyId',
+    jwtCheck, requireExportRole, requireExportAccess, requireOwner,
+    apiKeyController.revokeKey
+);
+
+// ─── Access management (JWT only, owner only) ─────────────────────────────────
+
+router.get('/:id/access',
+    jwtCheck, requireExportRole, requireExportAccess, requireOwner,
+    accessController.listAccess
+);
+
+router.post('/:id/access',
+    jwtCheck, requireExportRole, requireExportAccess, requireOwner,
+    accessController.grantAccess
+);
+
+router.delete('/:id/access/:email',
+    jwtCheck, requireExportRole, requireExportAccess, requireOwner,
+    accessController.revokeAccess
+);
 
 module.exports = router;

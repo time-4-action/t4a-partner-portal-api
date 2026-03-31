@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mkdir -p scripts docs)",
+      "Bash(mv build-and-push.cmd build-and-push.sh scripts/)",
+      "Bash(mv primer.xml product.json data/)",
+      "Bash(mv API_ENDPOINT.md docs/)"
+    ]
+  }
+}

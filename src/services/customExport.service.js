@@ -175,9 +175,10 @@ const validateConfig = (data, isUpdate = false) => {
 /**
  * Creates a new export configuration
  * @param {Object} data - Configuration data
+ * @param {Object} ownerContext - { sub, email } from Auth0 JWT payload
  * @returns {Promise<Object>} Created configuration
  */
-const createExportConfig = async (data) => {
+const createExportConfig = async (data, ownerContext = {}) => {
     const validation = validateConfig(data);
     if (!validation.valid) {
         const error = new Error('Validation failed');
@@ -219,6 +220,12 @@ const createExportConfig = async (data) => {
             enabled: Boolean(p.enabled !== undefined ? p.enabled : true),
             priority: p.priority ?? idx
         })),
+        owner: {
+            sub: ownerContext.sub || null,
+            email: ownerContext.email || null
+        },
+        accessList: [],
+        apiKeys: [],
         isActive: true,
         createdBy: data.createdBy || null,
         createdAt: now,
@@ -230,15 +237,36 @@ const createExportConfig = async (data) => {
 };
 
 /**
- * Retrieves all export configurations
+ * Retrieves all export configurations visible to the given authContext.
  * @param {Object} options - Query options
+ * @param {Object} authContext - { sub, email } from Auth0 JWT payload
  * @returns {Promise<Array>} Array of configurations
  */
-const getAllExportConfigs = async (options = {}) => {
+const getAllExportConfigs = async (options = {}, authContext = {}) => {
     const db = getDb();
     const collection = db.collection(COLLECTION_NAME);
 
-    const query = { isActive: options.active !== false };
+    const { sub, email } = authContext;
+
+    // Build ownership/access filter
+    const accessConditions = [
+        { 'owner.sub': null },          // legacy docs accessible to all export-role users
+        { 'owner.sub': { $exists: false } }  // docs without owner field
+    ];
+
+    if (sub) {
+        accessConditions.push({ 'owner.sub': sub });
+        accessConditions.push({ 'accessList.sub': sub });
+    }
+    if (email) {
+        accessConditions.push({ 'accessList.email': email });
+    }
+
+    const query = {
+        isActive: options.active !== false,
+        $or: accessConditions
+    };
+
     if (options.preset) {
         query.preset = options.preset;
     }
@@ -491,9 +519,13 @@ const applyFilters = (products, filters) => {
             if (!product.ai_categories?.some(c => c.exportId === filters.aiExportId)) return false;
         }
 
-        // AI Category filter
+        // AI Category filter — prefix match: selecting "A" includes "A / B", "A / B / C", etc.
         if (filters.aiCategory !== 'all') {
-            if (!product.ai_categories?.some(c => c.categoryId === filters.aiCategory)) return false;
+            const prefix = filters.aiCategory;
+            if (!product.ai_categories?.some(c =>
+                (c.categoryName === prefix || c.categoryName?.startsWith(prefix + ' / ')) &&
+                (filters.aiExportId === 'all' || c.exportId === filters.aiExportId)
+            )) return false;
         }
 
         // Boolean flags
@@ -648,7 +680,7 @@ const generateCsvExport = async (id) => {
 };
 
 /**
- * Generates JSON export for a configuration
+ * Generates JSON export for a configuration — respects selectedFields and all filters
  * @param {string} id - Configuration ID
  * @returns {Promise<Object>} JSON export data
  */
@@ -665,6 +697,15 @@ const generateJsonExport = async (id) => {
     const filteredProducts = applyFilters(products, config.filters);
     const rows = generateExportRows(filteredProducts, config);
 
+    // Map field keys to their human-readable column headers
+    const data = rows.map(row => {
+        const obj = {};
+        for (const field of config.selectedFields) {
+            obj[COLUMN_HEADERS[field] || field] = row[field];
+        }
+        return obj;
+    });
+
     return {
         success: true,
         exportName: config.name,
@@ -673,9 +714,139 @@ const generateJsonExport = async (id) => {
         preset: config.preset,
         totalProducts: filteredProducts.length,
         totalRows: rows.length,
-        columns: config.selectedFields,
-        data: rows
+        columns: config.selectedFields.map(f => COLUMN_HEADERS[f] || f),
+        data
     };
+};
+
+/**
+ * Escapes a value for XML text content
+ * @param {*} value - Value to escape
+ * @returns {string} Escaped string
+ */
+const escapeXml = (value) => {
+    if (value === null || value === undefined) return '';
+    return String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&apos;');
+};
+
+// Fields whose values may contain HTML — wrap in CDATA instead of escaping
+const HTML_FIELDS = new Set(['body_html', 'short_description', 'detailed_description']);
+
+/**
+ * Generates XML export for a configuration — hierarchical structure matching primer.json:
+ * code, token, product_name, short_description, detailed_description, category_name,
+ * images (wrapped), and variants with code, ean_code, product_name, images, stock_amount, price.
+ * @param {string} id - Configuration ID
+ * @returns {Promise<{xml: string, filename: string, config: Object}>} XML data
+ */
+const generateXmlExport = async (id) => {
+    const config = await getExportConfigById(id);
+    if (!config) {
+        const error = new Error('Export configuration not found');
+        error.code = 'NOT_FOUND';
+        throw error;
+    }
+
+    const db = getDb();
+    const products = await db.collection(PRODUCTS_COLLECTION).find({ active: true }).toArray();
+    const filteredProducts = applyFilters(products, config.filters);
+
+    const productXmls = filteredProducts.map(product => {
+        const variants = product.child_products || [];
+
+        // category_name: first ai_category name, or first plain category, or empty
+        const categoryName = product.ai_categories?.[0]?.categoryName
+            || product.categories?.[0]
+            || '';
+
+        // Product-level images
+        const productImagesXml = (product.images || [])
+            .map(img => `      <image>${escapeXml(img)}</image>`)
+            .join('\n');
+        const imagesBlock = productImagesXml
+            ? `\n    <images>\n${productImagesXml}\n    </images>`
+            : '\n    <images/>';
+
+        // Variants
+        const variantItems = variants.map(variant => {
+            const priceInfo = getPriceFromPriority(variant, config.pricelistPriority);
+            const price = priceInfo.vat > 0
+                ? (priceInfo.price * (1 + priceInfo.vat / 100)).toFixed(2)
+                : priceInfo.price.toFixed(2);
+
+            const variantImagesXml = (variant.images || [])
+                .map(img => `          <image>${escapeXml(img)}</image>`)
+                .join('\n');
+            const variantImagesBlock = variantImagesXml
+                ? `\n        <images>\n${variantImagesXml}\n        </images>`
+                : '\n        <images/>';
+
+            return [
+                '      <variant>',
+                `        <code>${escapeXml(variant.code)}</code>`,
+                `        <ean_code>${escapeXml(variant.ean_code)}</ean_code>`,
+                `        <product_name>${escapeXml(variant.product_name)}</product_name>`,
+                variantImagesBlock,
+                `        <stock_amount>${escapeXml(variant.stock_amount)}</stock_amount>`,
+                `        <price>${price}</price>`,
+                '      </variant>'
+            ].join('\n');
+        });
+
+        const variantsBlock = variantItems.length > 0
+            ? `\n    <variants>\n${variantItems.join('\n')}\n    </variants>`
+            : '\n    <variants/>';
+
+        return [
+            '  <product>',
+            `    <code>${escapeXml(product.code)}</code>`,
+            `    <token>${escapeXml(product.token)}</token>`,
+            `    <product_name>${escapeXml(product.product_name)}</product_name>`,
+            `    <short_description><![CDATA[${product.short_description || ''}]]></short_description>`,
+            `    <detailed_description><![CDATA[${product.detailed_description || ''}]]></detailed_description>`,
+            `    <category_name>${escapeXml(categoryName)}</category_name>`,
+            imagesBlock,
+            variantsBlock,
+            '  </product>'
+        ].join('\n');
+    });
+
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<products>\n${productXmls.join('\n')}\n</products>`;
+    const filename = `${config.name.replace(/[^a-z0-9]/gi, '-').toLowerCase()}-${new Date().toISOString().split('T')[0]}.xml`;
+
+    return { xml, filename, config };
+};
+
+/**
+ * Creates required MongoDB indexes and backfills existing documents with
+ * owner/accessList/apiKeys fields for the migration period.
+ * Safe to call multiple times (idempotent).
+ */
+const ensureIndexesAndMigrate = async () => {
+    try {
+        const db = getDb();
+        const collection = db.collection(COLLECTION_NAME);
+
+        // Create indexes
+        await collection.createIndex({ 'owner.sub': 1 });
+        await collection.createIndex({ 'accessList.email': 1 });
+        await collection.createIndex({ 'apiKeys.keyHash': 1 }, { sparse: true });
+
+        // Backfill existing docs that lack owner/accessList/apiKeys fields
+        await collection.updateMany(
+            { owner: { $exists: false } },
+            { $set: { owner: { sub: null, email: null }, accessList: [], apiKeys: [] } }
+        );
+
+        console.log('[customExport] Indexes ensured and migration complete.');
+    } catch (error) {
+        console.error('[customExport] Index/migration error:', error.message);
+    }
 };
 
 module.exports = {
@@ -686,6 +857,8 @@ module.exports = {
     deleteExportConfig,
     generateCsvExport,
     generateJsonExport,
+    generateXmlExport,
+    ensureIndexesAndMigrate,
     VALID_PRESETS,
     COLUMN_HEADERS,
     DEFAULT_FILTERS

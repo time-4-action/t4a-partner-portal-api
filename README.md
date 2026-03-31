@@ -1,198 +1,205 @@
-# Patrik Products Automation
+# patrik-products-automation
 
-This project is a Node.js application designed to automate the management and enrichment of product data from various sources. It synchronizes product information from a PNV (Partner.net Vision) system, enriches it with stock and pricing data from the Metakocka API, uses Google's Generative AI to automatically categorize products, and exposes the consolidated data through a secure RESTful API.
+Node.js/Express API that syncs product data from PNV into MongoDB, enriches it with stock and pricing from Metakocka, and exposes configurable product exports (CSV, JSON, XML).
 
-## Core Features
+Scheduling is handled externally by **n8n** via webhook endpoints — there is no internal cron scheduler.
 
--   **Automated Product Synchronization**: Regularly fetches the latest product data from a PNV system via a scheduled job.
--   **Data Enrichment**: Enriches product data with real-time stock levels and pricing information from the Metakocka ERP system.
--   **AI-Powered Categorization**: Utilizes Google Gemini to intelligently assign categories to products, which can be configured on a per-export basis.
--   **Secure REST API**: Provides a set of secure endpoints (protected by Auth0) to access product, category, and export configuration data.
--   **Performance Monitoring**: Includes built-in analytics to monitor the performance of API calls and critical background jobs, storing metrics in MongoDB.
--   **Configurable Data Mapping**: Allows for flexible mapping of incoming CSV data from PNV to the internal JSON data structure.
+---
 
-## Technology Stack
+## Environment variables
 
--   **Backend**: Node.js, Express.js
--   **Database**: MongoDB
--   **Authentication**: Auth0 (JWT Bearer Tokens)
--   **AI**: Google Generative AI (Gemini 2.5 Flash)
--   **Job Scheduling**: `node-cron`
--   **External APIs**: PNV (Partner.net Vision), Metakocka
+| Variable | Description |
+|---|---|
+| `PORT` | HTTP port (default: `3000`) |
+| `NODE_ENV` | `production` or `development` |
+| `DATA_PATH` | Base path for `.env` and downloaded data files (Docker: `/data`) |
+| `PNV_BASE_URL` | Base URL of the PNV admin panel |
+| `PNV_EXPORT_PRODUCTS_URL` | PNV endpoint that triggers the CSV export |
+| `PNV_USER` | PNV login username |
+| `PNV_PASS` | PNV login password (hashed SHA1 internally) |
+| `PNV_GROUP` | PNV group ID |
+| `PNV_USER_ID` | PNV user ID |
+| `METAKOCKA_ID` | Metakocka account ID |
+| `METAKOCKA_KEY` | Metakocka API key |
+| `GOOGLE_API_KEY` | Google Gemini API key for AI categorization |
+| `MONGO_URI` | MongoDB connection string |
+| `MONGO_DB_NAME` | MongoDB database name |
+| `WEBHOOK_API_KEY` | Secret key used to authenticate the webhook endpoints (see below) |
 
-## Getting Started
+---
 
-### Prerequisites
+## Webhook endpoints (n8n triggers)
 
--   Node.js (v18 or later)
--   npm
--   Access to a MongoDB database
--   Credentials for PNV, Metakocka, Google AI, and Auth0.
+All webhook endpoints are protected by an API key passed in the `x-api-key` request header.
+The key must match the `WEBHOOK_API_KEY` environment variable.
 
-### Installation
+### 1. PNV Product Sync
 
-1.  Clone the repository:
-    ```bash
-    git clone <repository-url>
-    cd patrik-products-automation
-    ```
+**`POST /api/export/webhooks/sync/pnv`**
 
-2.  Install dependencies:
-    ```bash
-    npm install
-    ```
+Triggers a full product sync from PNV:
+1. Authenticates with PNV and triggers a CSV export
+2. Downloads the resulting CSV file
+3. Parses and enriches each product with stock (Metakocka) and pricelist (Metakocka)
+4. Upserts all products into MongoDB (`products` collection)
+5. Products no longer in the CSV are soft-deleted (`active: false`)
 
-### Environment Variables
+The endpoint responds immediately with `202 Accepted` and runs the sync in the background.
 
-Create a `.env` file in the root of the project and add the following variables. These are essential for the application to run correctly.
+**Request**
 
-```env
-# Application
-APP_NAME=PatrikProductsAutomation
-NODE_ENV=development # or production
-
-# MongoDB
-MONGO_URI=mongodb://user:password@host:port
-MONGO_DB_NAME=your_db_name
-
-# PNV (Partner.net Vision) API
-PNV_BASE_URL=https://pnv.example.com
-PNV_EXPORT_PRODUCTS_URL=https://pnv.example.com/path/to/export
-PNV_USER=your_pnv_user
-PNV_PASS=your_pnv_password
-PNV_GROUP=your_pnv_group_id
-PNV_USER_ID=your_pnv_user_id
-
-# Metakocka API
-METAKOCKA_KEY=your_metakocka_secret_key
-METAKOCKA_ID=your_metakocka_company_id
-
-# Google AI
-GOOGLE_API_KEY=your_google_api_key
-
-# Auth0
-AUTH0_AUDIENCE=https://api.yourdomain.com
-AUTH0_ISSUER_BASE_URL=https://your-tenant.eu.auth0.com/
-
-# Job Scheduling
-PRODUCTS_DOWNLOAD_SCHEDULE="0 2 * * *" # Example: Run daily at 2 AM
+```
+POST /api/export/webhooks/sync/pnv
+x-api-key: <WEBHOOK_API_KEY>
 ```
 
-### Running the Application
+**Response `202`**
+
+```json
+{
+  "message": "PNV product sync started.",
+  "startedAt": "2024-01-15T10:00:00.000Z"
+}
+```
+
+**n8n setup**
+
+| Node | Settings |
+|---|---|
+| Trigger | Schedule (e.g. every hour: `0 * * * *`) |
+| Action | HTTP Request — Method: `POST`, URL: `https://<your-host>/api/export/webhooks/sync/pnv`, Header: `x-api-key` = your key |
+
+---
+
+### 2. AI Categorization
+
+**`POST /api/export/webhooks/sync/ai-categorization`**
+
+Runs AI category identification (Google Gemini) on products that have not yet been categorized.
+
+- If **no body** is sent, it runs for **all exports** that have `aiCategorizationEnabled: true` in MongoDB.
+- If a specific `exportId` is sent in the body, it runs only for that export.
+
+The endpoint responds immediately with `202 Accepted` and runs in the background.
+
+**Request — all AI-enabled exports**
+
+```
+POST /api/export/webhooks/sync/ai-categorization
+x-api-key: <WEBHOOK_API_KEY>
+Content-Type: application/json
+```
+
+*(empty body or `{}`)*
+
+**Request — specific export**
+
+```
+POST /api/export/webhooks/sync/ai-categorization
+x-api-key: <WEBHOOK_API_KEY>
+Content-Type: application/json
+
+{
+  "exportId": "664f1a2b3c4d5e6f7a8b9c0d"
+}
+```
+
+**Response `202`**
+
+```json
+{
+  "message": "AI categorization started for 2 export(s).",
+  "exportIds": ["664f1a2b3c4d5e6f7a8b9c0d", "664f1a2b3c4d5e6f7a8b9c0e"],
+  "startedAt": "2024-01-15T10:05:00.000Z"
+}
+```
+
+**n8n setup**
+
+| Node | Settings |
+|---|---|
+| Trigger | Schedule (or chained after PNV sync) |
+| Action | HTTP Request — Method: `POST`, URL: `https://<your-host>/api/export/webhooks/sync/ai-categorization`, Header: `x-api-key` = your key, Body: `{}` (or `{ "exportId": "..." }` for a specific export) |
+
+**Tip:** In n8n you can chain both webhooks in a single workflow — PNV sync first, then AI categorization — so categories are always applied to the freshest product data.
+
+---
+
+## Other API endpoints
+
+### Health check
+
+```
+GET /api/export/health
+```
+
+Public, no authentication required. Checks the status of the service and all its dependencies in parallel and returns a single combined result.
+
+**Response `200` — all healthy**
+
+```json
+{
+  "status": "ok",
+  "version": "1.0.0",
+  "appName": "patrik-products-export",
+  "timestamp": "2024-01-15T10:00:00.000Z",
+  "uptime": 3600.5,
+  "memoryUsage": { "rss": 12345678, "heapUsed": 9876543 },
+  "dependencies": {
+    "database": "ok",
+    "pnv": "ok",
+    "metakocka": "ok"
+  }
+}
+```
+
+**Response `503` — one or more dependencies unhealthy**
+
+Same shape as above but `"status": "error"` and the affected dependency shows `"error"` or `"misconfigured"`.
+
+**Dependency statuses**
+
+| Dependency | What is checked | Possible values |
+|---|---|---|
+| `database` | MongoDB ping | `ok`, `error` |
+| `pnv` | HEAD request to `PNV_BASE_URL` (5 s timeout) | `ok`, `error`, `misconfigured` |
+| `metakocka` | POST to warehouse stock endpoint with limit=1 (5 s timeout) | `ok`, `error`, `misconfigured` |
+
+`misconfigured` means the required environment variables for that service are not set.
+
+### Custom exports
+
+Saved export configurations (CSV / JSON / XML) with filtering, field selection, and pricelist priority.
+
+```
+GET    /api/export/custom-export              List all configs
+POST   /api/export/custom-export              Create a config
+GET    /api/export/custom-export/:id          Get a config
+PUT    /api/export/custom-export/:id          Update a config
+DELETE /api/export/custom-export/:id          Delete a config (soft)
+GET    /api/export/custom-export/:id/csv      Download CSV
+GET    /api/export/custom-export/:id/json     Download JSON
+GET    /api/export/custom-export/:id/xml      Download XML
+```
+
+### Recharge XML export
+
+```
+GET /api/export/recharge/xml
+```
+
+Returns a fixed-format XML feed for the Recharge platform, including products, variants, stock, prices, and AI-assigned Katalog categories.
+
+---
+
+## Development
+
+```bash
+npm run dev
+```
+
+## Production
 
 ```bash
 npm start
 ```
-
-## Project Structure
-
-```
-src/
-├── app.js                    # Main Express app configuration
-├── config/                   # Configuration files for external services (Metakocka, PNV)
-├── controllers/              # Express controllers to handle API request logic
-├── jobs/                     # Scheduled cron jobs (e.g., product sync)
-├── middleware/               # Custom Express middleware (auth, logging, analytics)
-├── models/                   # Data models (currently an example, as MongoDB is schemaless)
-├── routes/                   # API route definitions
-└── services/                 # Business logic, DB interactions, and external API clients
-    ├── ai/                   # Services related to Google AI
-    ├── db/                   # MongoDB connection service
-    ├── metakocka/            # Services for interacting with the Metakocka API
-    └── pnv/                  # Services for the PNV product synchronization process
-```
-
-## API Endpoints
-
-All API endpoints are prefixed with `/api/export`. Most endpoints are secured with Auth0 JWT authentication; public endpoints like the Health Check are explicitly noted.
-
-### Health Check
-
--   `GET /api/export/health`
-    -   **Description**: Provides a detailed health status of the service, including dependencies like the database connection, memory usage, and uptime. This endpoint is public and does not require authentication.
-    -   **Success Response (`200 OK`)**:
-        ```json
-        {
-            "status": "ok",
-            "version": "1.0.0",
-            "appName": "PatrikProductsAutomation",
-            "timestamp": "2026-02-01T12:00:00.000Z",
-            "uptime": 35.123,
-            "memoryUsage": {
-                "rss": 50331648,
-                "heapTotal": 7692288,
-                "heapUsed": 5537680,
-                "external": 8272,
-                "arrayBuffers": 9344
-            },
-            "dependencies": {
-                "database": "ok"
-            }
-        }
-        ```
-    -   **Error Response (`503 Service Unavailable`)**: Indicates a problem with one of the dependencies.
-        ```json
-        {
-            "status": "error",
-            "version": "1.0.0",
-            "appName": "PatrikProductsAutomation",
-            "timestamp": "2026-02-01T12:01:00.000Z",
-            "uptime": 95.456,
-            "memoryUsage": { "...": "..." },
-            "dependencies": {
-                "database": "error"
-            }
-        }
-        ```
-
----
-
-### Products
-
--   `GET /api/export/product`
-    -   **Description**: Retrieves a list of all products.
-    -   **Response**: `200 OK` with an array of product objects.
-
--   `GET /api/export/product/:code`
-    -   **Description**: Retrieves a single product by its unique `code` or `token`.
-    -   **Response**: `200 OK` with the product object or `404 Not Found`.
-
--   `GET /api/export/product/tsv/:exportId`
-    -   **Description**: Generates and returns a TSV (Tab-Separated Values) file containing product names and their AI-assigned categories for a specific export configuration.
-    -   **Response**: `200 OK` with the `products.tsv` file.
-
-### Categories
-
--   `GET /api/export/categories`
-    -   **Description**: Retrieves all available categories from the database.
-    -   **Response**: `200 OK` with an array of category objects.
-
--   `GET /api/export/categories/by-export/:exportId`
-    -   **Description**: Retrieves all categories associated with a specific export ID.
-    -   **Response**: `200 OK` with an array of category objects.
-
-### Exports
-
--   `GET /api/export/exports`
-    -   **Description**: Retrieves all export configurations. Export configurations define settings, such as whether AI categorization is enabled.
-    -   **Response**: `200 OK` with an array of export configuration objects.
-
--   `GET /api/export/exports/:id`
-    -   **Description**: Retrieves a single export configuration by its `_id`.
-    -   **Response**: `200 OK` with the export configuration object or `404 Not Found`.
-
-## Scheduled Jobs
-
-### Product Synchronization (`pnvProductSyncJob`)
-
-This is the core background process of the application. It runs on a schedule defined by the `PRODUCTS_DOWNLOAD_SCHEDULE` environment variable.
-
-The job performs the following sequence of tasks:
-
-1.  **Initiates PNV Export**: Authenticates with the PNV system and triggers a product data export.
-2.  **Downloads CSV**: Downloads the resulting `products.csv` file.
-3.  **Processes Data**: Parses the CSV and transforms the data based on the mapping in `src/config/pnv/products.js`.
-4.  **Enriches Data**: Fetches stock and price information for each product from the Metakocka API.
-5.  **Syncs to DB**: Upserts the enriched product data into the MongoDB `products` collection. Products not present in the latest CSV are marked as inactive.
-6.  **Runs AI Categorization**: For each export configuration with `aiCategorizationEnabled: true`, it identifies new products and uses Google Gemini to assign them a category.
-7.  **Monitors Performance**: Every major step is monitored, and performance analytics are logged to the `analytics` and `aiAnalytics` collections in MongoDB.
