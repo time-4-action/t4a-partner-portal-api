@@ -4,6 +4,9 @@ const exportsController = require('../controllers/exportsController');
 
 // GET /api/products - Retrieves all products
 router.get('/', exportsController.getAllExports);
-router.get('/:id', exportsController.getExportById)
+router.post('/', exportsController.createExport);
+router.get('/:id', exportsController.getExportById);
+router.put('/:id', exportsController.updateExport);
+router.delete('/:id', exportsController.deleteExport);
 
 module.exports = router;

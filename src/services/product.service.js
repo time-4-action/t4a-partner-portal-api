@@ -1,4 +1,5 @@
 const { getDb } = require('./db/mongo.service');
+const { ObjectId } = require('mongodb');
 
 /**
  * Fetches all products from the database.
@@ -61,4 +62,68 @@ const generateProductsTsv = async (exportId) => {
     return header + tsvRows.join('\n');
 };
 
-module.exports = { getAllProducts, getProductByIdentifier, generateProductsTsv };
+const getProductsWithAiCategoriesForExport = async (exportId) => {
+    const db = getDb();
+    const products = await db.collection('products')
+        .find(
+            { active: { $ne: false } },
+            { projection: { _id: 1, code: 1, token: 1, product_name: 1, ai_categories: 1 } }
+        )
+        .sort({ product_name: 1 })
+        .toArray();
+
+    return products.map(p => {
+        const match = p.ai_categories?.find(c => c.exportId === exportId) ?? null;
+        return {
+            _id: p._id,
+            code: p.code,
+            token: p.token,
+            product_name: p.product_name,
+            aiCategory: match,
+        };
+    });
+};
+
+const setProductAiCategory = async (productId, exportId, categoryId, categoryName) => {
+    const db = getDb();
+    if (!ObjectId.isValid(productId)) return null;
+    const col = db.collection('products');
+    await col.updateOne(
+        { _id: new ObjectId(productId) },
+        { $pull: { ai_categories: { exportId } } }
+    );
+    return col.findOneAndUpdate(
+        { _id: new ObjectId(productId) },
+        { $push: { ai_categories: { exportId, categoryId, categoryName } } },
+        { returnDocument: 'after', projection: { _id: 1, code: 1, ai_categories: 1 } }
+    );
+};
+
+const removeProductAiCategory = async (productId, exportId) => {
+    const db = getDb();
+    if (!ObjectId.isValid(productId)) return null;
+    return db.collection('products').findOneAndUpdate(
+        { _id: new ObjectId(productId) },
+        { $pull: { ai_categories: { exportId } } },
+        { returnDocument: 'after', projection: { _id: 1, code: 1, ai_categories: 1 } }
+    );
+};
+
+const clearAllAiCategoriesForExport = async (exportId) => {
+    const db = getDb();
+    const result = await db.collection('products').updateMany(
+        { 'ai_categories.exportId': exportId },
+        { $pull: { ai_categories: { exportId } } }
+    );
+    return result.modifiedCount;
+};
+
+module.exports = {
+    getAllProducts,
+    getProductByIdentifier,
+    generateProductsTsv,
+    getProductsWithAiCategoriesForExport,
+    setProductAiCategory,
+    removeProductAiCategory,
+    clearAllAiCategoriesForExport,
+};

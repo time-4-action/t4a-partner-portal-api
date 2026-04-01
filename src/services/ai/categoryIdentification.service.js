@@ -106,49 +106,51 @@ async function identifyProductCategories(exportId) {
         console.log(`Found ${productsToCategorize.length} new products to categorize for exportId "${exportId}".`);
         const categoriesForPrompt = validCategories.map(c => ({ id: c._id.toString(), label: c.label }));
         const categoryMap = new Map(categoriesForPrompt.map(c => [c.id, c.label]));
-        const newResults = [];
-        for (let i = 0; i < productsToCategorize.length; i += BATCH_SIZE) {
-            // for (let i = 0; i < 20; i += BATCH_SIZE) {
-            const batch = productsToCategorize.slice(i, i + BATCH_SIZE);
-            console.log(`Processing batch ${Math.floor(i / BATCH_SIZE) + 1} for exportId "${exportId}"...`);
-            const batchResults = await processBatch(batch, categoriesForPrompt, exportId);
-            newResults.push(...batchResults);
-        }
+        const totalBatches = Math.ceil(productsToCategorize.length / BATCH_SIZE);
+        let totalCategorized = 0;
 
-        // 3. Update products in the database with the new categories
-        const bulkOps = newResults.map(result => {
-            const categoryName = categoryMap.get(String(result.catId));
-            if (!categoryName) {
-                console.warn(`Warning: Category ID ${result.catId} not found for product code ${result.code}. Skipping update.`);
-                return null;
-            }
-            return {
-                updateOne: {
-                    filter: { code: result.code },
-                    update: {
-                        $addToSet: {
-                            ai_categories: {
-                                exportId: exportId,
-                                categoryId: result.catId,
-                                categoryName: categoryName
+        for (let i = 0; i < productsToCategorize.length; i += BATCH_SIZE) {
+            const batchNum = Math.floor(i / BATCH_SIZE) + 1;
+            const batch = productsToCategorize.slice(i, i + BATCH_SIZE);
+            console.log(`Processing batch ${batchNum}/${totalBatches} for exportId "${exportId}"...`);
+
+            const batchResults = await processBatch(batch, categoriesForPrompt, exportId);
+
+            const bulkOps = batchResults.map(result => {
+                const categoryName = categoryMap.get(String(result.catId));
+                if (!categoryName) {
+                    console.warn(`Warning: Category ID ${result.catId} not found for product code ${result.code}. Skipping.`);
+                    return null;
+                }
+                return {
+                    updateOne: {
+                        filter: { code: result.code },
+                        update: {
+                            $addToSet: {
+                                ai_categories: {
+                                    exportId: exportId,
+                                    categoryId: result.catId,
+                                    categoryName: categoryName
+                                }
                             }
                         }
                     }
-                }
-            };
-        }).filter(op => op !== null);
+                };
+            }).filter(op => op !== null);
 
-        if (bulkOps.length > 0) {
-            await productsCollection.bulkWrite(bulkOps);
-            console.log(`Successfully categorized and updated ${bulkOps.length} new products for exportId "${exportId}".`);
-        } else {
-            console.log('No valid new categories were identified to be saved.');
+            if (bulkOps.length > 0) {
+                await productsCollection.bulkWrite(bulkOps);
+                totalCategorized += bulkOps.length;
+                console.log(`Batch ${batchNum}/${totalBatches} saved — ${bulkOps.length} products written to DB.`);
+            } else {
+                console.log(`Batch ${batchNum}/${totalBatches} — no valid results to save.`);
+            }
         }
 
         return {
             exportId,
             productsFound: productsToCategorize.length,
-            productsCategorized: bulkOps.length,
+            productsCategorized: totalCategorized,
         };
 
     } catch (error) {

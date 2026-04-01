@@ -36,4 +36,40 @@ const getExportById = async (id) => {
     return db.collection('exports').findOne({ _id: new ObjectId(id) });
 };
 
-module.exports = { getAllExports, getAiEnabledExports, getExportById };
+const createExport = async (fields) => {
+    const db = getDb();
+    const doc = {
+        name: fields.name,
+        description: fields.description ?? '',
+        aiCategorizationEnabled: fields.aiCategorizationEnabled ?? false,
+        roles: fields.roles ?? [],
+        users: fields.users ?? [],
+    };
+    const result = await db.collection('exports').insertOne(doc);
+    return { _id: result.insertedId, ...doc };
+};
+
+const updateExport = async (id, fields) => {
+    const db = getDb();
+    if (!ObjectId.isValid(id)) return null;
+    const $set = {};
+    if (fields.name !== undefined) $set.name = fields.name;
+    if (fields.description !== undefined) $set.description = fields.description;
+    if (fields.aiCategorizationEnabled !== undefined) $set.aiCategorizationEnabled = fields.aiCategorizationEnabled;
+    if (fields.roles !== undefined) $set.roles = fields.roles;
+    if (fields.users !== undefined) $set.users = fields.users;
+    return db.collection('exports').findOneAndUpdate(
+        { _id: new ObjectId(id) },
+        { $set },
+        { returnDocument: 'after' }
+    );
+};
+
+const deleteExport = async (id) => {
+    const db = getDb();
+    if (!ObjectId.isValid(id)) return 0;
+    const result = await db.collection('exports').deleteOne({ _id: new ObjectId(id) });
+    return result.deletedCount;
+};
+
+module.exports = { getAllExports, getAiEnabledExports, getExportById, createExport, updateExport, deleteExport };
