@@ -90,7 +90,7 @@ async function identifyProductCategories(exportId) {
 
         if (validCategories.length === 0) {
             console.warn(`No categories found for exportId: "${exportId}". Skipping categorization.`);
-            return;
+            return { exportId, productsFound: 0, productsCategorized: 0 };
         }
 
         // 2. Find products that do NOT have a category for this exportId yet
@@ -100,7 +100,7 @@ async function identifyProductCategories(exportId) {
 
         if (productsToCategorize.length === 0) {
             console.log(`No new products to categorize for exportId "${exportId}". All products are up to date.`);
-            return;
+            return { exportId, productsFound: 0, productsCategorized: 0 };
         }
 
         console.log(`Found ${productsToCategorize.length} new products to categorize for exportId "${exportId}".`);
@@ -144,8 +144,16 @@ async function identifyProductCategories(exportId) {
         } else {
             console.log('No valid new categories were identified to be saved.');
         }
+
+        return {
+            exportId,
+            productsFound: productsToCategorize.length,
+            productsCategorized: bulkOps.length,
+        };
+
     } catch (error) {
         console.error(`Orchestrator Error for exportId "${exportId}":`, error.message);
+        throw error;
     }
 }
 

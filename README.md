@@ -51,6 +51,42 @@ The endpoint responds immediately with `202 Accepted` and runs the sync in the b
 ```
 POST /api/export/webhooks/sync/pnv
 x-api-key: <WEBHOOK_API_KEY>
+Content-Type: application/json
+
+{
+  "webhook": "https://your-n8n/webhook/abc123"
+}
+```
+
+`webhook` is optional. When provided, the app POSTs a result payload to that URL once the sync finishes (success or failure).
+
+**Callback payload — success**
+```json
+{
+  "event": "pnv_sync_completed",
+  "success": true,
+  "startedAt": "2024-01-15T10:00:00.000Z",
+  "finishedAt": "2024-01-15T10:05:30.000Z",
+  "durationMs": 330000,
+  "stats": {
+    "totalProcessed": 125,
+    "productsCreated": 5,
+    "productsUpdated": 120,
+    "productsDeactivated": 2
+  }
+}
+```
+
+**Callback payload — failure**
+```json
+{
+  "event": "pnv_sync_completed",
+  "success": false,
+  "startedAt": "2024-01-15T10:00:00.000Z",
+  "finishedAt": "2024-01-15T10:00:05.000Z",
+  "durationMs": 5000,
+  "error": "Failed to download CSV from PNV."
+}
 ```
 
 **Response `202`**
@@ -61,13 +97,6 @@ x-api-key: <WEBHOOK_API_KEY>
   "startedAt": "2024-01-15T10:00:00.000Z"
 }
 ```
-
-**n8n setup**
-
-| Node | Settings |
-|---|---|
-| Trigger | Schedule (e.g. every hour: `0 * * * *`) |
-| Action | HTTP Request — Method: `POST`, URL: `https://<your-host>/api/export/webhooks/sync/pnv`, Header: `x-api-key` = your key |
 
 ---
 
@@ -88,9 +117,11 @@ The endpoint responds immediately with `202 Accepted` and runs in the background
 POST /api/export/webhooks/sync/ai-categorization
 x-api-key: <WEBHOOK_API_KEY>
 Content-Type: application/json
-```
 
-*(empty body or `{}`)*
+{
+  "webhook": "https://your-n8n/webhook/abc123"
+}
+```
 
 **Request — specific export**
 
@@ -100,7 +131,55 @@ x-api-key: <WEBHOOK_API_KEY>
 Content-Type: application/json
 
 {
-  "exportId": "664f1a2b3c4d5e6f7a8b9c0d"
+  "exportId": "664f1a2b3c4d5e6f7a8b9c0d",
+  "webhook": "https://your-n8n/webhook/abc123"
+}
+```
+
+`webhook` is optional. When provided, the app POSTs a result payload to that URL once all exports are processed.
+
+**Callback payload — success**
+```json
+{
+  "event": "ai_categorization_completed",
+  "success": true,
+  "startedAt": "2024-01-15T10:05:30.000Z",
+  "finishedAt": "2024-01-15T10:07:00.000Z",
+  "durationMs": 90000,
+  "stats": {
+    "exportsProcessed": 2,
+    "results": [
+      {
+        "exportId": "664f1a2b3c4d5e6f7a8b9c0d",
+        "success": true,
+        "durationMs": 45000,
+        "productsFound": 20,
+        "productsCategorized": 18
+      }
+    ]
+  }
+}
+```
+
+**Callback payload — failure** (one or more exports failed — `results` array shows which ones)
+```json
+{
+  "event": "ai_categorization_completed",
+  "success": false,
+  "startedAt": "2024-01-15T10:05:30.000Z",
+  "finishedAt": "2024-01-15T10:06:00.000Z",
+  "durationMs": 30000,
+  "stats": {
+    "exportsProcessed": 1,
+    "results": [
+      {
+        "exportId": "664f1a2b3c4d5e6f7a8b9c0d",
+        "success": false,
+        "durationMs": 30000,
+        "error": "No categories found for exportId."
+      }
+    ]
+  }
 }
 ```
 
@@ -114,14 +193,17 @@ Content-Type: application/json
 }
 ```
 
-**n8n setup**
+**Tip — chaining in n8n:** Pass the URL of the AI categorization n8n workflow as `webhook` in the PNV sync request body. When PNV sync finishes, it GETs that URL and n8n immediately fires the next step.
 
-| Node | Settings |
-|---|---|
-| Trigger | Schedule (or chained after PNV sync) |
-| Action | HTTP Request — Method: `POST`, URL: `https://<your-host>/api/export/webhooks/sync/ai-categorization`, Header: `x-api-key` = your key, Body: `{}` (or `{ "exportId": "..." }` for a specific export) |
-
-**Tip:** In n8n you can chain both webhooks in a single workflow — PNV sync first, then AI categorization — so categories are always applied to the freshest product data.
+```
+[Schedule] → POST /webhooks/sync/pnv  { webhook: <n8n webhook> }
+                  ↓ (background finishes)
+             GET <n8n webhook>
+                  ↓
+             POST /webhooks/sync/ai-categorization  { webhook: <n8n webhook 2> }
+                  ↓ (background finishes)
+             GET <n8n webhook 2>
+```
 
 ---
 

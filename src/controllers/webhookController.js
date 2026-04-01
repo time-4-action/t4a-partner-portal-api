@@ -1,75 +1,138 @@
 const { runPnvProductSync } = require('../services/pnv/pnvProductsSync.service');
 const { identifyProductCategories } = require('../services/ai/categoryIdentification.service');
 const { getAiEnabledExports } = require('../services/exports.service');
+const { fireCallback } = require('../services/callbackWebhook.service');
 
 /**
  * POST /api/export/webhooks/sync/pnv
  *
- * Triggers a full PNV product sync:
- * - authenticates with PNV, downloads the latest products CSV
- * - processes and enriches data with Metakocka stock/prices
- * - upserts results into MongoDB
- *
- * Responds immediately with 202 and runs the job in the background
- * so that callers (e.g. n8n) do not time out on long-running syncs.
+ * Triggers a full PNV product sync in the background.
+ * Responds immediately with 202. When the sync finishes (success or failure),
+ * POSTs a result payload to webhook_url if provided in the request body.
  */
 exports.triggerPnvSync = (req, res) => {
+    const { webhook } = req.body || {};
+    const startedAt = new Date();
+
     res.status(202).json({
         message: 'PNV product sync started.',
-        startedAt: new Date().toISOString()
+        startedAt: startedAt.toISOString(),
     });
 
-    runPnvProductSync().catch(err => {
-        console.error('[webhook] PNV sync failed:', err.message);
-    });
+    console.log(`[pnv-sync] Started. Callback URL: ${webhook || 'none'}`);
+
+    (async () => {
+        try {
+            const stats = await runPnvProductSync();
+            const finishedAt = new Date();
+
+            await fireCallback(webhook, {
+                event: 'pnv_sync_completed',
+                success: true,
+                startedAt: startedAt.toISOString(),
+                finishedAt: finishedAt.toISOString(),
+                durationMs: finishedAt - startedAt,
+                stats: {
+                    totalProcessed: stats.totalProcessed,
+                    productsCreated: stats.created,
+                    productsUpdated: stats.updated,
+                    productsDeactivated: stats.deactivated,
+                },
+            });
+
+        } catch (err) {
+            const finishedAt = new Date();
+            console.error('[webhook] PNV sync failed:', err.message);
+
+            await fireCallback(webhook, {
+                event: 'pnv_sync_completed',
+                success: false,
+                startedAt: startedAt.toISOString(),
+                finishedAt: finishedAt.toISOString(),
+                durationMs: finishedAt - startedAt,
+                error: err.message,
+            });
+        }
+    })();
 };
 
 /**
  * POST /api/export/webhooks/sync/ai-categorization
  *
- * Triggers AI category identification for products that have not yet been categorized.
- *
- * Optionally accepts a JSON body with an exportId to limit the run to a single export:
- *   { "exportId": "<mongo ObjectId string>" }
- *
- * If no exportId is provided, it runs for every export that has aiCategorizationEnabled: true.
- *
- * Responds immediately with 202 and runs in the background.
+ * Triggers AI categorization in the background for all AI-enabled exports,
+ * or a specific one if { "exportId": "..." } is passed in the request body.
+ * Responds immediately with 202. When done, POSTs a result payload to
+ * webhook_url if provided in the request body.
  */
 exports.triggerAiCategorization = async (req, res) => {
-    const { exportId } = req.body || {};
+    const { exportId, webhook } = req.body || {};
+    const startedAt = new Date();
+
+    let exportsToRun;
 
     if (exportId) {
-        res.status(202).json({
-            message: `AI categorization started for exportId: ${exportId}.`,
-            startedAt: new Date().toISOString()
-        });
-
-        identifyProductCategories(exportId).catch(err => {
-            console.error(`[webhook] AI categorization failed for exportId ${exportId}:`, err.message);
-        });
+        exportsToRun = [{ _id: { toString: () => exportId } }];
     } else {
-        // Run for all AI-enabled exports
-        let exports;
         try {
-            exports = await getAiEnabledExports();
+            exportsToRun = await getAiEnabledExports();
         } catch (err) {
             console.error('[webhook] Failed to fetch AI-enabled exports:', err.message);
             return res.status(500).json({ message: 'Failed to fetch AI-enabled exports.' });
         }
+    }
 
-        res.status(202).json({
-            message: `AI categorization started for ${exports.length} export(s).`,
-            exportIds: exports.map(e => e._id.toString()),
-            startedAt: new Date().toISOString()
-        });
+    res.status(202).json({
+        message: `AI categorization started for ${exportsToRun.length} export(s).`,
+        exportIds: exportsToRun.map(e => e._id.toString()),
+        startedAt: startedAt.toISOString(),
+    });
 
-        (async () => {
-            for (const _export of exports) {
-                await identifyProductCategories(_export._id.toString()).catch(err => {
-                    console.error(`[webhook] AI categorization failed for exportId ${_export._id}:`, err.message);
+    console.log(`[ai-categorization] Started for ${exportsToRun.length} export(s). Callback URL: ${webhook || 'none'}`);
+
+    (async () => {
+        const results = [];
+
+        for (const _export of exportsToRun) {
+            const id = _export._id.toString();
+            const exportStartedAt = new Date();
+
+            try {
+                const stats = await identifyProductCategories(id);
+                const exportFinishedAt = new Date();
+
+                results.push({
+                    exportId: id,
+                    success: true,
+                    durationMs: exportFinishedAt - exportStartedAt,
+                    productsFound: stats.productsFound,
+                    productsCategorized: stats.productsCategorized,
+                });
+            } catch (err) {
+                const exportFinishedAt = new Date();
+                console.error(`[webhook] AI categorization failed for exportId ${id}:`, err.message);
+
+                results.push({
+                    exportId: id,
+                    success: false,
+                    durationMs: exportFinishedAt - exportStartedAt,
+                    error: err.message,
                 });
             }
-        })();
-    }
+        }
+
+        const finishedAt = new Date();
+        const allSucceeded = results.every(r => r.success);
+
+        await fireCallback(webhook, {
+            event: 'ai_categorization_completed',
+            success: allSucceeded,
+            startedAt: startedAt.toISOString(),
+            finishedAt: finishedAt.toISOString(),
+            durationMs: finishedAt - startedAt,
+            stats: {
+                exportsProcessed: results.length,
+                results,
+            },
+        });
+    })();
 };

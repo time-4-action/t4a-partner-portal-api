@@ -17,9 +17,10 @@ const DEFAULT_FILTERS = {
     stockStatus: 'all',
     minPrice: '',
     maxPrice: '',
-    category: 'all',
+    category: [],
     aiExportId: 'all',
-    aiCategory: 'all',
+    aiCategory: [],
+    imageFilter: 'all',
     showNew: false,
     showRecommended: false,
     publishedOnly: false
@@ -509,9 +510,12 @@ const applyFilters = (products, filters) => {
             }
         }
 
-        // Category filter
-        if (filters.category !== 'all') {
-            if (!product.categories?.includes(filters.category)) return false;
+        // Category filter — backwards-compatible: accepts array or legacy 'all'/string
+        const categories = Array.isArray(filters.category)
+            ? filters.category
+            : (filters.category && filters.category !== 'all' ? [filters.category] : []);
+        if (categories.length > 0) {
+            if (!categories.some(cat => product.categories?.includes(cat))) return false;
         }
 
         // AI Export ID filter
@@ -519,13 +523,26 @@ const applyFilters = (products, filters) => {
             if (!product.ai_categories?.some(c => c.exportId === filters.aiExportId)) return false;
         }
 
-        // AI Category filter — prefix match: selecting "A" includes "A / B", "A / B / C", etc.
-        if (filters.aiCategory !== 'all') {
-            const prefix = filters.aiCategory;
-            if (!product.ai_categories?.some(c =>
-                (c.categoryName === prefix || c.categoryName?.startsWith(prefix + ' / ')) &&
-                (filters.aiExportId === 'all' || c.exportId === filters.aiExportId)
+        // AI Category filter — prefix match, backwards-compatible array or legacy 'all'/string
+        const aiCategories = Array.isArray(filters.aiCategory)
+            ? filters.aiCategory
+            : (filters.aiCategory && filters.aiCategory !== 'all' ? [filters.aiCategory] : []);
+        if (aiCategories.length > 0) {
+            if (!aiCategories.some(prefix =>
+                product.ai_categories?.some(c =>
+                    (c.categoryName === prefix || c.categoryName?.startsWith(prefix + ' / ')) &&
+                    (filters.aiExportId === 'all' || c.exportId === filters.aiExportId)
+                )
             )) return false;
+        }
+
+        // Image filter
+        if (filters.imageFilter && filters.imageFilter !== 'all') {
+            const parentImages = product.images || [];
+            const childImages = (product.child_products || []).flatMap(v => v.images || []);
+            const hasImages = parentImages.length > 0 || childImages.length > 0;
+            if (filters.imageFilter === 'with_images' && !hasImages) return false;
+            if (filters.imageFilter === 'without_images' && hasImages) return false;
         }
 
         // Boolean flags
@@ -680,7 +697,9 @@ const generateCsvExport = async (id) => {
 };
 
 /**
- * Generates JSON export for a configuration — respects selectedFields and all filters
+ * Generates JSON export for a configuration — hierarchical structure matching primer.json:
+ * code, token, product_name, short_description, detailed_description, category_name,
+ * images (array), and variants with code, ean_code, product_name, images, stock_amount, price.
  * @param {string} id - Configuration ID
  * @returns {Promise<Object>} JSON export data
  */
@@ -695,15 +714,38 @@ const generateJsonExport = async (id) => {
     const db = getDb();
     const products = await db.collection(PRODUCTS_COLLECTION).find({ active: true }).toArray();
     const filteredProducts = applyFilters(products, config.filters);
-    const rows = generateExportRows(filteredProducts, config);
 
-    // Map field keys to their human-readable column headers
-    const data = rows.map(row => {
-        const obj = {};
-        for (const field of config.selectedFields) {
-            obj[COLUMN_HEADERS[field] || field] = row[field];
-        }
-        return obj;
+    const data = filteredProducts.map(product => {
+        const variants = product.child_products || [];
+
+        const categoryName = product.ai_categories?.[0]?.categoryName
+            || product.categories?.[0]
+            || '';
+
+        return {
+            code: product.code || '',
+            token: product.token || '',
+            product_name: product.product_name || '',
+            short_description: product.short_description || '',
+            detailed_description: product.detailed_description || '',
+            category_name: categoryName,
+            variants: variants.map(variant => {
+                const priceInfo = getPriceFromPriority(variant, config.pricelistPriority);
+                const price = priceInfo.vat > 0
+                    ? parseFloat((priceInfo.price * (1 + priceInfo.vat / 100)).toFixed(2))
+                    : priceInfo.price;
+
+                return {
+                    code: variant.code || '',
+                    ean_code: variant.ean_code || '',
+                    product_name: variant.product_name || '',
+                    images: variant.images || [],
+                    stock_amount: variant.stock_amount || 0,
+                    price
+                };
+            }),
+            images: product.images || []
+        };
     });
 
     return {
@@ -711,10 +753,7 @@ const generateJsonExport = async (id) => {
         exportName: config.name,
         exportId: config._id.toString(),
         generatedAt: new Date().toISOString(),
-        preset: config.preset,
         totalProducts: filteredProducts.length,
-        totalRows: rows.length,
-        columns: config.selectedFields.map(f => COLUMN_HEADERS[f] || f),
         data
     };
 };

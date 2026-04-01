@@ -144,15 +144,16 @@ const runPnvProductSync = async () => {
         await downloadFile(fileUrl, savePath, cookie);
 
         // Step 5: After a successful download, trigger the service to process the CSV file and sync with the DB.
-        await monitorFunction(
+        const stats = await monitorFunction(
             () => processPnvProductExport(),
             'processPnvProductExport'
         );
 
+        return stats;
+
     } catch (error) {
-        // Log any errors that occur during the sync process to prevent the entire application from crashing.
         console.error('Failed to complete product download process:', error.message);
-        // The error is not re-thrown to allow the application to continue running even if a sync fails.
+        throw error;
     }
 };
 

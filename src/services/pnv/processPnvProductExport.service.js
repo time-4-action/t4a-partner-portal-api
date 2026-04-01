@@ -207,27 +207,37 @@ const processPnvProductExport = async (columnMapping = productMapping) => {
         }
 
         // Step 5b: Perform a bulk write operation to insert new products and update existing ones.
+        let created = 0;
+        let updated = 0;
+
         if (parentProductsData.length > 0) {
             const bulkOps = parentProductsData.map(product => ({
                 updateOne: {
-                    filter: { code: product.code }, // Match document by its unique product code.
+                    filter: { code: product.code },
                     update: {
-                        $set: { ...product, active: true, updatedAt: new Date() }, // Set the new data and mark as active.
-                        $setOnInsert: { createdAt: new Date() } // If this is a new document, set the creation timestamp.
+                        $set: { ...product, active: true, updatedAt: new Date() },
+                        $setOnInsert: { createdAt: new Date() }
                     },
-                    upsert: true // This is the key: update if exists, insert if not.
+                    upsert: true
                 }
             }));
 
             const bulkResult = await productsCollection.bulkWrite(bulkOps);
+            created = bulkResult.upsertedCount;
+            updated = bulkResult.modifiedCount;
             console.log(`Successfully synced products to MongoDB.`);
-            console.log(`- ${bulkResult.nUpserted} products created.`);
-            console.log(`- ${bulkResult.nModified} products updated.`);
+            console.log(`- ${created} products created.`);
+            console.log(`- ${updated} products updated.`);
         } else {
             console.log('No products to sync.');
         }
 
-        return parentProductsData;
+        return {
+            totalProcessed: parentProductsData.length,
+            created,
+            updated,
+            deactivated: updateResult.modifiedCount,
+        };
 
     } catch (error) {
         console.error("Error processing products to JSON:", error);
