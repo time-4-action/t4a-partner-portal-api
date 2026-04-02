@@ -4,6 +4,15 @@ const { ObjectId } = require('mongodb');
 const COLLECTION_NAME = 'export_configs';
 const PRODUCTS_COLLECTION = 'products';
 
+const stripHtml = (str) => (str || '').replace(/<[^>]*>/g, '');
+
+const formatDate = (val) => {
+    if (!val) return '';
+    const d = new Date(val);
+    if (isNaN(d.getTime())) return '';
+    return d.toISOString().split('T')[0]; // YYYY-MM-DD
+};
+
 /**
  * Valid preset types for export configurations
  */
@@ -33,36 +42,50 @@ const FIELD_MAPPINGS = {
     // Shopify fields
     handle: (p, v) => p.token || '',
     title: (p, v) => p.product_name || '',
-    body_html: (p, v) => p.detailed_description || p.short_description || '',
+    body_html: (p) => p.detailed_description || p.short_description || '',
     vendor: () => 'Patrik International',
     type: (p, v) => p.categories?.[0] || '',
     tags: (p, v) => [...(p.categories || []), p.new ? 'new' : '', p.recomended ? 'recommended' : ''].filter(Boolean).join(', '),
     published: (p, v) => p.published ? 'TRUE' : 'FALSE',
-    variant_sku: (p, v) => v?.code || '',
-    variant_title: (p, v) => v?.product_name || '',
+    variant_sku: (p, v) => v?.code || p.code || '',
+    variant_title: (p, v) => v?.product_name || p.product_name || '',
     variant_price: (p, v, priceInfo) => priceInfo.price.toFixed(2),
-    variant_compare_at_price: (p, v, priceInfo, config) => '',
-    variant_inventory_qty: (p, v) => v?.stock_amount || 0,
-    variant_barcode: (p, v) => v?.ean_code || '',
+    variant_compare_at_price: (p, v, priceInfo, config) => {
+        const pricelist = v?.pricelist ?? (p.child_products?.length === 0 ? p.pricelist : null);
+        if (!pricelist) return '';
+        const enabled = (config?.pricelistPriority || []).filter(pl => pl.enabled).sort((a, b) => a.priority - b.priority);
+        if (enabled.length < 2) return '';
+        const second = enabled[1];
+        const found = pricelist.find(pl => pl.name === second.name);
+        return found?.price != null ? found.price.toFixed(2) : '';
+    },
+    variant_inventory_qty: (p, v) => v != null ? (v.stock_amount || 0) : (p.stock_amount || 0),
+    variant_barcode: (p, v) => v?.ean_code || p.ean_code || '',
     image_src: (p, v, priceInfo, config, image) => image || '',
     image_alt_text: (p, v) => p.product_name || '',
-    variant_image: (p, v) => v?.images?.[0] || '',
+    variant_image: (p, v) => v?.images?.[0] || p.images?.[0] || '',
 
     // Simple/Detailed fields
     product_name: (p, v) => p.product_name || '',
-    variant_name: (p, v) => v?.product_name || '',
-    sku: (p, v) => v?.code || '',
-    ean: (p, v) => v?.ean_code || '',
+    variant_name: (p, v) => v?.product_name || p.product_name || '',
+    sku: (p, v) => v?.code || p.code || '',
+    ean: (p, v) => v?.ean_code || p.ean_code || '',
     price: (p, v, priceInfo) => priceInfo.price.toFixed(2),
     pricelist_name: (p, v, priceInfo) => priceInfo.name || '',
     vat: (p, v, priceInfo) => priceInfo.vat,
     price_with_vat: (p, v, priceInfo) => (priceInfo.price * (1 + priceInfo.vat / 100)).toFixed(2),
-    stock: (p, v) => v?.stock_amount || 0,
-    stock_value: (p, v, priceInfo) => ((v?.stock_amount || 0) * priceInfo.price).toFixed(2),
-    in_stock: (p, v) => (v?.stock_amount || 0) > 0 ? 'Yes' : 'No',
+    stock: (p, v) => v != null ? (v.stock_amount || 0) : (p.stock_amount || 0),
+    stock_value: (p, v, priceInfo) => {
+        const qty = v != null ? (v.stock_amount || 0) : (p.stock_amount || 0);
+        return (qty * priceInfo.price).toFixed(2);
+    },
+    in_stock: (p, v) => {
+        const qty = v != null ? (v.stock_amount || 0) : (p.stock_amount || 0);
+        return qty > 0 ? 'Yes' : 'No';
+    },
     categories: (p, v) => (p.categories || []).join('; '),
-    short_description: (p, v) => p.short_description || '',
-    detailed_description: (p, v) => p.detailed_description || '',
+    short_description: (p) => stripHtml(p.short_description || ''),
+    detailed_description: (p) => stripHtml(p.detailed_description || ''),
     product_code: (p, v) => p.code || '',
     product_token: (p, v) => p.token || '',
     is_new: (p, v) => p.new ? 'Yes' : 'No',
@@ -70,7 +93,50 @@ const FIELD_MAPPINGS = {
     is_published: (p, v) => p.published ? 'Yes' : 'No',
     product_images: (p, v) => (p.images || []).join('; '),
     variant_images: (p, v) => (v?.images || []).join('; '),
-    ai_categories: (p, v) => (p.ai_categories || []).map(c => c.categoryName).join('; ')
+    all_images: (p, v) => [...new Set([...(p.images || []), ...(v?.images || [])])].join('; '),
+    image_url: (p, v) => v?.images?.[0] || p.images?.[0] || '',
+    variant_token: (p, v) => v?.token || p.token || '',
+    variant_code: (p, v) => v?.code || p.code || '',
+    is_active: (p) => p.active ? 'Yes' : 'No',
+    created_at: (p) => formatDate(p.createdAt || p.created_at),
+    updated_at: (p) => formatDate(p.updatedAt || p.updated_at),
+
+    // AI / Collection fields
+    ai_categories: (p, v, priceInfo, config) => {
+        const filtered = config?.filters?.aiExportId && config.filters.aiExportId !== 'all'
+            ? (p.ai_categories || []).filter(c => c.exportId === config.filters.aiExportId)
+            : (p.ai_categories || []);
+        return filtered.map(c => c.categoryName).join('; ');
+    },
+    ai_tags: (p, v, priceInfo, config) => {
+        const filtered = config?.filters?.aiExportId && config.filters.aiExportId !== 'all'
+            ? (p.ai_categories || []).filter(c => c.exportId === config.filters.aiExportId)
+            : (p.ai_categories || []);
+        const leaf = config?.aiLeafMode?.ai_tags !== false; // default true (leaf)
+        return filtered.map(c => leaf ? c.categoryName.split(' / ').pop().trim() : c.categoryName).join(', ');
+    },
+    ai_category_names: (p, v, priceInfo, config) => {
+        const filtered = config?.filters?.aiExportId && config.filters.aiExportId !== 'all'
+            ? (p.ai_categories || []).filter(c => c.exportId === config.filters.aiExportId)
+            : (p.ai_categories || []);
+        const leaf = config?.aiLeafMode?.ai_category_names === true; // default false (full path)
+        return filtered.map(c => leaf ? c.categoryName.split(' / ').pop().trim() : c.categoryName).join('; ');
+    },
+    ai_category_ids: (p, v, priceInfo, config) => {
+        const filtered = config?.filters?.aiExportId && config.filters.aiExportId !== 'all'
+            ? (p.ai_categories || []).filter(c => c.exportId === config.filters.aiExportId)
+            : (p.ai_categories || []);
+        return filtered.map(c => c.categoryId).join('; ');
+    },
+    ai_category_full: (p, v, priceInfo, config) => {
+        const filtered = config?.filters?.aiExportId && config.filters.aiExportId !== 'all'
+            ? (p.ai_categories || []).filter(c => c.exportId === config.filters.aiExportId)
+            : (p.ai_categories || []);
+        return filtered.map(c => `${c.categoryName} [${c.categoryId}]`).join('; ');
+    },
+    ai_export_ids: (p) => {
+        return [...new Set((p.ai_categories || []).map(c => c.exportId))].join('; ');
+    },
 };
 
 /**
@@ -114,7 +180,19 @@ const COLUMN_HEADERS = {
     is_published: 'Published',
     product_images: 'Product Images',
     variant_images: 'Variant Images',
-    ai_categories: 'AI Categories'
+    all_images: 'All Images',
+    image_url: 'Image URL',
+    variant_token: 'Variant Token',
+    variant_code: 'Variant Code',
+    is_active: 'Active',
+    created_at: 'Created At',
+    updated_at: 'Updated At',
+    ai_categories: 'AI Categories',
+    ai_tags: 'Collection',
+    ai_category_names: 'Collection',
+    ai_category_ids: 'Collection IDs',
+    ai_category_full: 'Collection (Full)',
+    ai_export_ids: 'AI Export IDs',
 };
 
 /**
@@ -221,6 +299,10 @@ const createExportConfig = async (data, ownerContext = {}) => {
             enabled: Boolean(p.enabled !== undefined ? p.enabled : true),
             priority: p.priority ?? idx
         })),
+        aiLeafMode: {
+            ai_tags: data.aiLeafMode?.ai_tags !== false,          // default true (leaf)
+            ai_category_names: data.aiLeafMode?.ai_category_names === true, // default false (full path)
+        },
         owner: {
             sub: ownerContext.sub || null,
             email: ownerContext.email || null
@@ -377,6 +459,12 @@ const updateExportConfig = async (id, data) => {
             publishedOnly: Boolean(data.filters.publishedOnly ?? existing.filters?.publishedOnly)
         };
     }
+    if (data.aiLeafMode !== undefined) {
+        updateData.aiLeafMode = {
+            ai_tags: data.aiLeafMode?.ai_tags !== false,
+            ai_category_names: data.aiLeafMode?.ai_category_names === true,
+        };
+    }
 
     const result = await collection.findOneAndUpdate(
         { _id: new ObjectId(id) },
@@ -469,7 +557,7 @@ const getPriceFromPriority = (variant, pricelistPriority) => {
  * @param {Object} filters - Filter configuration
  * @returns {Array} Filtered products
  */
-const applyFilters = (products, filters) => {
+const applyFilters = (products, filters, pricelistPriority = []) => {
     return products.filter(product => {
         // Search filter
         if (filters.search && filters.search.trim() !== '') {
@@ -487,24 +575,25 @@ const applyFilters = (products, filters) => {
             if (!matchesSearch) return false;
         }
 
-        // Stock status filter
+        // Stock status filter — check child_products first, fall back to parent stock_amount
         if (filters.stockStatus !== 'all') {
-            const totalStock = (product.child_products || [])
-                .reduce((sum, v) => sum + (v.stock_amount || 0), 0);
+            const variants = product.child_products || [];
+            const totalStock = variants.length > 0
+                ? variants.reduce((sum, v) => sum + (v.stock_amount || 0), 0)
+                : (product.stock_amount || 0);
             if (filters.stockStatus === 'in_stock' && totalStock <= 0) return false;
             if (filters.stockStatus === 'out_of_stock' && totalStock > 0) return false;
         }
 
-        // Price filters
+        // Price filters — use priority-based price; fall back to parent pricelist when no variants
         if (filters.minPrice !== '' || filters.maxPrice !== '') {
-            const prices = (product.child_products || []).flatMap(v =>
-                (v.pricelist || []).map(p => p.price)
-            ).filter(p => p !== undefined);
-
+            const variants = product.child_products || [];
+            const prices = variants.length > 0
+                ? variants.map(v => getPriceFromPriority(v, pricelistPriority).price).filter(p => p > 0)
+                : [getPriceFromPriority(product, pricelistPriority).price].filter(p => p > 0);
             if (prices.length > 0) {
                 const maxPrice = Math.max(...prices);
                 const minPrice = Math.min(...prices);
-
                 if (filters.minPrice !== '' && maxPrice < parseFloat(filters.minPrice)) return false;
                 if (filters.maxPrice !== '' && minPrice > parseFloat(filters.maxPrice)) return false;
             }
@@ -579,7 +668,7 @@ const getFieldValue = (fieldKey, product, variant, priceInfo, config, image) => 
 const generateExportRows = (products, config) => {
     const rows = [];
     const isShopify = config.preset === 'shopify';
-    const productFields = ['title', 'body_html', 'vendor', 'type', 'tags', 'published'];
+    const productFields = ['title', 'body_html', 'vendor', 'type', 'tags', 'ai_tags', 'published'];
 
     for (const product of products) {
         const variants = product.child_products || [];
@@ -592,14 +681,19 @@ const generateExportRows = (products, config) => {
             ])];
 
             const maxRows = Math.max(variants.length, allImages.length, 1);
+            // Products with no child_products occupy row 0 as a real product row (not image-only).
+            // Image-only rows start after all variant rows (or after row 0 for parent-only products).
+            const variantRowCount = Math.max(variants.length, 1);
 
             for (let rowIdx = 0; rowIdx < maxRows; rowIdx++) {
                 const row = {};
                 const variant = variants[rowIdx] || null;
                 const isFirstRow = rowIdx === 0;
-                const isImageOnlyRow = !variant && rowIdx >= variants.length && rowIdx < allImages.length;
+                const isImageOnlyRow = rowIdx >= variantRowCount && rowIdx < allImages.length;
                 const currentImage = allImages[rowIdx] || '';
-                const priceInfo = variant ? getPriceFromPriority(variant, config.pricelistPriority) : { price: 0, vat: 0, name: '' };
+                // When no variants, use the parent product's own pricelist for price
+                const priceSource = variant ?? (variants.length === 0 ? product : null);
+                const priceInfo = priceSource ? getPriceFromPriority(priceSource, config.pricelistPriority) : { price: 0, vat: 0, name: '' };
 
                 for (const fieldKey of config.selectedFields) {
                     if (isImageOnlyRow) {
@@ -630,7 +724,8 @@ const generateExportRows = (products, config) => {
             // Non-Shopify format: one row per variant
             if (variants.length === 0) {
                 const row = {};
-                const priceInfo = { price: 0, vat: 0, name: '' };
+                // Use parent product's own pricelist when there are no child_products
+                const priceInfo = getPriceFromPriority(product, config.pricelistPriority);
                 for (const fieldKey of config.selectedFields) {
                     row[fieldKey] = getFieldValue(fieldKey, product, null, priceInfo, config, product.images?.[0] || '');
                 }
@@ -658,8 +753,8 @@ const generateExportRows = (products, config) => {
  */
 const escapeCsvValue = (value) => {
     if (value === null || value === undefined) return '';
-    const str = String(value);
-    if (str.includes(',') || str.includes('"') || str.includes('\n') || str.includes('\r')) {
+    const str = String(value).replace(/\r\n|\r|\n/g, ' ');
+    if (str.includes(',') || str.includes('"')) {
         return `"${str.replace(/"/g, '""')}"`;
     }
     return str;
@@ -680,7 +775,7 @@ const generateCsvExport = async (id) => {
 
     const db = getDb();
     const products = await db.collection(PRODUCTS_COLLECTION).find({ active: true }).toArray();
-    const filteredProducts = applyFilters(products, config.filters);
+    const filteredProducts = applyFilters(products, config.filters, config.pricelistPriority);
     const rows = generateExportRows(filteredProducts, config);
 
     // Build CSV
@@ -697,9 +792,8 @@ const generateCsvExport = async (id) => {
 };
 
 /**
- * Generates JSON export for a configuration — hierarchical structure matching primer.json:
- * code, token, product_name, short_description, detailed_description, category_name,
- * images (array), and variants with code, ean_code, product_name, images, stock_amount, price.
+ * Generates JSON export for a configuration — flat row-based structure matching CSV field selection.
+ * Each row is an object keyed by column header name (same labels as CSV headers).
  * @param {string} id - Configuration ID
  * @returns {Promise<Object>} JSON export data
  */
@@ -713,39 +807,16 @@ const generateJsonExport = async (id) => {
 
     const db = getDb();
     const products = await db.collection(PRODUCTS_COLLECTION).find({ active: true }).toArray();
-    const filteredProducts = applyFilters(products, config.filters);
+    const filteredProducts = applyFilters(products, config.filters, config.pricelistPriority);
+    const rows = generateExportRows(filteredProducts, config);
 
-    const data = filteredProducts.map(product => {
-        const variants = product.child_products || [];
-
-        const categoryName = product.ai_categories?.[0]?.categoryName
-            || product.categories?.[0]
-            || '';
-
-        return {
-            code: product.code || '',
-            token: product.token || '',
-            product_name: product.product_name || '',
-            short_description: product.short_description || '',
-            detailed_description: product.detailed_description || '',
-            category_name: categoryName,
-            variants: variants.map(variant => {
-                const priceInfo = getPriceFromPriority(variant, config.pricelistPriority);
-                const price = priceInfo.vat > 0
-                    ? parseFloat((priceInfo.price * (1 + priceInfo.vat / 100)).toFixed(2))
-                    : priceInfo.price;
-
-                return {
-                    code: variant.code || '',
-                    ean_code: variant.ean_code || '',
-                    product_name: variant.product_name || '',
-                    images: variant.images || [],
-                    stock_amount: variant.stock_amount || 0,
-                    price
-                };
-            }),
-            images: product.images || []
-        };
+    const data = rows.map(row => {
+        const obj = {};
+        config.selectedFields.forEach(f => {
+            const header = COLUMN_HEADERS[f] || f;
+            obj[header] = row[f] ?? '';
+        });
+        return obj;
     });
 
     return {
@@ -753,7 +824,7 @@ const generateJsonExport = async (id) => {
         exportName: config.name,
         exportId: config._id.toString(),
         generatedAt: new Date().toISOString(),
-        totalProducts: filteredProducts.length,
+        totalRows: rows.length,
         data
     };
 };
@@ -777,9 +848,8 @@ const escapeXml = (value) => {
 const HTML_FIELDS = new Set(['body_html', 'short_description', 'detailed_description']);
 
 /**
- * Generates XML export for a configuration — hierarchical structure matching primer.json:
- * code, token, product_name, short_description, detailed_description, category_name,
- * images (wrapped), and variants with code, ean_code, product_name, images, stock_amount, price.
+ * Generates XML export for a configuration — flat row-based structure matching CSV field selection.
+ * Each <row> element contains one child element per selected field (using field key as tag name).
  * @param {string} id - Configuration ID
  * @returns {Promise<{xml: string, filename: string, config: Object}>} XML data
  */
@@ -793,69 +863,19 @@ const generateXmlExport = async (id) => {
 
     const db = getDb();
     const products = await db.collection(PRODUCTS_COLLECTION).find({ active: true }).toArray();
-    const filteredProducts = applyFilters(products, config.filters);
+    const filteredProducts = applyFilters(products, config.filters, config.pricelistPriority);
+    const rows = generateExportRows(filteredProducts, config);
 
-    const productXmls = filteredProducts.map(product => {
-        const variants = product.child_products || [];
-
-        // category_name: first ai_category name, or first plain category, or empty
-        const categoryName = product.ai_categories?.[0]?.categoryName
-            || product.categories?.[0]
-            || '';
-
-        // Product-level images
-        const productImagesXml = (product.images || [])
-            .map(img => `      <image>${escapeXml(img)}</image>`)
-            .join('\n');
-        const imagesBlock = productImagesXml
-            ? `\n    <images>\n${productImagesXml}\n    </images>`
-            : '\n    <images/>';
-
-        // Variants
-        const variantItems = variants.map(variant => {
-            const priceInfo = getPriceFromPriority(variant, config.pricelistPriority);
-            const price = priceInfo.vat > 0
-                ? (priceInfo.price * (1 + priceInfo.vat / 100)).toFixed(2)
-                : priceInfo.price.toFixed(2);
-
-            const variantImagesXml = (variant.images || [])
-                .map(img => `          <image>${escapeXml(img)}</image>`)
-                .join('\n');
-            const variantImagesBlock = variantImagesXml
-                ? `\n        <images>\n${variantImagesXml}\n        </images>`
-                : '\n        <images/>';
-
-            return [
-                '      <variant>',
-                `        <code>${escapeXml(variant.code)}</code>`,
-                `        <ean_code>${escapeXml(variant.ean_code)}</ean_code>`,
-                `        <product_name>${escapeXml(variant.product_name)}</product_name>`,
-                variantImagesBlock,
-                `        <stock_amount>${escapeXml(variant.stock_amount)}</stock_amount>`,
-                `        <price>${price}</price>`,
-                '      </variant>'
-            ].join('\n');
-        });
-
-        const variantsBlock = variantItems.length > 0
-            ? `\n    <variants>\n${variantItems.join('\n')}\n    </variants>`
-            : '\n    <variants/>';
-
-        return [
-            '  <product>',
-            `    <code>${escapeXml(product.code)}</code>`,
-            `    <token>${escapeXml(product.token)}</token>`,
-            `    <product_name>${escapeXml(product.product_name)}</product_name>`,
-            `    <short_description><![CDATA[${product.short_description || ''}]]></short_description>`,
-            `    <detailed_description><![CDATA[${product.detailed_description || ''}]]></detailed_description>`,
-            `    <category_name>${escapeXml(categoryName)}</category_name>`,
-            imagesBlock,
-            variantsBlock,
-            '  </product>'
-        ].join('\n');
+    const rowXmls = rows.map(row => {
+        const fields = config.selectedFields.map(f => {
+            const val = String(row[f] ?? '');
+            const content = HTML_FIELDS.has(f) ? `<![CDATA[${val}]]>` : escapeXml(val);
+            return `    <${f}>${content}</${f}>`;
+        }).join('\n');
+        return `  <row>\n${fields}\n  </row>`;
     });
 
-    const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<products>\n${productXmls.join('\n')}\n</products>`;
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<export>\n${rowXmls.join('\n')}\n</export>`;
     const filename = `${config.name.replace(/[^a-z0-9]/gi, '-').toLowerCase()}-${new Date().toISOString().split('T')[0]}.xml`;
 
     return { xml, filename, config };
