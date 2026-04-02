@@ -17,6 +17,7 @@ module.exports = {
         { csvHeader: 'Košarica', jsonKey: 'cart', transform: transformToBoolean },
         { csvHeader: 'Mission', jsonKey: "mission", transform: transformToBoolean },
         { csvHeader: 'New', jsonKey: 'new', transform: transformToBoolean },
-        { csvHeader: 'Priporočamo', jsonKey: 'recomended', transform: transformToBoolean }
+        { csvHeader: 'Priporočamo', jsonKey: 'recomended', transform: transformToBoolean },
+        { csvHeader: 'Size', jsonKey: 'size' }
     ]
 }

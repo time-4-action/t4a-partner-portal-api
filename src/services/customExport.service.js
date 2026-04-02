@@ -48,7 +48,18 @@ const FIELD_MAPPINGS = {
     tags: (p, v) => [...(p.categories || []), p.new ? 'new' : '', p.recomended ? 'recommended' : ''].filter(Boolean).join(', '),
     published: (p, v) => p.published ? 'TRUE' : 'FALSE',
     variant_sku: (p, v) => v?.code || p.code || '',
-    variant_title: (p, v) => v?.product_name || p.product_name || '',
+    variant_title: (p, v) => {
+        if (v?.size) return v.size;
+        if (v?.product_name && p.product_name) {
+            const parentName = p.product_name.trim();
+            const variantName = v.product_name.trim();
+            if (variantName.startsWith(parentName)) {
+                const suffix = variantName.slice(parentName.length).trim();
+                if (suffix) return suffix;
+            }
+        }
+        return v?.product_name || p.product_name || '';
+    },
     variant_price: (p, v, priceInfo) => priceInfo.price.toFixed(2),
     variant_compare_at_price: (p, v, priceInfo, config) => {
         const pricelist = v?.pricelist ?? (p.child_products?.length === 0 ? p.pricelist : null);
@@ -674,23 +685,22 @@ const generateExportRows = (products, config) => {
         const variants = product.child_products || [];
 
         if (isShopify) {
-            // Shopify format: product fields only on first row
-            const allImages = [...new Set([
-                ...(product.images || []),
-                ...variants.flatMap(v => v.images || [])
-            ])];
-
-            const maxRows = Math.max(variants.length, allImages.length, 1);
-            // Products with no child_products occupy row 0 as a real product row (not image-only).
-            // Image-only rows start after all variant rows (or after row 0 for parent-only products).
+            // Shopify format: product fields only on first row.
+            // Variant rows: image_src = variant's own first image.
+            // Parent images all go on image-only rows below the variant rows.
+            const productImages = [...new Set(product.images || [])];
             const variantRowCount = Math.max(variants.length, 1);
+            const maxRows = variantRowCount + productImages.length;
 
             for (let rowIdx = 0; rowIdx < maxRows; rowIdx++) {
                 const row = {};
                 const variant = variants[rowIdx] || null;
                 const isFirstRow = rowIdx === 0;
-                const isImageOnlyRow = rowIdx >= variantRowCount && rowIdx < allImages.length;
-                const currentImage = allImages[rowIdx] || '';
+                const isImageOnlyRow = rowIdx >= variantRowCount;
+                // Variant rows use the variant's own image; image-only rows use parent images
+                const currentImage = isImageOnlyRow
+                    ? productImages[rowIdx - variantRowCount] || ''
+                    : (variant?.images?.[0] || variants[0]?.images?.[0] || '');
                 // When no variants, use the parent product's own pricelist for price
                 const priceSource = variant ?? (variants.length === 0 ? product : null);
                 const priceInfo = priceSource ? getPriceFromPriority(priceSource, config.pricelistPriority) : { price: 0, vat: 0, name: '' };
@@ -792,8 +802,25 @@ const generateCsvExport = async (id) => {
 };
 
 /**
- * Generates JSON export for a configuration — flat row-based structure matching CSV field selection.
- * Each row is an object keyed by column header name (same labels as CSV headers).
+ * Resolves the primary category name for a product.
+ * Uses ai_categories filtered by aiExportId config, falls back to categories[0].
+ * @param {Object} product - Product document
+ * @param {Object} config - Export configuration
+ * @returns {string} Category name
+ */
+const resolveCategoryName = (product, config) => {
+    const aiExportId = config?.filters?.aiExportId;
+    if (product.ai_categories?.length > 0) {
+        const filtered = aiExportId && aiExportId !== 'all'
+            ? product.ai_categories.filter(c => c.exportId === aiExportId)
+            : product.ai_categories;
+        if (filtered.length > 0) return filtered[0].categoryName;
+    }
+    return product.categories?.[0] || '';
+};
+
+/**
+ * Generates JSON export — product-centric nested structure matching primer.json format.
  * @param {string} id - Configuration ID
  * @returns {Promise<Object>} JSON export data
  */
@@ -808,15 +835,32 @@ const generateJsonExport = async (id) => {
     const db = getDb();
     const products = await db.collection(PRODUCTS_COLLECTION).find({ active: true }).toArray();
     const filteredProducts = applyFilters(products, config.filters, config.pricelistPriority);
-    const rows = generateExportRows(filteredProducts, config);
 
-    const data = rows.map(row => {
-        const obj = {};
-        config.selectedFields.forEach(f => {
-            const header = COLUMN_HEADERS[f] || f;
-            obj[header] = row[f] ?? '';
+    const data = filteredProducts.map(product => {
+        const variants = (product.child_products || []).map(v => {
+            const priceInfo = getPriceFromPriority(v, config.pricelistPriority);
+            const variant = {
+                code: v.code || '',
+                ean_code: v.ean_code || '',
+                product_name: v.product_name || '',
+                images: v.images || [],
+                stock_amount: v.stock_amount || 0,
+                price: priceInfo.price,
+            };
+            if (v.size) variant.size = v.size;
+            return variant;
         });
-        return obj;
+
+        return {
+            code: product.code || '',
+            token: product.token || '',
+            product_name: product.product_name || '',
+            short_description: product.short_description || '',
+            detailed_description: product.detailed_description || '',
+            category_name: resolveCategoryName(product, config),
+            variants,
+            images: product.images || [],
+        };
     });
 
     return {
@@ -824,7 +868,7 @@ const generateJsonExport = async (id) => {
         exportName: config.name,
         exportId: config._id.toString(),
         generatedAt: new Date().toISOString(),
-        totalRows: rows.length,
+        totalProducts: data.length,
         data
     };
 };
@@ -848,8 +892,7 @@ const escapeXml = (value) => {
 const HTML_FIELDS = new Set(['body_html', 'short_description', 'detailed_description']);
 
 /**
- * Generates XML export for a configuration — flat row-based structure matching CSV field selection.
- * Each <row> element contains one child element per selected field (using field key as tag name).
+ * Generates XML export — product-centric nested structure matching primer (1).xml format.
  * @param {string} id - Configuration ID
  * @returns {Promise<{xml: string, filename: string, config: Object}>} XML data
  */
@@ -864,18 +907,69 @@ const generateXmlExport = async (id) => {
     const db = getDb();
     const products = await db.collection(PRODUCTS_COLLECTION).find({ active: true }).toArray();
     const filteredProducts = applyFilters(products, config.filters, config.pricelistPriority);
-    const rows = generateExportRows(filteredProducts, config);
 
-    const rowXmls = rows.map(row => {
-        const fields = config.selectedFields.map(f => {
-            const val = String(row[f] ?? '');
-            const content = HTML_FIELDS.has(f) ? `<![CDATA[${val}]]>` : escapeXml(val);
-            return `    <${f}>${content}</${f}>`;
+    const productXmls = filteredProducts.map(product => {
+        const categoryName = resolveCategoryName(product, config);
+        const shortDesc = product.short_description || '';
+        const detailedDesc = product.detailed_description || '';
+
+        const productImages = (product.images || [])
+            .map(img => `      <image>${escapeXml(img)}</image>`)
+            .join('\n');
+
+        const variants = (product.child_products || []);
+        const variantXmls = variants.map(v => {
+            const priceInfo = getPriceFromPriority(v, config.pricelistPriority);
+            const price = priceInfo.price.toFixed(2);
+            const variantImages = (v.images || [])
+                .map(img => `          <image>${escapeXml(img)}</image>`)
+                .join('\n');
+
+            const variantFeatures = [];
+            if (v.size) {
+                variantFeatures.push(
+                    `          <feature>\n            <name>Size</name>\n            <value>${escapeXml(v.size)}</value>\n            <description></description>\n          </feature>`
+                );
+            }
+            const variantFeaturesXml = variantFeatures.length > 0
+                ? `\n        <features>\n${variantFeatures.join('\n')}\n        </features>`
+                : '';
+
+            return `      <variant>
+        <id>${escapeXml(v.code || '')}</id>
+        <ean>${escapeXml(v.ean_code || '')}</ean>
+        <name>${escapeXml(v.product_name || '')}</name>
+        <stock>${v.stock_amount || 0}</stock>
+        <recommendedRetailPriceWithVat>${price}</recommendedRetailPriceWithVat>
+        <images>
+${variantImages}
+        </images>${variantFeaturesXml}
+      </variant>`;
         }).join('\n');
-        return `  <row>\n${fields}\n  </row>`;
+
+        const variantsBlock = variants.length > 0
+            ? `\n    <variants>\n${variantXmls}\n    </variants>`
+            : '';
+
+        return `  <product>
+    <id>${escapeXml(product.code || '')}</id>
+    <name>${escapeXml(product.product_name || '')}</name>
+    <descriptionSI><![CDATA[${shortDesc}]]></descriptionSI>
+    <descriptionEN><![CDATA[${detailedDesc}]]></descriptionEN>
+    <features>
+      <feature>
+        <name>Category</name>
+        <value>${escapeXml(categoryName)}</value>
+        <description></description>
+      </feature>
+    </features>
+    <images>
+${productImages}
+    </images>${variantsBlock}
+  </product>`;
     });
 
-    const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<export>\n${rowXmls.join('\n')}\n</export>`;
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<products>\n${productXmls.join('\n')}\n</products>`;
     const filename = `${config.name.replace(/[^a-z0-9]/gi, '-').toLowerCase()}-${new Date().toISOString().split('T')[0]}.xml`;
 
     return { xml, filename, config };
