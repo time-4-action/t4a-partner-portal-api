@@ -32,7 +32,17 @@ const DEFAULT_FILTERS = {
     imageFilter: 'all',
     showNew: false,
     showRecommended: false,
-    publishedOnly: false
+    publishedOnly: false,
+    excludeCloseOut: false
+};
+
+/**
+ * Expands a category path into all hierarchical prefixes.
+ * e.g. "Electronics / Phones" → ["Electronics", "Electronics / Phones"]
+ */
+const expandCategoryToTags = (categoryName) => {
+    const parts = categoryName.split(' / ');
+    return parts.map((_, i) => parts.slice(0, i + 1).join(' / '));
 };
 
 /**
@@ -45,7 +55,19 @@ const FIELD_MAPPINGS = {
     body_html: (p) => p.detailed_description || p.short_description || '',
     vendor: () => 'Patrik International',
     type: (p, v) => p.categories?.[0] || '',
-    tags: (p, v) => [...(p.categories || []), p.new ? 'new' : '', p.recomended ? 'recommended' : ''].filter(Boolean).join(', '),
+    tags: (p, v, priceInfo, config) => {
+        const aiExportId = config?.filters?.aiExportId;
+        const baseTags = aiExportId && aiExportId !== 'all'
+            ? (() => {
+                const filtered = (p.ai_categories || []).filter(c => c.exportId === aiExportId);
+                return filtered.length > 0
+                    ? [...new Set(filtered.flatMap(c => expandCategoryToTags(c.categoryName)))]
+                    : (p.categories || []);
+            })()
+            : (p.categories || []);
+        const extraTags = [p.new ? 'new' : '', p.recomended ? 'recommended' : ''].filter(Boolean);
+        return [...baseTags, ...extraTags].join(', ');
+    },
     published: (p, v) => p.published ? 'TRUE' : 'FALSE',
     variant_sku: (p, v) => v?.code || p.code || '',
     variant_title: (p, v) => {
@@ -70,7 +92,10 @@ const FIELD_MAPPINGS = {
         const found = pricelist.find(pl => pl.name === second.name);
         return found?.price != null ? found.price.toFixed(2) : '';
     },
+    variant_inventory_tracker: () => 'shopify',
     variant_inventory_qty: (p, v) => v != null ? (v.stock_amount || 0) : (p.stock_amount || 0),
+    variant_inventory_policy: (p, v) => (v?.allow_backorder || p.allow_backorder) ? 'continue' : 'deny',
+    variant_fulfillment_service: () => 'manual',
     variant_barcode: (p, v) => v?.ean_code || p.ean_code || '',
     image_src: (p, v, priceInfo, config, image) => image || '',
     image_alt_text: (p, v) => p.product_name || '',
@@ -94,7 +119,16 @@ const FIELD_MAPPINGS = {
         const qty = v != null ? (v.stock_amount || 0) : (p.stock_amount || 0);
         return qty > 0 ? 'Yes' : 'No';
     },
-    categories: (p, v) => (p.categories || []).join('; '),
+    categories: (p, v, priceInfo, config) => {
+        const aiExportId = config?.filters?.aiExportId;
+        if (aiExportId && aiExportId !== 'all') {
+            const filtered = (p.ai_categories || []).filter(c => c.exportId === aiExportId);
+            if (filtered.length > 0) {
+                return [...new Set(filtered.flatMap(c => expandCategoryToTags(c.categoryName)))].join(', ');
+            }
+        }
+        return (p.categories || []).join(', ');
+    },
     short_description: (p) => stripHtml(p.short_description || ''),
     detailed_description: (p) => stripHtml(p.detailed_description || ''),
     product_code: (p, v) => p.code || '',
@@ -165,7 +199,10 @@ const COLUMN_HEADERS = {
     variant_title: 'Variant Title',
     variant_price: 'Variant Price',
     variant_compare_at_price: 'Variant Compare At Price',
+    variant_inventory_tracker: 'Variant Inventory Tracker',
     variant_inventory_qty: 'Variant Inventory Qty',
+    variant_inventory_policy: 'Variant Inventory Policy',
+    variant_fulfillment_service: 'Variant Fulfillment Service',
     variant_barcode: 'Variant Barcode',
     image_src: 'Image Src',
     image_alt_text: 'Image Alt Text',
@@ -181,7 +218,7 @@ const COLUMN_HEADERS = {
     stock: 'Stock',
     stock_value: 'Stock Value',
     in_stock: 'In Stock',
-    categories: 'Categories',
+    categories: 'Tags',
     short_description: 'Short Description',
     detailed_description: 'Detailed Description',
     product_code: 'Product Code',
@@ -303,7 +340,8 @@ const createExportConfig = async (data, ownerContext = {}) => {
             ...(data.filters || {}),
             showNew: Boolean(data.filters?.showNew),
             showRecommended: Boolean(data.filters?.showRecommended),
-            publishedOnly: Boolean(data.filters?.publishedOnly)
+            publishedOnly: Boolean(data.filters?.publishedOnly),
+            excludeCloseOut: Boolean(data.filters?.excludeCloseOut)
         },
         pricelistPriority: (data.pricelistPriority || []).map((p, idx) => ({
             name: p.name,
@@ -311,7 +349,7 @@ const createExportConfig = async (data, ownerContext = {}) => {
             priority: p.priority ?? idx
         })),
         aiLeafMode: {
-            ai_tags: data.aiLeafMode?.ai_tags !== false,          // default true (leaf)
+            ai_tags: data.aiLeafMode?.ai_tags === true,           // default false (full hierarchy)
             ai_category_names: data.aiLeafMode?.ai_category_names === true, // default false (full path)
         },
         owner: {
@@ -467,7 +505,8 @@ const updateExportConfig = async (id, data) => {
             ...data.filters,
             showNew: Boolean(data.filters.showNew ?? existing.filters?.showNew),
             showRecommended: Boolean(data.filters.showRecommended ?? existing.filters?.showRecommended),
-            publishedOnly: Boolean(data.filters.publishedOnly ?? existing.filters?.publishedOnly)
+            publishedOnly: Boolean(data.filters.publishedOnly ?? existing.filters?.publishedOnly),
+            excludeCloseOut: Boolean(data.filters.excludeCloseOut ?? existing.filters?.excludeCloseOut)
         };
     }
     if (data.aiLeafMode !== undefined) {
@@ -649,6 +688,8 @@ const applyFilters = (products, filters, pricelistPriority = []) => {
         if (filters.showNew && !product.new) return false;
         if (filters.showRecommended && !product.recomended) return false;
         if (filters.publishedOnly && !product.published) return false;
+        if (filters.excludeCloseOut && product.product_name?.toUpperCase().includes('CLOSE OUT')) return false;
+        if (filters.excludeCloseOut && product.images?.some(img => img?.toLowerCase().includes('close-out'))) return false;
 
         return true;
     });
@@ -820,6 +861,21 @@ const resolveCategoryName = (product, config) => {
 };
 
 /**
+ * Resolves all hierarchical tag combinations for a product.
+ * e.g. AI category "Electronics / Phones" → ["Electronics", "Electronics / Phones"]
+ */
+const resolveTagsArray = (product, config) => {
+    const aiExportId = config?.filters?.aiExportId;
+    if (aiExportId && aiExportId !== 'all') {
+        const filtered = (product.ai_categories || []).filter(c => c.exportId === aiExportId);
+        if (filtered.length > 0) {
+            return [...new Set(filtered.flatMap(c => expandCategoryToTags(c.categoryName)))];
+        }
+    }
+    return product.categories || [];
+};
+
+/**
  * Generates JSON export — product-centric nested structure matching primer.json format.
  * @param {string} id - Configuration ID
  * @returns {Promise<Object>} JSON export data
@@ -857,7 +913,7 @@ const generateJsonExport = async (id) => {
             product_name: product.product_name || '',
             short_description: product.short_description || '',
             detailed_description: product.detailed_description || '',
-            category_name: resolveCategoryName(product, config),
+            tags: resolveTagsArray(product, config),
             variants,
             images: product.images || [],
         };
@@ -909,7 +965,7 @@ const generateXmlExport = async (id) => {
     const filteredProducts = applyFilters(products, config.filters, config.pricelistPriority);
 
     const productXmls = filteredProducts.map(product => {
-        const categoryName = resolveCategoryName(product, config);
+        const tags = resolveTagsArray(product, config);
         const shortDesc = product.short_description || '';
         const detailedDesc = product.detailed_description || '';
 
@@ -957,11 +1013,7 @@ ${variantImages}
     <descriptionSI><![CDATA[${shortDesc}]]></descriptionSI>
     <descriptionEN><![CDATA[${detailedDesc}]]></descriptionEN>
     <features>
-      <feature>
-        <name>Category</name>
-        <value>${escapeXml(categoryName)}</value>
-        <description></description>
-      </feature>
+${tags.map(tag => `      <feature>\n        <name>Tags</name>\n        <value>${escapeXml(tag)}</value>\n        <description></description>\n      </feature>`).join('\n')}
     </features>
     <images>
 ${productImages}
