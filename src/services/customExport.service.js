@@ -70,7 +70,7 @@ const FIELD_MAPPINGS = {
     },
     published: (p, v) => p.published ? 'TRUE' : 'FALSE',
     variant_sku: (p, v) => v?.code || p.code || '',
-    option1_name: () => 'Variant',
+    option1_name: (p, v, priceInfo, config) => config?.option1Name || 'Variant',
     option1_value: (p, v) => {
         if (v?.size) return v.size;
         if (v?.product_name && p.product_name) {
@@ -358,6 +358,7 @@ const createExportConfig = async (data, ownerContext = {}) => {
             ai_category_names: data.aiLeafMode?.ai_category_names === true, // default false (full path)
         },
         inventoryLocationName: data.inventoryLocationName?.trim() || null,
+        option1Name: data.option1Name?.trim() || null,
         owner: {
             sub: ownerContext.sub || null,
             email: ownerContext.email || null
@@ -523,6 +524,9 @@ const updateExportConfig = async (id, data) => {
     }
     if (data.inventoryLocationName !== undefined) {
         updateData.inventoryLocationName = data.inventoryLocationName?.trim() || null;
+    }
+    if (data.option1Name !== undefined) {
+        updateData.option1Name = data.option1Name?.trim() || null;
     }
 
     const result = await collection.findOneAndUpdate(
@@ -834,7 +838,7 @@ const escapeCsvValue = (value) => {
  * @param {string} locationName - Shopify location name (exact case match)
  * @returns {{ headers: string[], rows: string[][] }} Headers and data rows
  */
-const generateInventoryRows = (products, locationName) => {
+const generateInventoryRows = (products, locationName, option1Name) => {
     const headers = [
         'Handle', 'Title', 'Option1 Name', 'Option1 Value',
         'Option2 Name', 'Option2 Value', 'Option3 Name', 'Option3 Value',
@@ -850,7 +854,7 @@ const generateInventoryRows = (products, locationName) => {
         if (variants.length === 0) {
             // Product without variants
             rows.push([
-                handle, title, 'Variant', title,
+                handle, title, option1Name || 'Variant', title,
                 '', '', '', '',
                 product.code || '', '', '',
                 String(product.stock_amount || 0)
@@ -877,7 +881,7 @@ const generateInventoryRows = (products, locationName) => {
                 }
 
                 rows.push([
-                    handle, title, 'Variant', optionValue,
+                    handle, title, option1Name || 'Variant', optionValue,
                     '', '', '', '',
                     variant.code || '', '', '',
                     String(variant.stock_amount || 0)
@@ -910,7 +914,7 @@ const generateCsvExport = async (id) => {
 
     if (config.preset === 'inventory') {
         // Inventory format: fixed Shopify-compatible columns with location-based stock
-        const { headers, rows } = generateInventoryRows(filteredProducts, config.inventoryLocationName);
+        const { headers, rows } = generateInventoryRows(filteredProducts, config.inventoryLocationName, config.option1Name);
         const headerLine = headers.map(escapeCsvValue).join(',');
         const dataLines = rows.map(row => row.map(escapeCsvValue).join(','));
         csv = [headerLine, ...dataLines].join('\n');
