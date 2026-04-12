@@ -63,6 +63,8 @@ Triggered by `POST /api/export/webhooks/sync/ai-categorization`. Uses Google Gem
 
 Export configurations are stored in the `export_configs` MongoDB collection. Each config defines field selection, filters, and pricelist priority. Supports presets: `shopify`, `simple`, `detailed`, `inventory`. Generates CSV/JSON/XML on demand.
 
+The **inventory preset** uses a dedicated code path (`generateInventoryRows()`) that produces a fixed-column Shopify inventory import CSV: `Handle, Title, Option1 Name, Option1 Value, Option2 Name, Option2 Value, Option3 Name, Option3 Value, SKU, HS Code, COO, {locationName}`. The last column header is the `inventoryLocationName` stored on the config — it must be an exact case-sensitive match of the Shopify location name. Field selection is skipped for inventory; only CSV export is supported (no JSON/XML).
+
 ### Analytics
 
 `src/services/analytics.service.js` provides `monitorFunction(fn, actionName)` — wraps any async function, measures duration, and writes a record to the `analytics` MongoDB collection. Also tracks API request logs via `src/middleware/analytics.js` using PostHog (`posthog-node`).
