@@ -27,7 +27,10 @@ const transformToBoolean = (value) => {
 
 /**
  * Returns the size value as-is if non-empty, otherwise extracts a trailing number
- * from the product name (e.g. "Patrik QT-Wave 71" → "71").
+ * from the product name. Handles common suffixes like "l" (liters), "V2" (version),
+ * and rider/team tags like "- GET", "- GBM".
+ * Examples: "Patrik T-Wave 85 l" → "85", "Patrik F-Style 85 V2 - GET" → "85",
+ *           "Patrik QT-Wave 71" → "71", "Patrik Campello Wave 69l" → "69"
  * @param {string | undefined | null} value - The Size column value.
  * @param {Object} row - The full CSV row, used to read 'Product name' as fallback.
  * @returns {string} The size string.
@@ -35,7 +38,9 @@ const transformToBoolean = (value) => {
 const extractSize = (value, row) => {
     if (value && value.trim()) return value.trim();
     const name = row?.['Product name'] || '';
-    const match = name.match(/\s(\d+(?:[.,]\d+)?)$/);
+    // Match a number (with optional decimal) followed by optional suffixes:
+    // "l" (liters), "V2/V3" (version), "- GET/GBM" (team/rider tags)
+    const match = name.match(/\s(\d+(?:[.,]\d+)?)\s*l?\s*(?:V\d+)?\s*(?:-\s*\w+)*\s*$/i);
     return match ? match[1] : '';
 };
 
