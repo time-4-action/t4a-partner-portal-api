@@ -70,7 +70,8 @@ const FIELD_MAPPINGS = {
     },
     published: (p, v) => p.published ? 'TRUE' : 'FALSE',
     variant_sku: (p, v) => v?.code || p.code || '',
-    variant_title: (p, v) => {
+    option1_name: () => 'Variant',
+    option1_value: (p, v) => {
         if (v?.size) return v.size;
         if (v?.product_name && p.product_name) {
             const parentName = p.product_name.trim();
@@ -199,7 +200,8 @@ const COLUMN_HEADERS = {
     tags: 'Tags',
     published: 'Published',
     variant_sku: 'Variant SKU',
-    variant_title: 'Variant Title',
+    option1_name: 'Option1 Name',
+    option1_value: 'Option1 Value',
     variant_price: 'Variant Price',
     variant_compare_at_price: 'Variant Compare At Price',
     variant_inventory_tracker: 'Variant Inventory Tracker',
@@ -725,6 +727,12 @@ const getFieldValue = (fieldKey, product, variant, priceInfo, config, image) => 
  * @returns {Array} Export data rows
  */
 const generateExportRows = (products, config) => {
+    // Migrate legacy field: variant_title → option1_name + option1_value
+    if (config.selectedFields?.includes('variant_title')) {
+        const idx = config.selectedFields.indexOf('variant_title');
+        config.selectedFields.splice(idx, 1, 'option1_name', 'option1_value');
+    }
+
     const rows = [];
     const isShopify = config.preset === 'shopify';
     const productFields = ['title', 'body_html', 'vendor', 'type', 'tags', 'ai_tags', 'published'];
