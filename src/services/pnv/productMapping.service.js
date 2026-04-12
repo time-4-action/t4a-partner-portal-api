@@ -25,7 +25,22 @@ const transformToBoolean = (value) => {
     return false;
 };
 
+/**
+ * Returns the size value as-is if non-empty, otherwise extracts a trailing number
+ * from the product name (e.g. "Patrik QT-Wave 71" → "71").
+ * @param {string | undefined | null} value - The Size column value.
+ * @param {Object} row - The full CSV row, used to read 'Product name' as fallback.
+ * @returns {string} The size string.
+ */
+const extractSize = (value, row) => {
+    if (value && value.trim()) return value.trim();
+    const name = row?.['Product name'] || '';
+    const match = name.match(/\s(\d+(?:[.,]\d+)?)$/);
+    return match ? match[1] : '';
+};
+
 module.exports = {
     splitStringByBackslash,
     transformToBoolean,
+    extractSize,
 };

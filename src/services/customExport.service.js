@@ -79,6 +79,9 @@ const FIELD_MAPPINGS = {
                 const suffix = variantName.slice(parentName.length).trim();
                 if (suffix) return suffix;
             }
+            // Try extracting trailing number as size (e.g. "Patrik QT-Wave 71" → "71")
+            const trailingNum = variantName.match(/\s(\d+(?:[.,]\d+)?)$/);
+            if (trailingNum) return trailingNum[1];
         }
         return v?.product_name || p.product_name || '';
     },
@@ -857,7 +860,9 @@ const generateInventoryRows = (products, locationName) => {
                         const suffix = variantName.slice(parentName.length).trim();
                         optionValue = suffix || variantName;
                     } else {
-                        optionValue = variantName;
+                        // Try extracting trailing number as size (e.g. "Patrik QT-Wave 71" → "71")
+                        const trailingNum = variantName.match(/\s(\d+(?:[.,]\d+)?)$/);
+                        optionValue = trailingNum ? trailingNum[1] : variantName;
                     }
                 } else {
                     optionValue = variant.product_name || title;

@@ -1,4 +1,4 @@
-const { splitStringByBackslash, transformToBoolean } = require('../../services/pnv/productMapping.service');
+const { splitStringByBackslash, transformToBoolean, extractSize } = require('../../services/pnv/productMapping.service');
 const { getCategoryNameForProductCode } = require('../../services/ai/categoryIdentification.service');
 
 
@@ -18,6 +18,6 @@ module.exports = {
         { csvHeader: 'Mission', jsonKey: "mission", transform: transformToBoolean },
         { csvHeader: 'New', jsonKey: 'new', transform: transformToBoolean },
         { csvHeader: 'Priporočamo', jsonKey: 'recomended', transform: transformToBoolean },
-        { csvHeader: 'Size', jsonKey: 'size' }
+        { csvHeader: 'Size', jsonKey: 'size', transform: extractSize }
     ]
 }
