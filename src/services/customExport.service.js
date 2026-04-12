@@ -352,6 +352,7 @@ const createExportConfig = async (data, ownerContext = {}) => {
             ai_tags: data.aiLeafMode?.ai_tags === true,           // default false (full hierarchy)
             ai_category_names: data.aiLeafMode?.ai_category_names === true, // default false (full path)
         },
+        inventoryLocationName: data.inventoryLocationName?.trim() || null,
         owner: {
             sub: ownerContext.sub || null,
             email: ownerContext.email || null
@@ -514,6 +515,9 @@ const updateExportConfig = async (id, data) => {
             ai_tags: data.aiLeafMode?.ai_tags !== false,
             ai_category_names: data.aiLeafMode?.ai_category_names === true,
         };
+    }
+    if (data.inventoryLocationName !== undefined) {
+        updateData.inventoryLocationName = data.inventoryLocationName?.trim() || null;
     }
 
     const result = await collection.findOneAndUpdate(
@@ -812,6 +816,67 @@ const escapeCsvValue = (value) => {
 };
 
 /**
+ * Generates inventory CSV rows in the Shopify inventory import format.
+ * Fixed columns: Handle, Title, Option1 Name, Option1 Value, Option2 Name, Option2 Value,
+ *                Option3 Name, Option3 Value, SKU, HS Code, COO, {locationName}
+ * @param {Array} products - Filtered products
+ * @param {string} locationName - Shopify location name (exact case match)
+ * @returns {{ headers: string[], rows: string[][] }} Headers and data rows
+ */
+const generateInventoryRows = (products, locationName) => {
+    const headers = [
+        'Handle', 'Title', 'Option1 Name', 'Option1 Value',
+        'Option2 Name', 'Option2 Value', 'Option3 Name', 'Option3 Value',
+        'SKU', 'HS Code', 'COO', locationName || 'Location'
+    ];
+
+    const rows = [];
+    for (const product of products) {
+        const variants = product.child_products || [];
+        const handle = product.token || '';
+        const title = product.product_name || '';
+
+        if (variants.length === 0) {
+            // Product without variants
+            rows.push([
+                handle, title, 'Title', title,
+                '', '', '', '',
+                product.code || '', '', '',
+                String(product.stock_amount || 0)
+            ]);
+        } else {
+            for (const variant of variants) {
+                // Derive option value from size, or variant name suffix, or full variant name
+                let optionValue = '';
+                if (variant.size) {
+                    optionValue = variant.size;
+                } else if (variant.product_name && product.product_name) {
+                    const parentName = product.product_name.trim();
+                    const variantName = variant.product_name.trim();
+                    if (variantName.startsWith(parentName)) {
+                        const suffix = variantName.slice(parentName.length).trim();
+                        optionValue = suffix || variantName;
+                    } else {
+                        optionValue = variantName;
+                    }
+                } else {
+                    optionValue = variant.product_name || title;
+                }
+
+                rows.push([
+                    handle, title, 'Title', optionValue,
+                    '', '', '', '',
+                    variant.code || '', '', '',
+                    String(variant.stock_amount || 0)
+                ]);
+            }
+        }
+    }
+
+    return { headers, rows };
+};
+
+/**
  * Generates CSV export for a configuration
  * @param {string} id - Configuration ID
  * @returns {Promise<{csv: string, filename: string, config: Object}>} CSV data
@@ -827,16 +892,25 @@ const generateCsvExport = async (id) => {
     const db = getDb();
     const products = await db.collection(PRODUCTS_COLLECTION).find({ active: true }).toArray();
     const filteredProducts = applyFilters(products, config.filters, config.pricelistPriority);
-    const rows = generateExportRows(filteredProducts, config);
 
-    // Build CSV
-    const headers = config.selectedFields.map(f => COLUMN_HEADERS[f] || f);
-    const headerLine = headers.map(escapeCsvValue).join(',');
-    const dataLines = rows.map(row =>
-        config.selectedFields.map(f => escapeCsvValue(row[f])).join(',')
-    );
+    let csv;
 
-    const csv = [headerLine, ...dataLines].join('\n');
+    if (config.preset === 'inventory') {
+        // Inventory format: fixed Shopify-compatible columns with location-based stock
+        const { headers, rows } = generateInventoryRows(filteredProducts, config.inventoryLocationName);
+        const headerLine = headers.map(escapeCsvValue).join(',');
+        const dataLines = rows.map(row => row.map(escapeCsvValue).join(','));
+        csv = [headerLine, ...dataLines].join('\n');
+    } else {
+        const rows = generateExportRows(filteredProducts, config);
+        const headers = config.selectedFields.map(f => COLUMN_HEADERS[f] || f);
+        const headerLine = headers.map(escapeCsvValue).join(',');
+        const dataLines = rows.map(row =>
+            config.selectedFields.map(f => escapeCsvValue(row[f])).join(',')
+        );
+        csv = [headerLine, ...dataLines].join('\n');
+    }
+
     const filename = `${config.name.replace(/[^a-z0-9]/gi, '-').toLowerCase()}-${new Date().toISOString().split('T')[0]}.csv`;
 
     return { csv, filename, config };

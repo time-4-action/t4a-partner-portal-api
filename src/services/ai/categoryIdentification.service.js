@@ -182,4 +182,48 @@ async function getCategoryNameForProductCode(productCode, exportId) {
     }
 }
 
-module.exports = { identifyProductCategories, getCategoryNameForProductCode };
+/**
+ * Categorizes an array of arbitrary (third-party) products against the
+ * categories defined for a given exportId.  Results are returned directly
+ * and are NOT persisted to the database.
+ *
+ * @param {string} exportId - The export whose category list should be used.
+ * @param {Array<Object>} products - Products to categorize. Each object must
+ *   have at least { code, name } and may include any other descriptive fields.
+ * @returns {Promise<{results: Array<{code: string, categoryId: string, categoryName: string}>}>}
+ */
+async function categorizeExternalProducts(exportId, products) {
+    const db = getDb();
+    const categoriesCollection = db.collection('categories');
+
+    const validCategories = await categoriesCollection.find({ exportId: exportId.toString() }).toArray();
+
+    if (validCategories.length === 0) {
+        throw new Error(`No categories found for exportId "${exportId}".`);
+    }
+
+    const categoriesForPrompt = validCategories.map(c => ({ id: c._id.toString(), label: c.label }));
+    const categoryMap = new Map(categoriesForPrompt.map(c => [c.id, c.label]));
+
+    const allResults = [];
+
+    for (let i = 0; i < products.length; i += BATCH_SIZE) {
+        const batch = products.slice(i, i + BATCH_SIZE);
+        const batchResults = await processBatch(batch, categoriesForPrompt, `external:${exportId}`);
+
+        for (const result of batchResults) {
+            const categoryName = categoryMap.get(String(result.catId));
+            if (categoryName) {
+                allResults.push({
+                    code: result.code,
+                    categoryId: result.catId,
+                    categoryName,
+                });
+            }
+        }
+    }
+
+    return { results: allResults };
+}
+
+module.exports = { identifyProductCategories, getCategoryNameForProductCode, categorizeExternalProducts };

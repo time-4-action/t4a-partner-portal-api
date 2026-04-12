@@ -1,5 +1,5 @@
 const { runPnvProductSync } = require('../services/pnv/pnvProductsSync.service');
-const { identifyProductCategories } = require('../services/ai/categoryIdentification.service');
+const { identifyProductCategories, categorizeExternalProducts } = require('../services/ai/categoryIdentification.service');
 const { getAiEnabledExports } = require('../services/exports.service');
 const { fireCallback } = require('../services/callbackWebhook.service');
 
@@ -54,6 +54,51 @@ exports.triggerPnvSync = (req, res) => {
             });
         }
     })();
+};
+
+/**
+ * POST /api/export/webhooks/sync/ai-categorization
+ *
+ * Triggers AI categorization in the background for all AI-enabled exports,
+ * or a specific one if { "exportId": "..." } is passed in the request body.
+ * Responds immediately with 202. When done, POSTs a result payload to
+ * webhook_url if provided in the request body.
+ */
+/**
+ * POST /api/export/webhooks/categorize
+ *
+ * Synchronously categorizes an array of third-party products against an
+ * existing category set (identified by exportId).  Nothing is persisted —
+ * the results are returned in the response body.
+ */
+exports.categorizeExternal = async (req, res) => {
+    const { exportId, products } = req.body || {};
+
+    if (!exportId) {
+        return res.status(400).json({ message: 'Missing required field: exportId' });
+    }
+    if (!Array.isArray(products) || products.length === 0) {
+        return res.status(400).json({ message: 'Missing or empty required field: products (must be a non-empty array)' });
+    }
+
+    const MAX_PRODUCTS = 300;
+    if (products.length > MAX_PRODUCTS) {
+        return res.status(400).json({ message: `Too many products. Maximum is ${MAX_PRODUCTS} per request.` });
+    }
+
+    for (const p of products) {
+        if (!p.code || !p.name) {
+            return res.status(400).json({ message: 'Every product must have at least "code" and "name" fields.' });
+        }
+    }
+
+    try {
+        const result = await categorizeExternalProducts(exportId, products);
+        return res.status(200).json(result);
+    } catch (err) {
+        console.error('[categorize-external] Error:', err.message);
+        return res.status(500).json({ message: err.message });
+    }
 };
 
 /**

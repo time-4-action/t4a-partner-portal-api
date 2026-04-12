@@ -6,5 +6,6 @@ const webhookController = require('../controllers/webhookController');
 // All webhook routes require a valid x-api-key header
 router.post('/sync/pnv', webhookApiKey, webhookController.triggerPnvSync);
 router.post('/sync/ai-categorization', webhookApiKey, webhookController.triggerAiCategorization);
+router.post('/categorize', webhookApiKey, webhookController.categorizeExternal);
 
 module.exports = router;
