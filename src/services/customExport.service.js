@@ -842,7 +842,7 @@ const generateInventoryRows = (products, locationName) => {
         if (variants.length === 0) {
             // Product without variants
             rows.push([
-                handle, title, 'Title', title,
+                handle, title, 'Variant', title,
                 '', '', '', '',
                 product.code || '', '', '',
                 String(product.stock_amount || 0)
@@ -869,7 +869,7 @@ const generateInventoryRows = (products, locationName) => {
                 }
 
                 rows.push([
-                    handle, title, 'Title', optionValue,
+                    handle, title, 'Variant', optionValue,
                     '', '', '', '',
                     variant.code || '', '', '',
                     String(variant.stock_amount || 0)
