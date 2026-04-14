@@ -1,8 +1,8 @@
 ---
 name: Bug report
-about: Create a report to help us improve
+about: Report an issue with the Export API
 title: ''
-labels: ''
+labels: bug
 assignees: ''
 
 ---
@@ -10,29 +10,28 @@ assignees: ''
 **Describe the bug**
 A clear and concise description of what the bug is.
 
+**Endpoint / Feature affected**
+Which API endpoint or feature is this related to? (e.g., `POST /api/export/webhooks/sync/pnv`, custom export CSV generation, AI categorization)
+
 **To Reproduce**
 Steps to reproduce the behavior:
-1. Go to '...'
-2. Click on '....'
-3. Scroll down to '....'
-4. See error
+1. Send request to '...'
+2. With body/params '...'
+3. Observe response '...'
 
 **Expected behavior**
-A clear and concise description of what you expected to happen.
+What you expected to happen.
 
-**Screenshots**
-If applicable, add screenshots to help explain your problem.
+**Actual response**
+Include the error response body, status code, or unexpected output.
 
-**Desktop (please complete the following information):**
- - OS: [e.g. iOS]
- - Browser [e.g. chrome, safari]
- - Version [e.g. 22]
+**Environment**
+ - Node.js version: [e.g., 22.x]
+ - Deployment: [e.g., Docker, local]
+ - MongoDB version: [e.g., 7.0]
 
-**Smartphone (please complete the following information):**
- - Device: [e.g. iPhone6]
- - OS: [e.g. iOS8.1]
- - Browser [e.g. stock browser, safari]
- - Version [e.g. 22]
+**Logs**
+If applicable, include relevant server logs.
 
 **Additional context**
 Add any other context about the problem here.
