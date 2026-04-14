@@ -1,287 +1,203 @@
-# patrik-products-automation
+<div align="center">
 
-Node.js/Express API that syncs product data from PNV into MongoDB, enriches it with stock and pricing from Metakocka, and exposes configurable product exports (CSV, JSON, XML).
+# Patrik Products Export API
 
-Scheduling is handled externally by **n8n** via webhook endpoints — there is no internal cron scheduler.
+**Product data pipeline & configurable export engine**
 
----
+Syncs products from PNV, enriches with stock & pricing from Metakocka,
+categorizes with AI, and exports to CSV / JSON / XML.
 
-## Environment variables
+[![Node.js](https://img.shields.io/badge/Node.js-22_LTS-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
+[![Express](https://img.shields.io/badge/Express-5.x-000000?logo=express&logoColor=white)](https://expressjs.com/)
+[![MongoDB](https://img.shields.io/badge/MongoDB-7.0-47A248?logo=mongodb&logoColor=white)](https://www.mongodb.com/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?logo=docker&logoColor=white)](#docker)
 
-| Variable | Description |
-|---|---|
-| `PORT` | HTTP port (default: `3000`) |
-| `NODE_ENV` | `production` or `development` |
-| `DATA_PATH` | Base path for `.env` and downloaded data files (Docker: `/data`) |
-| `PNV_BASE_URL` | Base URL of the PNV admin panel |
-| `PNV_EXPORT_PRODUCTS_URL` | PNV endpoint that triggers the CSV export |
-| `PNV_USER` | PNV login username |
-| `PNV_PASS` | PNV login password (hashed SHA1 internally) |
-| `PNV_GROUP` | PNV group ID |
-| `PNV_USER_ID` | PNV user ID |
-| `METAKOCKA_ID` | Metakocka account ID |
-| `METAKOCKA_KEY` | Metakocka API key |
-| `GOOGLE_API_KEY` | Google Gemini API key for AI categorization |
-| `MONGO_URI` | MongoDB connection string |
-| `MONGO_DB_NAME` | MongoDB database name |
-| `WEBHOOK_API_KEY` | Secret key used to authenticate the webhook endpoints (see below) |
+</div>
 
 ---
 
-## Webhook endpoints (n8n triggers)
+## Overview
 
-All webhook endpoints are protected by an API key passed in the `x-api-key` request header.
-The key must match the `WEBHOOK_API_KEY` environment variable.
+This API serves as the backbone of the Patrik product management pipeline. It connects multiple data sources into a single MongoDB store and exposes flexible export endpoints for downstream consumers like Shopify, Recharge, and custom integrations.
 
-### 1. PNV Product Sync
+**Key capabilities:**
 
-**`POST /api/export/webhooks/sync/pnv`**
+- **Product sync** from PNV (Partner.net Vision) with automatic CSV parsing
+- **Stock & pricing enrichment** from Metakocka warehouse/pricelist APIs
+- **AI categorization** using Google Gemini 2.5 Flash
+- **Configurable exports** in CSV, JSON, and XML with preset templates
+- **Webhook-driven scheduling** via n8n (no internal cron)
 
-Triggers a full product sync from PNV:
-1. Authenticates with PNV and triggers a CSV export
-2. Downloads the resulting CSV file
-3. Parses and enriches each product with stock (Metakocka) and pricelist (Metakocka)
-4. Upserts all products into MongoDB (`products` collection)
-5. Products no longer in the CSV are soft-deleted (`active: false`)
-
-The endpoint responds immediately with `202 Accepted` and runs the sync in the background.
-
-**Request**
+## Architecture
 
 ```
-POST /api/export/webhooks/sync/pnv
-x-api-key: <WEBHOOK_API_KEY>
-Content-Type: application/json
-
-{
-  "webhook": "https://your-n8n/webhook/abc123"
-}
+                          n8n (scheduler)
+                               |
+                     webhook triggers (POST)
+                               |
+                               v
+  ┌─────────┐   CSV    ┌─────────────────┐   enrich   ┌────────────┐
+  │   PNV   │ -------> │                 │ <---------> │ Metakocka  │
+  │ (admin) │          │   Export API    │             │  (stock &  │
+  └─────────┘          │   (Express)    │             │  pricing)  │
+                       │                 │             └────────────┘
+                       │                 │
+  ┌─────────┐  batch   │                 │   query    ┌────────────┐
+  │ Gemini  │ <------> │                 │ <--------> │  MongoDB   │
+  │  (AI)   │          │                 │            │            │
+  └─────────┘          └────────┬────────┘            └────────────┘
+                                │
+                    ┌───────────┼───────────┐
+                    v           v           v
+                  CSV         JSON         XML
+               (Shopify)   (custom)    (Recharge)
 ```
 
-`webhook` is optional. When provided, the app POSTs a result payload to that URL once the sync finishes (success or failure).
+> For a deep dive into the system design, see [Architecture](docs/architecture.md).
 
-**Callback payload — success**
-```json
-{
-  "event": "pnv_sync_completed",
-  "success": true,
-  "startedAt": "2024-01-15T10:00:00.000Z",
-  "finishedAt": "2024-01-15T10:05:30.000Z",
-  "durationMs": 330000,
-  "stats": {
-    "totalProcessed": 125,
-    "productsCreated": 5,
-    "productsUpdated": 120,
-    "productsDeactivated": 2
-  }
-}
-```
+## Quick Start
 
-**Callback payload — failure**
-```json
-{
-  "event": "pnv_sync_completed",
-  "success": false,
-  "startedAt": "2024-01-15T10:00:00.000Z",
-  "finishedAt": "2024-01-15T10:00:05.000Z",
-  "durationMs": 5000,
-  "error": "Failed to download CSV from PNV."
-}
-```
+### Prerequisites
 
-**Response `202`**
+- **Node.js** 22 LTS (or compatible)
+- **MongoDB** 7.0+
+- PNV admin credentials
+- Metakocka API key
+- Google Gemini API key *(optional, for AI categorization)*
 
-```json
-{
-  "message": "PNV product sync started.",
-  "startedAt": "2024-01-15T10:00:00.000Z"
-}
-```
-
----
-
-### 2. AI Categorization
-
-**`POST /api/export/webhooks/sync/ai-categorization`**
-
-Runs AI category identification (Google Gemini) on products that have not yet been categorized.
-
-- If **no body** is sent, it runs for **all exports** that have `aiCategorizationEnabled: true` in MongoDB.
-- If a specific `exportId` is sent in the body, it runs only for that export.
-
-The endpoint responds immediately with `202 Accepted` and runs in the background.
-
-**Request — all AI-enabled exports**
-
-```
-POST /api/export/webhooks/sync/ai-categorization
-x-api-key: <WEBHOOK_API_KEY>
-Content-Type: application/json
-
-{
-  "webhook": "https://your-n8n/webhook/abc123"
-}
-```
-
-**Request — specific export**
-
-```
-POST /api/export/webhooks/sync/ai-categorization
-x-api-key: <WEBHOOK_API_KEY>
-Content-Type: application/json
-
-{
-  "exportId": "664f1a2b3c4d5e6f7a8b9c0d",
-  "webhook": "https://your-n8n/webhook/abc123"
-}
-```
-
-`webhook` is optional. When provided, the app POSTs a result payload to that URL once all exports are processed.
-
-**Callback payload — success**
-```json
-{
-  "event": "ai_categorization_completed",
-  "success": true,
-  "startedAt": "2024-01-15T10:05:30.000Z",
-  "finishedAt": "2024-01-15T10:07:00.000Z",
-  "durationMs": 90000,
-  "stats": {
-    "exportsProcessed": 2,
-    "results": [
-      {
-        "exportId": "664f1a2b3c4d5e6f7a8b9c0d",
-        "success": true,
-        "durationMs": 45000,
-        "productsFound": 20,
-        "productsCategorized": 18
-      }
-    ]
-  }
-}
-```
-
-**Callback payload — failure** (one or more exports failed — `results` array shows which ones)
-```json
-{
-  "event": "ai_categorization_completed",
-  "success": false,
-  "startedAt": "2024-01-15T10:05:30.000Z",
-  "finishedAt": "2024-01-15T10:06:00.000Z",
-  "durationMs": 30000,
-  "stats": {
-    "exportsProcessed": 1,
-    "results": [
-      {
-        "exportId": "664f1a2b3c4d5e6f7a8b9c0d",
-        "success": false,
-        "durationMs": 30000,
-        "error": "No categories found for exportId."
-      }
-    ]
-  }
-}
-```
-
-**Response `202`**
-
-```json
-{
-  "message": "AI categorization started for 2 export(s).",
-  "exportIds": ["664f1a2b3c4d5e6f7a8b9c0d", "664f1a2b3c4d5e6f7a8b9c0e"],
-  "startedAt": "2024-01-15T10:05:00.000Z"
-}
-```
-
-**Tip — chaining in n8n:** Pass the URL of the AI categorization n8n workflow as `webhook` in the PNV sync request body. When PNV sync finishes, it GETs that URL and n8n immediately fires the next step.
-
-```
-[Schedule] → POST /webhooks/sync/pnv  { webhook: <n8n webhook> }
-                  ↓ (background finishes)
-             GET <n8n webhook>
-                  ↓
-             POST /webhooks/sync/ai-categorization  { webhook: <n8n webhook 2> }
-                  ↓ (background finishes)
-             GET <n8n webhook 2>
-```
-
----
-
-## Other API endpoints
-
-### Health check
-
-```
-GET /api/export/health
-```
-
-Public, no authentication required. Checks the status of the service and all its dependencies in parallel and returns a single combined result.
-
-**Response `200` — all healthy**
-
-```json
-{
-  "status": "ok",
-  "version": "1.0.0",
-  "appName": "patrik-products-export",
-  "timestamp": "2024-01-15T10:00:00.000Z",
-  "uptime": 3600.5,
-  "memoryUsage": { "rss": 12345678, "heapUsed": 9876543 },
-  "dependencies": {
-    "database": "ok",
-    "pnv": "ok",
-    "metakocka": "ok"
-  }
-}
-```
-
-**Response `503` — one or more dependencies unhealthy**
-
-Same shape as above but `"status": "error"` and the affected dependency shows `"error"` or `"misconfigured"`.
-
-**Dependency statuses**
-
-| Dependency | What is checked | Possible values |
-|---|---|---|
-| `database` | MongoDB ping | `ok`, `error` |
-| `pnv` | HEAD request to `PNV_BASE_URL` (5 s timeout) | `ok`, `error`, `misconfigured` |
-| `metakocka` | POST to warehouse stock endpoint with limit=1 (5 s timeout) | `ok`, `error`, `misconfigured` |
-
-`misconfigured` means the required environment variables for that service are not set.
-
-### Custom exports
-
-Saved export configurations (CSV / JSON / XML) with filtering, field selection, and pricelist priority.
-
-```
-GET    /api/export/custom-export              List all configs
-POST   /api/export/custom-export              Create a config
-GET    /api/export/custom-export/:id          Get a config
-PUT    /api/export/custom-export/:id          Update a config
-DELETE /api/export/custom-export/:id          Delete a config (soft)
-GET    /api/export/custom-export/:id/csv      Download CSV
-GET    /api/export/custom-export/:id/json     Download JSON
-GET    /api/export/custom-export/:id/xml      Download XML
-```
-
-### Recharge XML export
-
-```
-GET /api/export/recharge/xml
-```
-
-Returns a fixed-format XML feed for the Recharge platform, including products, variants, stock, prices, and AI-assigned Katalog categories.
-
----
-
-## Development
+### Installation
 
 ```bash
+git clone https://github.com/etiam-si/patrik-products-automation.git
+cd patrik-products-automation
+npm install
+```
+
+### Configuration
+
+Copy the example environment file and fill in your credentials:
+
+```bash
+cp .env.development .env
+```
+
+See the [Environment Variables](docs/deployment.md#environment-variables) reference for all available options.
+
+### Run
+
+```bash
+# Development (hot-reloads .env.development overrides)
 npm run dev
-```
 
-## Production
-
-```bash
+# Production
 npm start
 ```
+
+The API starts on `http://localhost:3000` by default. All routes are under `/api/export`.
+
+## API Reference
+
+| Endpoint | Description | Auth | Docs |
+|----------|-------------|------|------|
+| `GET /api/export/health` | Service & dependency health | Public | [Health](docs/api/health.md) |
+| `POST /api/export/webhooks/sync/pnv` | Trigger PNV product sync | API Key | [Webhooks](docs/api/webhooks.md#pnv-product-sync) |
+| `POST /api/export/webhooks/sync/ai-categorization` | Run AI categorization | API Key | [Webhooks](docs/api/webhooks.md#ai-categorization) |
+| `POST /api/export/webhooks/categorize` | Categorize external products | API Key | [AI Categorization](docs/api/ai-categorization.md) |
+| `GET\|POST\|PUT\|DELETE /api/export/custom-export` | Manage export configs | Dual Auth | [Custom Exports](docs/api/custom-exports.md) |
+| `GET /api/export/custom-export/:id/csv\|json\|xml` | Download export data | Dual Auth | [Custom Exports](docs/api/custom-exports.md#download-endpoints) |
+| `GET /api/export/recharge/xml` | Recharge XML feed | Dual Auth | [Webhooks](docs/api/webhooks.md#recharge-xml) |
+
+> **Auth types:** `API Key` = `x-api-key` header, `Dual Auth` = JWT bearer or API key, `Public` = no auth required.
+
+## Data Pipeline
+
+The sync pipeline runs as a background job triggered by n8n webhooks:
+
+```
+1. Authenticate with PNV  ─>  trigger CSV export  ─>  download CSV
+2. Parse CSV  ─>  map fields  ─>  normalize product data
+3. Enrich with Metakocka stock levels and pricelist pricing
+4. Upsert into MongoDB  ─>  soft-delete removed products
+5. (Optional) AI categorization pass with Google Gemini
+6. Callback to n8n webhook URL on completion
+```
+
+Each step is instrumented with analytics tracking and optional webhook callbacks for pipeline orchestration.
+
+## Docker
+
+Build and run with Docker:
+
+```bash
+docker build -t patrik-export-api .
+docker run -d \
+  --name export-api \
+  -p 3000:3000 \
+  -v /path/to/data:/data \
+  --env-file .env \
+  patrik-export-api
+```
+
+Or use the included build script:
+
+```bash
+./scripts/build-and-push.sh
+```
+
+> See [Deployment Guide](docs/deployment.md) for full Docker and production setup instructions.
+
+## Documentation
+
+| Document | Description |
+|----------|-------------|
+| [Architecture](docs/architecture.md) | System design, data flow, and component overview |
+| [Deployment](docs/deployment.md) | Docker, environment variables, and production setup |
+| **API Reference** | |
+| [Webhooks](docs/api/webhooks.md) | PNV sync, AI categorization triggers, and Recharge |
+| [Custom Exports](docs/api/custom-exports.md) | Export configuration CRUD and download endpoints |
+| [AI Categorization](docs/api/ai-categorization.md) | Third-party product categorization API |
+| [Health Check](docs/api/health.md) | Service health and dependency monitoring |
+
+## Project Structure
+
+```
+patrik-products-automation/
+├── index.js                  # Entry point & server startup
+├── src/
+│   ├── app.js                # Express app setup & route mounting
+│   ├── config/               # External service configurations
+│   │   ├── metakocka/        # Metakocka API config
+│   │   └── pnv/              # PNV field mappings
+│   ├── controllers/          # Request handlers
+│   ├── jobs/                 # Background job orchestration
+│   │   └── pnv/              # PNV sync job implementation
+│   ├── middleware/            # Auth, analytics, logging
+│   ├── models/               # Data models
+│   ├── routes/               # Route definitions
+│   │   └── export/           # Route aggregation & middleware
+│   └── services/             # Business logic
+│       ├── ai/               # Gemini AI categorization
+│       ├── db/               # MongoDB connection & migrations
+│       ├── metakocka/        # Stock & pricing queries
+│       └── pnv/              # PNV sync & CSV processing
+├── docs/                     # Documentation
+│   └── api/                  # API reference docs
+├── scripts/                  # Build & deploy scripts
+├── public/                   # Static assets
+└── data/                     # Runtime data files (CSV, XML)
+```
+
+## Contributing
+
+Contributions are welcome! Please read the [Contributing Guide](CONTRIBUTING.md) before submitting a pull request.
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
+
+---
+
+<div align="center">
+  <sub>Built by <a href="https://etiam.si">etiam.si</a></sub>
+</div>
