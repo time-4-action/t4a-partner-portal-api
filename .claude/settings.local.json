@@ -8,7 +8,11 @@
       "Bash(xargs grep *)",
       "Bash(git add *)",
       "Bash(git commit -m ' *)",
-      "Bash(git commit *)"
+      "Bash(git commit *)",
+      "Bash(git push *)",
+      "Bash(node -e \"console.log\\(require\\('dotenv/package.json'\\).version\\)\")",
+      "Bash(node -e \"const d = require\\('dotenv'\\); console.log\\(Object.keys\\(d\\)\\)\")",
+      "Bash(node -e \"const d = require\\('dotenv'\\); const r = d.config\\({ path: '.env' }\\); console.log\\(r\\)\")"
     ]
   }
 }
