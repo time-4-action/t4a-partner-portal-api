@@ -1,22 +1,5 @@
-const { getDb } = require('../services/db/mongo.service');
-
-const COLLECTION_NAME = 'analytics';
-
-/**
- * Saves a single API log entry to the database.
- * @param {Object} logData - The data object to insert
- */
 const saveAnalyticsData = async (logData) => {
-    try {
-        const db = getDb();
-        const collection = db.collection(COLLECTION_NAME);
-        
-        await collection.insertOne(logData);
-        
-    } catch (error) {
-        // Log locally so we don't crash the app if Mongo is down
-        console.error('[Analytics Service] Error saving log:', error);
-    }
+    // MongoDB write removed — analytics collection dropped
 };
 
 const monitorFunction = async (fn, actionName, metadata = {}) => {
