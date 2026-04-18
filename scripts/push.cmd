@@ -3,8 +3,13 @@ setlocal
 
 set IMAGE=time4action/t4a-partner-portal-api
 
-:: Always generate a date tag
-for /f "tokens=*" %%i in ('powershell -NoProfile -Command "Get-Date -Format 'yyyyMMdd-HHmmss'"') do set DATE_TAG=%%i
+:: Read the date tag saved by build.cmd; fall back to generating a new one
+if exist "%TEMP%\t4a-ppa-date-tag.tmp" (
+    for /f "tokens=*" %%i in (%TEMP%\t4a-ppa-date-tag.tmp) do set DATE_TAG=%%i
+    del "%TEMP%\t4a-ppa-date-tag.tmp"
+) else (
+    for /f "tokens=*" %%i in ('powershell -NoProfile -Command "Get-Date -Format 'yyyyMMdd-HHmmss'"') do set DATE_TAG=%%i
+)
 
 :: Determine tag
 if "%~1"=="--latest" (

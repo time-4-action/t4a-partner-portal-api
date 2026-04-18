@@ -32,4 +32,7 @@ if "%TAG%" neq "%DATE_TAG%" (
     echo [build] Done: %IMAGE%:%DATE_TAG%
 )
 
+:: Save the date tag so push.cmd uses the exact same timestamp
+echo %DATE_TAG%> "%TEMP%\t4a-ppa-date-tag.tmp"
+
 endlocal
