@@ -146,10 +146,7 @@ const searchProducts = async (query) => {
                     code: child.code,
                     ean_code: child.ean_code || '',
                     product_name: child.product_name,
-                    short_description: child.short_description || parent.short_description || '',
-                    detailed_description: child.detailed_description || parent.detailed_description || '',
-                    stock_amount: child.stock_amount || 0,
-                    image: (child.images && child.images[0]) || (parent.images && parent.images[0]) || null,
+                    image: (child.images && child.images[0]) || null,
                 });
             }
         } else {
@@ -157,9 +154,6 @@ const searchProducts = async (query) => {
                 code: parent.code,
                 ean_code: parent.ean_code || '',
                 product_name: parent.product_name,
-                short_description: parent.short_description || '',
-                detailed_description: parent.detailed_description || '',
-                stock_amount: parent.stock_amount || 0,
                 image: (parent.images && parent.images[0]) || null,
             });
         }
