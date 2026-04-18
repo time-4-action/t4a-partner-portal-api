@@ -1,0 +1,10 @@
+services:
+  app:
+    image: time4action/t4a-partner-portal-api
+    pull_policy: always
+    container_name: t4a-partner-portal-api
+    restart: unless-stopped
+    ports:
+      - "3001:3000"
+    volumes:
+      - /data/stack/apps/time-4-action/partner-portal/api/data:/data
