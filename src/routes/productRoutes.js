@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const productController = require('../controllers/productController');
 
+router.get('/search', productController.searchProducts);
 router.get('/', productController.getAllProducts);
 router.get('/tsv/:exportId', productController.getProductsAsTsv);
 router.get('/with-ai-categories', productController.getProductsWithAiCategories);

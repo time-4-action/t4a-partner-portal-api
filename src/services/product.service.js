@@ -118,6 +118,56 @@ const clearAllAiCategoriesForExport = async (exportId) => {
     return result.modifiedCount;
 };
 
+const searchProducts = async (query) => {
+    const db = getDb();
+    const escaped = query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp(escaped, 'i');
+    const filter = {
+        active: { $ne: false },
+        $or: [
+            { code: regex },
+            { ean_code: regex },
+            { product_name: regex },
+            { short_description: regex },
+            { detailed_description: regex },
+            { 'child_products.code': regex },
+            { 'child_products.ean_code': regex },
+            { 'child_products.product_name': regex },
+        ],
+    };
+
+    const parents = await db.collection('products').find(filter).toArray();
+
+    const results = [];
+    for (const parent of parents) {
+        if (parent.child_products && parent.child_products.length > 0) {
+            for (const child of parent.child_products) {
+                results.push({
+                    code: child.code,
+                    ean_code: child.ean_code || '',
+                    product_name: child.product_name,
+                    short_description: child.short_description || parent.short_description || '',
+                    detailed_description: child.detailed_description || parent.detailed_description || '',
+                    stock_amount: child.stock_amount || 0,
+                    image: (child.images && child.images[0]) || (parent.images && parent.images[0]) || null,
+                });
+            }
+        } else {
+            results.push({
+                code: parent.code,
+                ean_code: parent.ean_code || '',
+                product_name: parent.product_name,
+                short_description: parent.short_description || '',
+                detailed_description: parent.detailed_description || '',
+                stock_amount: parent.stock_amount || 0,
+                image: (parent.images && parent.images[0]) || null,
+            });
+        }
+    }
+
+    return results;
+};
+
 module.exports = {
     getAllProducts,
     getProductByIdentifier,
@@ -126,4 +176,5 @@ module.exports = {
     setProductAiCategory,
     removeProductAiCategory,
     clearAllAiCategoriesForExport,
+    searchProducts,
 };

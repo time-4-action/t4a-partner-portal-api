@@ -71,6 +71,19 @@ exports.getProductByIdentifier = async (req, res) => {
     }
 };
 
+exports.searchProducts = async (req, res) => {
+    try {
+        const { q } = req.query;
+        if (!q || q.trim().length < 2) {
+            return res.status(400).json({ success: false, message: 'Query param q must be at least 2 characters.' });
+        }
+        const data = await productService.searchProducts(q.trim());
+        res.json({ success: true, data });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+};
+
 exports.getProductsAsTsv = async (req, res) => {
     try {
         const { exportId } = req.params;

@@ -13,7 +13,9 @@ app.set('trust proxy', true);
 app.use(express.static(path.join(__dirname, '..', 'public')));
 
 const healthRoutes = require('./routes/healthRoutes');
+const productRoutes = require('./routes/productRoutes');
 app.use('/api/export/health', healthRoutes);
+app.use('/api/product', productRoutes);
 app.use('/api/export', exportRoutes);
 
 module.exports = { app };
