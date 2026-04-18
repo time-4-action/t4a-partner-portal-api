@@ -118,30 +118,38 @@ const clearAllAiCategoriesForExport = async (exportId) => {
     return result.modifiedCount;
 };
 
-const _formatParent = (p) => ({
+const _resolveCategory = (parent, exportId) => {
+    if (!exportId) return undefined;
+    const match = (parent.ai_categories || []).find((c) => c.exportId === exportId);
+    return match ? match.categoryName : null;
+};
+
+const _formatParent = (p, category) => ({
     code: p.code,
     ean_code: p.ean_code || '',
     product_name: p.product_name,
     image: (p.images && p.images[0]) || null,
+    ...(category !== undefined && { category }),
 });
 
-const _formatChild = (c) => ({
+const _formatChild = (c, category) => ({
     code: c.code,
     ean_code: c.ean_code || '',
     product_name: c.product_name,
     image: (c.images && c.images[0]) || null,
+    ...(category !== undefined && { category }),
 });
 
 const _allWordsMatch = (text, wordRegs) => wordRegs.every((r) => r.test(text || ''));
 
-const searchProducts = async (query) => {
+const searchProducts = async (query, exportId = null) => {
     const db = getDb();
     const collection = db.collection('products');
     const activeFilter = { active: { $ne: false } };
 
     // Exact code/EAN match → single result
     const exactParent = await collection.findOne({ ...activeFilter, $or: [{ code: query }, { ean_code: query }] });
-    if (exactParent) return [_formatParent(exactParent)];
+    if (exactParent) return [_formatParent(exactParent, _resolveCategory(exactParent, exportId))];
 
     const exactChildParent = await collection.findOne({
         ...activeFilter,
@@ -149,7 +157,7 @@ const searchProducts = async (query) => {
     });
     if (exactChildParent) {
         const child = exactChildParent.child_products.find((c) => c.code === query || c.ean_code === query);
-        if (child) return [_formatChild(child)];
+        if (child) return [_formatChild(child, _resolveCategory(exactChildParent, exportId))];
     }
 
     // Text search on name/code/ean only (no descriptions — they cause false positives)
@@ -183,8 +191,10 @@ const searchProducts = async (query) => {
     const results = [];
 
     for (const parent of parents) {
+        const category = _resolveCategory(parent, exportId);
+
         if (!parent.child_products || parent.child_products.length === 0) {
-            results.push(_formatParent(parent));
+            results.push(_formatParent(parent, category));
             continue;
         }
 
@@ -194,7 +204,7 @@ const searchProducts = async (query) => {
         if (parentCodeMatch || parentNameMatch) {
             // Parent matched by code/name — return all children as variants
             for (const child of parent.child_products) {
-                results.push(_formatChild(child));
+                results.push(_formatChild(child, category));
             }
         } else {
             // Only specific children matched — return just those
@@ -204,7 +214,7 @@ const searchProducts = async (query) => {
                     codeRegex.test(child.ean_code || '') ||
                     _allWordsMatch(child.product_name, wordRegs)
                 ) {
-                    results.push(_formatChild(child));
+                    results.push(_formatChild(child, category));
                 }
             }
         }
