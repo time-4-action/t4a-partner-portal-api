@@ -4,7 +4,11 @@
       "Bash(mkdir -p scripts docs)",
       "Bash(mv build-and-push.cmd build-and-push.sh scripts/)",
       "Bash(mv primer.xml product.json data/)",
-      "Bash(mv API_ENDPOINT.md docs/)"
+      "Bash(mv API_ENDPOINT.md docs/)",
+      "Bash(xargs grep *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git commit *)"
     ]
   }
 }
