@@ -118,44 +118,95 @@ const clearAllAiCategoriesForExport = async (exportId) => {
     return result.modifiedCount;
 };
 
+const _formatParent = (p) => ({
+    code: p.code,
+    ean_code: p.ean_code || '',
+    product_name: p.product_name,
+    image: (p.images && p.images[0]) || null,
+});
+
+const _formatChild = (c) => ({
+    code: c.code,
+    ean_code: c.ean_code || '',
+    product_name: c.product_name,
+    image: (c.images && c.images[0]) || null,
+});
+
+const _allWordsMatch = (text, wordRegs) => wordRegs.every((r) => r.test(text || ''));
+
 const searchProducts = async (query) => {
     const db = getDb();
+    const collection = db.collection('products');
+    const activeFilter = { active: { $ne: false } };
+
+    // Exact code/EAN match → single result
+    const exactParent = await collection.findOne({ ...activeFilter, $or: [{ code: query }, { ean_code: query }] });
+    if (exactParent) return [_formatParent(exactParent)];
+
+    const exactChildParent = await collection.findOne({
+        ...activeFilter,
+        $or: [{ 'child_products.code': query }, { 'child_products.ean_code': query }],
+    });
+    if (exactChildParent) {
+        const child = exactChildParent.child_products.find((c) => c.code === query || c.ean_code === query);
+        if (child) return [_formatChild(child)];
+    }
+
+    // Text search on name/code/ean only (no descriptions — they cause false positives)
     const escaped = query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const regex = new RegExp(escaped, 'i');
+    const words = query.trim().split(/\s+/);
+    const wordRegs = words.map((w) => new RegExp(w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'));
+    const codeRegex = new RegExp(escaped, 'i');
+
+    const nameCondition =
+        words.length > 1
+            ? { $and: wordRegs.map((r) => ({ product_name: r })) }
+            : { product_name: wordRegs[0] };
+    const childNameCondition =
+        words.length > 1
+            ? { $and: wordRegs.map((r) => ({ 'child_products.product_name': r })) }
+            : { 'child_products.product_name': wordRegs[0] };
+
     const filter = {
-        active: { $ne: false },
+        ...activeFilter,
         $or: [
-            { code: regex },
-            { ean_code: regex },
-            { product_name: regex },
-            { short_description: regex },
-            { detailed_description: regex },
-            { 'child_products.code': regex },
-            { 'child_products.ean_code': regex },
-            { 'child_products.product_name': regex },
+            { code: codeRegex },
+            { ean_code: codeRegex },
+            nameCondition,
+            { 'child_products.code': codeRegex },
+            { 'child_products.ean_code': codeRegex },
+            childNameCondition,
         ],
     };
 
-    const parents = await db.collection('products').find(filter).toArray();
-
+    const parents = await collection.find(filter).toArray();
     const results = [];
+
     for (const parent of parents) {
-        if (parent.child_products && parent.child_products.length > 0) {
+        if (!parent.child_products || parent.child_products.length === 0) {
+            results.push(_formatParent(parent));
+            continue;
+        }
+
+        const parentCodeMatch = codeRegex.test(parent.code) || codeRegex.test(parent.ean_code || '');
+        const parentNameMatch = _allWordsMatch(parent.product_name, wordRegs);
+
+        if (parentCodeMatch || parentNameMatch) {
+            // Parent matched by code/name — return all children as variants
             for (const child of parent.child_products) {
-                results.push({
-                    code: child.code,
-                    ean_code: child.ean_code || '',
-                    product_name: child.product_name,
-                    image: (child.images && child.images[0]) || null,
-                });
+                results.push(_formatChild(child));
             }
         } else {
-            results.push({
-                code: parent.code,
-                ean_code: parent.ean_code || '',
-                product_name: parent.product_name,
-                image: (parent.images && parent.images[0]) || null,
-            });
+            // Only specific children matched — return just those
+            for (const child of parent.child_products) {
+                if (
+                    codeRegex.test(child.code || '') ||
+                    codeRegex.test(child.ean_code || '') ||
+                    _allWordsMatch(child.product_name, wordRegs)
+                ) {
+                    results.push(_formatChild(child));
+                }
+            }
         }
     }
 
