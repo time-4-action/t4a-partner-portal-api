@@ -77,7 +77,10 @@ interface ExportFilters {
   aiCategory: string;               // "all" or ObjectId string
   showNew: boolean;                 // Default: false
   showRecommended: boolean;         // Default: false
-  publishedOnly: boolean;           // Default: false
+  publishedOnly: boolean;           // Default: false. Cascades into variants:
+                                    // excludes unpublished parents AND strips
+                                    // unpublished variants from child_products
+                                    // before all other filters and row generation.
 }
 ```
 
@@ -294,6 +297,11 @@ product matches IF:
   AND (showNew is false OR product.new is true)
   AND (showRecommended is false OR product.recomended is true)
   AND (publishedOnly is false OR product.published is true)
+
+If publishedOnly is true, the filter also narrows each surviving parent's
+child_products to only those variants whose own `published` field is true —
+all downstream filters (stock, price, image, search) and row generation
+operate on this narrowed set, so unpublished variants never appear in output.
 ```
 
 ---
