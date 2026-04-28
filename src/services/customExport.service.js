@@ -621,7 +621,17 @@ const getPriceFromPriority = (variant, pricelistPriority) => {
  * @returns {Array} Filtered products
  */
 const applyFilters = (products, filters, pricelistPriority = []) => {
-    return products.filter(product => {
+    // publishedOnly cascades into variants: drop unpublished parents entirely,
+    // and narrow each surviving parent's child_products to the published ones.
+    // All downstream filters (stock, price, image, search) and row generation
+    // then operate on the narrowed set, so unpublished variants never appear.
+    const input = filters.publishedOnly
+        ? products
+            .filter(p => p.published)
+            .map(p => ({ ...p, child_products: (p.child_products || []).filter(v => v.published) }))
+        : products;
+
+    return input.filter(product => {
         // Search filter
         if (filters.search && filters.search.trim() !== '') {
             const searchLower = filters.search.toLowerCase();
@@ -700,7 +710,6 @@ const applyFilters = (products, filters, pricelistPriority = []) => {
         // Boolean flags
         if (filters.showNew && !product.new) return false;
         if (filters.showRecommended && !product.recomended) return false;
-        if (filters.publishedOnly && !product.published) return false;
         if (filters.excludeCloseOut && product.product_name?.toUpperCase().includes('CLOSE OUT')) return false;
         if (filters.excludeCloseOut && product.images?.some(img => img?.toLowerCase().includes('close-out'))) return false;
 
