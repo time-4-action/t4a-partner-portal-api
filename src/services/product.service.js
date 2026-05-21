@@ -145,7 +145,7 @@ const _allWordsMatch = (text, wordRegs) => wordRegs.every((r) => r.test(text || 
 const searchProducts = async (query, exportId = null) => {
     const db = getDb();
     const collection = db.collection('products');
-    const activeFilter = { active: { $ne: false } };
+    const activeFilter = { active: { $ne: false }, published: true };
 
     // Exact code/EAN match → single result
     const exactParent = await collection.findOne({ ...activeFilter, $or: [{ code: query }, { ean_code: query }] });
@@ -156,7 +156,9 @@ const searchProducts = async (query, exportId = null) => {
         $or: [{ 'child_products.code': query }, { 'child_products.ean_code': query }],
     });
     if (exactChildParent) {
-        const child = exactChildParent.child_products.find((c) => c.code === query || c.ean_code === query);
+        const child = exactChildParent.child_products.find(
+            (c) => (c.code === query || c.ean_code === query) && c.published,
+        );
         if (child) return [_formatChild(child, _resolveCategory(exactChildParent, exportId))];
     }
 
@@ -192,8 +194,9 @@ const searchProducts = async (query, exportId = null) => {
 
     for (const parent of parents) {
         const category = _resolveCategory(parent, exportId);
+        const publishedChildren = (parent.child_products || []).filter((c) => c.published);
 
-        if (!parent.child_products || parent.child_products.length === 0) {
+        if (publishedChildren.length === 0) {
             results.push(_formatParent(parent, category));
             continue;
         }
@@ -202,13 +205,13 @@ const searchProducts = async (query, exportId = null) => {
         const parentNameMatch = _allWordsMatch(parent.product_name, wordRegs);
 
         if (parentCodeMatch || parentNameMatch) {
-            // Parent matched by code/name — return all children as variants
-            for (const child of parent.child_products) {
+            // Parent matched by code/name — return all published children as variants
+            for (const child of publishedChildren) {
                 results.push(_formatChild(child, category));
             }
         } else {
-            // Only specific children matched — return just those
-            for (const child of parent.child_products) {
+            // Only specific children matched — return just those (published only)
+            for (const child of publishedChildren) {
                 if (
                     codeRegex.test(child.code || '') ||
                     codeRegex.test(child.ean_code || '') ||
