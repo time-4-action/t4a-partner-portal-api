@@ -840,66 +840,29 @@ const escapeCsvValue = (value) => {
 };
 
 /**
- * Generates inventory CSV rows in the Shopify inventory import format.
- * Fixed columns: Handle, Title, Option1 Name, Option1 Value, Option2 Name, Option2 Value,
- *                Option3 Name, Option3 Value, SKU, HS Code, COO, {locationName}
+ * Builds inventory items (SKU + quantity) from filtered products.
+ * Emits one item per variant; products without variants emit a single item using the product code/stock.
+ * Items with no SKU are skipped.
  * @param {Array} products - Filtered products
- * @param {string} locationName - Shopify location name (exact case match)
- * @returns {{ headers: string[], rows: string[][] }} Headers and data rows
+ * @returns {Array<{sku: string, quantity: number}>}
  */
-const generateInventoryRows = (products, locationName, option1Name) => {
-    const headers = [
-        'Handle', 'Title', 'Option1 Name', 'Option1 Value',
-        'Option2 Name', 'Option2 Value', 'Option3 Name', 'Option3 Value',
-        'SKU', 'HS Code', 'COO', locationName || 'Location'
-    ];
-
-    const rows = [];
+const generateInventoryItems = (products) => {
+    const items = [];
     for (const product of products) {
         const variants = product.child_products || [];
-        const handle = product.token || '';
-        const title = product.product_name || '';
-
         if (variants.length === 0) {
-            // Product without variants
-            rows.push([
-                handle, title, option1Name || 'Variant', title,
-                '', '', '', '',
-                product.code || '', '', '',
-                String(product.stock_amount || 0)
-            ]);
+            const sku = product.code || '';
+            if (!sku) continue;
+            items.push({ sku, quantity: product.stock_amount || 0 });
         } else {
             for (const variant of variants) {
-                // Derive option value from size, or variant name suffix, or full variant name
-                let optionValue = '';
-                if (variant.size) {
-                    optionValue = variant.size;
-                } else if (variant.product_name && product.product_name) {
-                    const parentName = product.product_name.trim();
-                    const variantName = variant.product_name.trim();
-                    if (variantName.startsWith(parentName)) {
-                        const suffix = variantName.slice(parentName.length).trim();
-                        optionValue = suffix || variantName;
-                    } else {
-                        // Try extracting trailing number as size (e.g. "Patrik QT-Wave 71" → "71", "85 l" → "85", "85 V2 - GET" → "85")
-                        const trailingNum = variantName.match(/\s(\d+(?:[.,]\d+)?)\s*l?\s*(?:V\d+)?\s*(?:-\s*\w+)*\s*$/i);
-                        optionValue = trailingNum ? trailingNum[1] : variantName;
-                    }
-                } else {
-                    optionValue = variant.product_name || title;
-                }
-
-                rows.push([
-                    handle, title, option1Name || 'Variant', optionValue,
-                    '', '', '', '',
-                    variant.code || '', '', '',
-                    String(variant.stock_amount || 0)
-                ]);
+                const sku = variant.code || '';
+                if (!sku) continue;
+                items.push({ sku, quantity: variant.stock_amount || 0 });
             }
         }
     }
-
-    return { headers, rows };
+    return items;
 };
 
 /**
@@ -922,10 +885,10 @@ const generateCsvExport = async (id) => {
     let csv;
 
     if (config.preset === 'inventory') {
-        // Inventory format: fixed Shopify-compatible columns with location-based stock
-        const { headers, rows } = generateInventoryRows(filteredProducts, config.inventoryLocationName, config.option1Name);
-        const headerLine = headers.map(escapeCsvValue).join(',');
-        const dataLines = rows.map(row => row.map(escapeCsvValue).join(','));
+        // Inventory format: SKU + Quantity only
+        const items = generateInventoryItems(filteredProducts);
+        const headerLine = 'SKU,Quantity';
+        const dataLines = items.map(it => `${escapeCsvValue(it.sku)},${it.quantity}`);
         csv = [headerLine, ...dataLines].join('\n');
     } else {
         const rows = generateExportRows(filteredProducts, config);
@@ -991,6 +954,18 @@ const generateJsonExport = async (id) => {
     const db = getDb();
     const products = await db.collection(PRODUCTS_COLLECTION).find({ active: true }).toArray();
     const filteredProducts = applyFilters(products, config.filters, config.pricelistPriority);
+
+    if (config.preset === 'inventory') {
+        const items = generateInventoryItems(filteredProducts);
+        return {
+            success: true,
+            exportName: config.name,
+            exportId: config._id.toString(),
+            generatedAt: new Date().toISOString(),
+            totalItems: items.length,
+            data: items
+        };
+    }
 
     const data = filteredProducts.map(product => {
         const variants = (product.child_products || []).map(v => {
@@ -1063,6 +1038,16 @@ const generateXmlExport = async (id) => {
     const db = getDb();
     const products = await db.collection(PRODUCTS_COLLECTION).find({ active: true }).toArray();
     const filteredProducts = applyFilters(products, config.filters, config.pricelistPriority);
+
+    if (config.preset === 'inventory') {
+        const items = generateInventoryItems(filteredProducts);
+        const itemXmls = items.map(it =>
+            `  <item>\n    <sku>${escapeXml(it.sku)}</sku>\n    <quantity>${it.quantity}</quantity>\n  </item>`
+        );
+        const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<inventory>\n${itemXmls.join('\n')}\n</inventory>`;
+        const filename = `${config.name.replace(/[^a-z0-9]/gi, '-').toLowerCase()}-${new Date().toISOString().split('T')[0]}.xml`;
+        return { xml, filename, config };
+    }
 
     const productXmls = filteredProducts.map(product => {
         const tags = resolveTagsArray(product, config);
