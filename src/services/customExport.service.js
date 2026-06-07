@@ -32,7 +32,6 @@ const DEFAULT_FILTERS = {
     imageFilter: 'all',
     showNew: false,
     showRecommended: false,
-    publishedOnly: false,
     excludeCloseOut: false
 };
 
@@ -345,7 +344,6 @@ const createExportConfig = async (data, ownerContext = {}) => {
             ...(data.filters || {}),
             showNew: Boolean(data.filters?.showNew),
             showRecommended: Boolean(data.filters?.showRecommended),
-            publishedOnly: Boolean(data.filters?.publishedOnly),
             excludeCloseOut: Boolean(data.filters?.excludeCloseOut)
         },
         pricelistPriority: (data.pricelistPriority || []).map((p, idx) => ({
@@ -512,7 +510,6 @@ const updateExportConfig = async (id, data) => {
             ...data.filters,
             showNew: Boolean(data.filters.showNew ?? existing.filters?.showNew),
             showRecommended: Boolean(data.filters.showRecommended ?? existing.filters?.showRecommended),
-            publishedOnly: Boolean(data.filters.publishedOnly ?? existing.filters?.publishedOnly),
             excludeCloseOut: Boolean(data.filters.excludeCloseOut ?? existing.filters?.excludeCloseOut)
         };
     }
@@ -621,15 +618,14 @@ const getPriceFromPriority = (variant, pricelistPriority) => {
  * @returns {Array} Filtered products
  */
 const applyFilters = (products, filters, pricelistPriority = []) => {
-    // publishedOnly cascades into variants: drop unpublished parents entirely,
-    // and narrow each surviving parent's child_products to the published ones.
-    // All downstream filters (stock, price, image, search) and row generation
-    // then operate on the narrowed set, so unpublished variants never appear.
-    const input = filters.publishedOnly
-        ? products
-            .filter(p => p.published)
-            .map(p => ({ ...p, child_products: (p.child_products || []).filter(v => v.published) }))
-        : products;
+    // Published-only is ALWAYS enforced — exports must never leak unannounced
+    // products. Drop unpublished parents entirely, and narrow each surviving
+    // parent's child_products to the published ones. All downstream filters
+    // (stock, price, image, search) and row generation then operate on the
+    // narrowed set, so unpublished variants never appear.
+    const input = products
+        .filter(p => p.published)
+        .map(p => ({ ...p, child_products: (p.child_products || []).filter(v => v.published) }));
 
     return input.filter(product => {
         // Search filter
