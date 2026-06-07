@@ -78,6 +78,17 @@ The **inventory preset** uses a dedicated code path (`generateInventoryRows()`) 
 | `export_configs` | Custom export configurations (fields, filters, presets) |
 | `analytics` | Function performance and API request logs |
 
+### `products` document shape
+
+A product is a **parent** with an optional `child_products` array of **variants**. Variants are normally the sellable SKUs; the parent groups them.
+
+- **Parent:** `code`, `token` (handle), `product_name`, `short_description`/`detailed_description` (HTML), `images[]`, `categories[]` (PNV path), `ai_categories[]`, `published`, `active`, `archived`, `stock_amount` (often `0` — variants carry stock), `pricelist[]` (often empty — variants carry pricing), `ean_code`, `size`.
+- **Variant (`child_products[]`):** `code` (**SKU**), `ean_code` (**barcode**), `token`, `product_name`, `size` (variant option, e.g. `"77"`), `stock_amount`, `images[]`, per-variant flags (`published`, `archived`, `cart`, `new`, `recomended`), and `pricelist[]`.
+- **`pricelist[]`:** array of `{ name, valid_from, price, vat }` — e.g. `RRP 2025` (`vat: 22`) and a future-dated `RRP 2026` (`vat: 0`). No single price field; resolve via `getPriceFromPriority(variant, pricelistPriority)` in `customExport.service.js`. VAT and `valid_from` vary per list.
+- **`ai_categories[]`:** `{ exportId, categoryId, categoryName }` — categorization is per export, keyed by `exportId`.
+- **Publishing:** parents and variants each have a `published` flag; a published parent may contain unpublished variants. Exports are **always published-only** — `applyFilters` drops unpublished parents and narrows `child_products` to published variants.
+- **No-variant products:** if `child_products` is empty, the parent is the sellable item (use its own `code`/`pricelist`/`stock_amount`).
+
 ## Environment variables
 
 See README.md for the full table. Key variables: `MONGO_URI`, `MONGO_DB_NAME`, `PNV_BASE_URL`, `PNV_EXPORT_PRODUCTS_URL`, `PNV_USER`, `PNV_PASS`, `PNV_GROUP`, `PNV_USER_ID`, `METAKOCKA_ID`, `METAKOCKA_KEY`, `GOOGLE_API_KEY`, `WEBHOOK_API_KEY`.
