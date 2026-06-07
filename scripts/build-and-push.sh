@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -e
 
-IMAGE="etiamsi/t4a-export-api"
+IMAGE="time4action/t4a-partner-portal-api"
 
 docker build . -t "$IMAGE"
 docker push "$IMAGE"
