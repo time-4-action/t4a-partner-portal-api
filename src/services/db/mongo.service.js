@@ -19,9 +19,9 @@ if (!mongoUri || !dbName) {
     throw new Error('MONGO_URI and MONGO_DB_NAME must be set in environment variables.');
 }
 
-// The `authSource` option tells the driver which database to use for authentication.
-// This is necessary if the user's credentials are not stored in the 'admin' database.
-const client = new MongoClient(mongoUri, { authSource: dbName });
+// authSource comes from MONGO_URI (e.g. `?authSource=admin`). Do not override it
+// here with dbName — that points auth at the wrong database and breaks login.
+const client = new MongoClient(mongoUri);
 /**
  * @type {MongoDb}
  */

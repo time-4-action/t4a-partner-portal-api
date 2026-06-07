@@ -20,6 +20,7 @@ const { ensureIndexesAndMigrate } = require('./src/services/customExport.service
 const PORT = process.env.PORT || 3000;
 
 const startServer = async () => {
+
   await connectToDb();
   await ensureIndexesAndMigrate();
 
