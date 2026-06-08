@@ -89,6 +89,16 @@ A product is a **parent** with an optional `child_products` array of **variants*
 - **Publishing:** parents and variants each have a `published` flag; a published parent may contain unpublished variants. Exports are **always published-only** — `applyFilters` drops unpublished parents and narrows `child_products` to published variants.
 - **No-variant products:** if `child_products` is empty, the parent is the sellable item (use its own `code`/`pricelist`/`stock_amount`).
 
+### Planned: Shopify integration (not yet started on the backend)
+
+A full design for letting partners connect their own Shopify store and receive an automated one-way product push lives in `shopify_integration.md` at this repo's root. **No backend code exists for it yet** — the partner-facing UI has been built in the `t4a-partner-portal-ui` repo against mock data, but none of the API pieces below are implemented:
+
+- New endpoints under `/api/export/shopify/*` — OAuth `connect`/`callback`, `status`, per-connection `config`, `sync`, `disconnect`, and HMAC-verified Shopify webhooks (design §10).
+- New Mongo collections `shopify_connections`, `shopify_product_map`, `shopify_sync_jobs` (design §6).
+- A rate-limited per-shop sync engine that turns the parent/`child_products` shape into Shopify Admin API calls, reusing `getPriceFromPriority` for price resolution and the existing published-only narrowing (design §8).
+
+When picking this up, start from `shopify_integration.md` — its §0 status checklist tracks what's done, and §11 lists open questions (pricing/VAT handling, ownership default, secrets location) to settle before coding.
+
 ## Environment variables
 
 See README.md for the full table. Key variables: `MONGO_URI`, `MONGO_DB_NAME`, `PNV_BASE_URL`, `PNV_EXPORT_PRODUCTS_URL`, `PNV_USER`, `PNV_PASS`, `PNV_GROUP`, `PNV_USER_ID`, `METAKOCKA_ID`, `METAKOCKA_KEY`, `GOOGLE_API_KEY`, `WEBHOOK_API_KEY`.
