@@ -105,7 +105,7 @@ const chunk = (arr, size) => {
  * product/variant) — as opposed to a transient/validation failure. Such SKUs are stale in our
  * map: we drop them so the next sync re-matches, rather than retrying a dead id forever.
  */
-const isStaleError = (msg) => /could not be found|does not exist|doesn'?t exist|not found|no longer exists/i.test(msg || '');
+const isStaleError = (msg) => /could not be found|does not exist|doesn'?t exist|not found|no longer exists|was deleted|been deleted|couldn'?t be stocked|could not be stocked/i.test(msg || '');
 
 /**
  * Resolves the connection's export config into the in-scope catalogue: the published-only,
