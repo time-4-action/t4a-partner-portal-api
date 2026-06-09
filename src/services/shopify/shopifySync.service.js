@@ -64,6 +64,13 @@ const chunk = (arr, size) => {
 };
 
 /**
+ * True when a push error means the Shopify target no longer exists (the merchant deleted the
+ * product/variant) — as opposed to a transient/validation failure. Such SKUs are stale in our
+ * map: we drop them so the next sync re-matches, rather than retrying a dead id forever.
+ */
+const isStaleError = (msg) => /could not be found|does not exist|doesn'?t exist|not found|no longer exists/i.test(msg || '');
+
+/**
  * Resolves the connection's export config into the in-scope catalogue: the published-only,
  * filtered products ({@link applyFilters}) AND the flat list of sellable inventory items
  * derived from them (one per variant, or the parent for no-variant products — design §3.4;
@@ -195,7 +202,7 @@ async function pushBatch(shop, token, locationId, jobId, batch) {
  *
  * Mutates `counts` (pricesPushed / contentPushed / failed) and appends to `errors`.
  */
-async function pushPortalAuthoritative({ connection, token, scopedProducts, matchInfoBySku, existingMap, exportConfig, counts, errors }) {
+async function pushPortalAuthoritative({ connection, token, scopedProducts, matchInfoBySku, existingMap, exportConfig, counts, errors, staleSkus, unmatched }) {
     const cfg = connection.config || {};
     const wantPrices = !!cfg.syncPrices;
     const wantContent = !!cfg.syncDescriptions;
@@ -206,6 +213,16 @@ async function pushPortalAuthoritative({ connection, token, scopedProducts, matc
     const pricelistPriority = cfg.pricelistPriority || [];
     const nowMs = Date.now();
     const shop = connection.shopDomain;
+
+    // Records a SKU whose Shopify target was deleted: queue its map row for removal and report
+    // it once (dedup against rows the stock push already flagged).
+    const markStale = (parentCode, skus) => {
+        for (const sku of skus) {
+            if (staleSkus.has(sku)) continue;
+            staleSkus.add(sku);
+            unmatched.push({ sku, parentCode, reason: 'Removed in Shopify — will re-match next sync', tone: 'amber' });
+        }
+    };
 
     const priceOps = []; // { parentCode, productId, variants:[{id,price}], hashes:[{sku,priceHash}] }
     const contentOps = []; // { parentCode, product:{id,title,descriptionHtml,tags}, skus:[], contentHash }
@@ -254,16 +271,19 @@ async function pushPortalAuthoritative({ connection, token, scopedProducts, matc
         try {
             const data = await graphqlRequest(shop, token, VARIANTS_PRICE_MUTATION, { productId: op.productId, variants: op.variants });
             const ue = data?.productVariantsBulkUpdate?.userErrors || [];
-            if (ue.length) {
+            const msg = ue.map((e) => e.message).join('; ');
+            if (ue.length && isStaleError(msg)) {
+                markStale(op.parentCode, op.hashes.map((h) => h.sku));
+            } else if (ue.length) {
                 counts.failed += op.variants.length;
-                errors.push({ parentCode: op.parentCode, error: `price: ${ue.map((e) => e.message).join('; ')}` });
+                errors.push({ parentCode: op.parentCode, error: `price: ${msg}` });
             } else {
                 counts.pricesPushed += op.variants.length;
                 for (const h of op.hashes) hashUpdates.push({ sku: h.sku, priceHash: h.priceHash });
             }
         } catch (e) {
-            counts.failed += op.variants.length;
-            errors.push({ parentCode: op.parentCode, error: `price: ${e.message}` });
+            if (isStaleError(e.message)) markStale(op.parentCode, op.hashes.map((h) => h.sku));
+            else { counts.failed += op.variants.length; errors.push({ parentCode: op.parentCode, error: `price: ${e.message}` }); }
         }
     });
 
@@ -271,16 +291,19 @@ async function pushPortalAuthoritative({ connection, token, scopedProducts, matc
         try {
             const data = await graphqlRequest(shop, token, PRODUCT_UPDATE_MUTATION, { product: op.product });
             const ue = data?.productUpdate?.userErrors || [];
-            if (ue.length) {
+            const msg = ue.map((e) => e.message).join('; ');
+            if (ue.length && isStaleError(msg)) {
+                markStale(op.parentCode, op.skus);
+            } else if (ue.length) {
                 counts.failed += 1;
-                errors.push({ parentCode: op.parentCode, error: `content: ${ue.map((e) => e.message).join('; ')}` });
+                errors.push({ parentCode: op.parentCode, error: `content: ${msg}` });
             } else {
                 counts.contentPushed += 1;
                 for (const sku of op.skus) hashUpdates.push({ sku, contentHash: op.contentHash });
             }
         } catch (e) {
-            counts.failed += 1;
-            errors.push({ parentCode: op.parentCode, error: `content: ${e.message}` });
+            if (isStaleError(e.message)) markStale(op.parentCode, op.skus);
+            else { counts.failed += 1; errors.push({ parentCode: op.parentCode, error: `content: ${e.message}` }); }
         }
     });
 
@@ -309,6 +332,9 @@ async function executeRun(connection, job, token) {
     const counts = { ...syncJobs.EMPTY_COUNTS };
     const unmatched = [];
     const errors = [];
+    // SKUs whose Shopify target was deleted — their map rows are dropped at the end of the run
+    // so the next sync re-matches them instead of pushing to a dead id.
+    const staleSkus = new Set();
 
     try {
         const locationId = connection.shopifyLocationId;
@@ -402,6 +428,11 @@ async function executeRun(connection, job, token) {
                     if (outcome.ok) {
                         counts.pushed++;
                         stateUpdates.push({ sku: it.sku, state: 'synced', hash: sha1(it.quantity), error: null });
+                    } else if (isStaleError(outcome.error)) {
+                        // Target deleted in Shopify — drop the mapping (re-match next sync), don't
+                        // count as a failure or write an error state on a row we're removing.
+                        staleSkus.add(it.sku);
+                        unmatched.push({ sku: it.sku, parentCode: it.parentCode, reason: 'Removed in Shopify — will re-match next sync', tone: 'amber' });
                     } else {
                         counts.failed++;
                         errors.push({ sku: it.sku, parentCode: it.parentCode, error: outcome.error });
@@ -422,11 +453,17 @@ async function executeRun(connection, job, token) {
             for (const m of newMatches) {
                 matchInfoBySku.set(m.sku, { shopifyVariantId: m.shopifyVariantId, shopifyProductId: m.shopifyProductId });
             }
+            // Don't re-hit SKUs the stock push already found deleted.
+            for (const sku of staleSkus) matchInfoBySku.delete(sku);
             await pushPortalAuthoritative({
-                connection, token, scopedProducts, matchInfoBySku, existingMap, exportConfig, counts, errors
+                connection, token, scopedProducts, matchInfoBySku, existingMap, exportConfig, counts, errors, staleSkus, unmatched
             });
         }
 
+        // Drop any stale mappings discovered this run; they re-match on the next sync.
+        if (staleSkus.size) await productMap.deleteBySkus(connection._id, [...staleSkus]);
+
+        counts.unmatched = unmatched.length;
         const status = counts.failed || counts.unmatched ? 'partial' : 'done';
         await syncJobs.finishRun(job._id, { status, counts, unmatched, errors });
         await connectionService.updateLastSync(connection._id, {

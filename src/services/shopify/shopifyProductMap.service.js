@@ -145,6 +145,24 @@ async function deleteForConnection(connectionId) {
     await getDb().collection(COLLECTION_NAME).deleteMany({ connectionId: toObjectId(connectionId) });
 }
 
+/**
+ * Removes specific SKUs' map rows for a connection. Used to drop **stale** mappings when a
+ * push reports the Shopify variant/inventory item no longer exists (the merchant deleted the
+ * product). Dropping the row makes the SKU unmapped again, so the next sync re-matches it
+ * (re-creating drift-free) instead of forever pushing to a dead id.
+ * @param {ObjectId|string} connectionId
+ * @param {string[]} skus
+ * @returns {Promise<number>} rows removed
+ */
+async function deleteBySkus(connectionId, skus) {
+    if (!skus.length) return 0;
+    const result = await getDb().collection(COLLECTION_NAME).deleteMany({
+        connectionId: toObjectId(connectionId),
+        sku: { $in: skus }
+    });
+    return result.deletedCount || 0;
+}
+
 module.exports = {
     COLLECTION_NAME,
     getMapBySku,
@@ -152,5 +170,6 @@ module.exports = {
     bulkSetState,
     bulkSetHashes,
     getStateCounts,
-    deleteForConnection
+    deleteForConnection,
+    deleteBySkus
 };
