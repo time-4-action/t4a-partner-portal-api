@@ -7,7 +7,7 @@ const { matchVariants } = require('./shopifyMatch.service');
 const productMap = require('./shopifyProductMap.service');
 const syncJobs = require('./shopifySyncJobs.service');
 const queue = require('./shopifyQueue.service');
-const { graphqlRequest, publishToPublications, unpublishFromPublications, listPublications } = require('./shopifyGraphql.service');
+const { graphqlRequest, publishToPublications, unpublishFromPublications, listPublications, findExistingIds } = require('./shopifyGraphql.service');
 
 /**
  * Stock-only sync engine — Phase A (design §8, plan Phase A).
@@ -78,6 +78,16 @@ const PRODUCT_CREATE_MUTATION = `mutation ProductCreate($product: ProductCreateI
 const VARIANTS_BULK_CREATE_MUTATION = `mutation VariantsBulkCreate($productId: ID!, $variants: [ProductVariantsBulkInput!]!, $strategy: ProductVariantsBulkCreateStrategy) {
   productVariantsBulkCreate(productId: $productId, variants: $variants, strategy: $strategy) {
     productVariants { id sku inventoryItem { id } }
+    userErrors { field message }
+  }
+}`;
+
+// Declarative create with media linked to variants (productCreate + bulkCreate can't attach a
+// variant image at create — media is async/non-ready). productSet sets the whole product —
+// gallery, variants, per-variant image, price, barcode, sku, inventory — in one synchronous call.
+const PRODUCT_SET_MUTATION = `mutation ProductSet($input: ProductSetInput!, $synchronous: Boolean!) {
+  productSet(synchronous: $synchronous, input: $input) {
+    product { id variants(first: 100) { nodes { id sku inventoryItem { id } } } }
     userErrors { field message }
   }
 }`;
@@ -516,6 +526,54 @@ function buildCreateVariantInput(plan, v, locationId, pricelistPriority, vatMode
     };
 }
 
+/**
+ * Builds the `ProductSetInput` for creating a new product with its variants AND per-variant
+ * images linked (design §3.5). Each variant's own image becomes its variant image; the parent
+ * gallery + all variant images form the product files. price/barcode/sku/inventory set inline.
+ */
+function buildProductSetInput(plan, exportConfig, locationId, pricelistPriority, vatMode, futureGuard, nowMs) {
+    const product = plan.product;
+    const parentImages = [...new Set(product.images || [])].filter(Boolean);
+    const variantImageUrls = [];
+
+    const variants = plan.toCreate.map((v) => {
+        const sku = plan.skuOf(v);
+        const price = resolvePushPrice(v, pricelistPriority, vatMode, futureGuard, nowMs) || '0.00';
+        const optionName = plan.isNoVariant ? 'Title' : 'Size';
+        const optionValue = plan.isNoVariant ? 'Default Title' : deriveOptionValue(v);
+        const vImg = (v.images && v.images[0]) || null;
+        if (vImg) variantImageUrls.push(vImg);
+        const vin = {
+            optionValues: [{ optionName, name: optionValue }],
+            price,
+            barcode: v.ean_code || null,
+            inventoryItem: { sku, tracked: true },
+            inventoryQuantities: [{ locationId, name: 'available', quantity: v.stock_amount || 0 }]
+        };
+        // A variant file must ALSO appear in the product files list (Shopify requirement).
+        if (vImg) vin.file = { originalSource: vImg, contentType: 'IMAGE' };
+        return vin;
+    });
+
+    const allFiles = [...new Set([...parentImages, ...variantImageUrls])].filter(Boolean)
+        .map((url) => ({ originalSource: url, contentType: 'IMAGE', alt: product.product_name || '' }));
+
+    const input = {
+        title: product.product_name || product.code || 'Untitled',
+        descriptionHtml: product.detailed_description || product.short_description || '',
+        vendor: 'Patrik International',
+        productType: product.categories?.[0] || '',
+        status: 'ACTIVE',
+        tags: resolveTagsArray(product, exportConfig) || [],
+        variants
+    };
+    if (!plan.isNoVariant) {
+        input.productOptions = [{ name: 'Size', values: [...new Set(plan.toCreate.map(deriveOptionValue).filter(Boolean))].map((name) => ({ name })) }];
+    }
+    if (allFiles.length) input.files = allFiles;
+    return input;
+}
+
 /** Maps the variants returned by a bulk-create back to `shopify_product_map` rows (by SKU). */
 function createdRowsFromNodes(plan, productId, nodes) {
     const bySku = new Map((nodes || []).map((n) => [n.sku, n]));
@@ -585,37 +643,29 @@ async function pushNewProducts({ connection, token, scopedProducts, unmatched, m
 
     await queue.mapWithConcurrency(plans, async (plan) => {
         try {
-            const variantInputs = plan.toCreate.map((v) =>
-                buildCreateVariantInput(plan, v, locationId, pricelistPriority, vatMode, futureGuard, nowMs));
+            let productId;
+            let variantNodes;
 
-            let productId = plan.existingProductId;
-            let strategy = 'DEFAULT';
-
-            if (!productId) {
-                const productInput = {
-                    title: plan.product.product_name || plan.product.code || 'Untitled',
-                    descriptionHtml: plan.product.detailed_description || plan.product.short_description || '',
-                    vendor: 'Patrik International',
-                    productType: plan.product.categories?.[0] || '',
-                    status: 'ACTIVE',
-                    tags: resolveTagsArray(plan.product, exportConfig) || []
-                };
-                if (!plan.isNoVariant) {
-                    const values = [...new Set(plan.toCreate.map(deriveOptionValue).filter(Boolean))].map((name) => ({ name }));
-                    productInput.productOptions = [{ name: 'Size', values }];
-                }
-                const cData = await graphqlRequest(shop, token, PRODUCT_CREATE_MUTATION, { product: productInput });
-                const cue = cData?.productCreate?.userErrors || [];
-                if (cue.length) throw new Error(cue.map((e) => e.message).join('; '));
-                productId = cData.productCreate.product.id;
-                strategy = 'REMOVE_STANDALONE_VARIANT';
+            if (!plan.existingProductId) {
+                // New product → productSet (links each variant's own image to the variant).
+                const input = buildProductSetInput(plan, exportConfig, locationId, pricelistPriority, vatMode, futureGuard, nowMs);
+                const data = await graphqlRequest(shop, token, PRODUCT_SET_MUTATION, { input, synchronous: true });
+                const ue = data?.productSet?.userErrors || [];
+                if (ue.length) throw new Error(ue.map((e) => e.message).join('; '));
+                productId = data.productSet.product.id;
+                variantNodes = data.productSet.product.variants.nodes;
+            } else {
+                // Parent already exists → add only the missing variants (no whole-product reset).
+                const variantInputs = plan.toCreate.map((v) =>
+                    buildCreateVariantInput(plan, v, locationId, pricelistPriority, vatMode, futureGuard, nowMs));
+                const vData = await graphqlRequest(shop, token, VARIANTS_BULK_CREATE_MUTATION, { productId: plan.existingProductId, variants: variantInputs, strategy: 'DEFAULT' });
+                const vue = vData?.productVariantsBulkCreate?.userErrors || [];
+                if (vue.length) throw new Error(vue.map((e) => e.message).join('; '));
+                productId = plan.existingProductId;
+                variantNodes = vData.productVariantsBulkCreate.productVariants;
             }
 
-            const vData = await graphqlRequest(shop, token, VARIANTS_BULK_CREATE_MUTATION, { productId, variants: variantInputs, strategy });
-            const vue = vData?.productVariantsBulkCreate?.userErrors || [];
-            if (vue.length) throw new Error(vue.map((e) => e.message).join('; '));
-
-            const rows = createdRowsFromNodes(plan, productId, vData.productVariantsBulkCreate.productVariants);
+            const rows = createdRowsFromNodes(plan, productId, variantNodes);
             for (const r of rows) { created.push(r); createdSkus.add(r.sku); }
             if (rows.length) {
                 counts.createdVariants += rows.length;
@@ -682,6 +732,30 @@ async function executeRun(connection, job, token) {
 
         // Authoritative map: only look up SKUs we haven't mapped before (design §7).
         const existingMap = await productMap.getMapBySku(connection._id);
+
+        // Pre-flight: drop mappings whose Shopify product was DELETED in the store. One bulk
+        // existence check up front means those SKUs become unmapped and flow into the normal
+        // match → create path THIS run (re-created instead of erroring on push and forcing a
+        // second sync). Reactive stale-handling at push time remains a backstop.
+        const mappedProductIds = [...new Set([...existingMap.values()].map((r) => r.shopifyProductId).filter(Boolean))];
+        if (mappedProductIds.length) {
+            try {
+                const existing = await findExistingIds(connection.shopDomain, token, mappedProductIds);
+                const deletedSkus = [];
+                for (const [sku, row] of existingMap) {
+                    if (row.shopifyProductId && !existing.has(row.shopifyProductId)) deletedSkus.push(sku);
+                }
+                if (deletedSkus.length) {
+                    await productMap.deleteBySkus(connection._id, deletedSkus);
+                    for (const sku of deletedSkus) existingMap.delete(sku);
+                    console.log(`[shopify] pre-flight dropped ${deletedSkus.length} mapping(s) for deleted products (${connection.shopDomain})`);
+                }
+            } catch (err) {
+                // Non-fatal — fall back to reactive stale handling at push time.
+                console.error('[shopify] pre-flight existence check failed:', err.message);
+            }
+        }
+
         const unmapped = items.filter((it) => !existingMap.has(it.sku));
 
         const newMatches = [];

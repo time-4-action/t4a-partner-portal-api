@@ -218,9 +218,29 @@ async function unpublishFromPublications(shop, accessToken, publishableId, publi
     return data?.publishableUnpublish?.userErrors || [];
 }
 
+const NODES_EXISTS_QUERY = `query Nodes($ids: [ID!]!) { nodes(ids: $ids) { id } }`;
+
+/**
+ * Returns the subset of the given product (or any node) ids that STILL EXIST in the store.
+ * Deleted ids come back as null from `nodes(ids:)`. Batched at 250 (the query limit). Used by
+ * the sync's pre-flight so deleted products are detected up front and re-created in the same
+ * run instead of erroring at push time and forcing a second sync.
+ * @returns {Promise<Set<string>>}
+ */
+async function findExistingIds(shop, accessToken, ids) {
+    const existing = new Set();
+    for (let i = 0; i < ids.length; i += 250) {
+        const batch = ids.slice(i, i + 250);
+        const data = await graphqlRequest(shop, accessToken, NODES_EXISTS_QUERY, { ids: batch });
+        for (const node of data?.nodes || []) if (node?.id) existing.add(node.id);
+    }
+    return existing;
+}
+
 module.exports = {
     graphqlRequest,
     listLocations,
+    findExistingIds,
     listPublications,
     publishToPublications,
     unpublishFromPublications,
