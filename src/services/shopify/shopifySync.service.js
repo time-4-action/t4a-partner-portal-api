@@ -94,7 +94,7 @@ const PRODUCT_SET_MUTATION = `mutation ProductSet($input: ProductSetInput!, $syn
 
 // Phase D — image sync. productCreateMedia is deprecated on 2026-04; the supported path is
 // productUpdate with a `media` arg (adds media, processed asynchronously by Shopify).
-const PRODUCT_MEDIA_QUERY = `query ProductMedia($id: ID!) { product(id: $id) { media(first: 100) { nodes { id } } } }`;
+const PRODUCT_MEDIA_QUERY = `query ProductMedia($id: ID!) { product(id: $id) { media(first: 100) { nodes { id alt } } } }`;
 
 const PRODUCT_UPDATE_MEDIA_MUTATION = `mutation ProductUpdateMedia($product: ProductUpdateInput!, $media: [CreateMediaInput!]) {
   productUpdate(product: $product, media: $media) {
@@ -370,12 +370,13 @@ async function pushPortalAuthoritative({ connection, token, scopedProducts, matc
 /**
  * Image sync (Phase D) — pushes the parent gallery + variant images for matched products.
  *
- * We track, per product, which source URL maps to which Shopify media id (`imageMedia` on the
- * map row). That lets us tell exactly which of OUR images are present without matching
- * Shopify's rehosted CDN urls, so:
- *   - `authoritative` (portal_authoritative): the portal OWNS the images. Every sync it checks
- *     the product's current media and **re-adds any of ours that were deleted** in Shopify, and
- *     adds newly-added catalogue images. No duplicates (only missing ones are added).
+ * Every image WE add carries `alt = its source URL`, which is the reliable key for telling
+ * which of our images are currently present (Shopify rehosts images on its CDN, so the URL is
+ * otherwise unrecoverable). So:
+ *   - `authoritative` (portal_authoritative): the portal OWNS the images. Each sync it compares
+ *     our desired set to the media currently present (by alt) and **re-adds any that are
+ *     missing** — whether one image was deleted or all of them — without duplicating the ones
+ *     still there. New catalogue images are added too.
  *   - non-authoritative (create_then_handoff): media-less guard — only fill products that have
  *     NO media (the ones we created), never re-touch existing/partner media.
  *
@@ -405,11 +406,10 @@ async function pushImages({ connection, token, scopedProducts, matchInfoBySku, e
         const images = [...new Set([...(product.images || []), ...variantImages])].filter(Boolean);
         if (!images.length) continue;
         const imageHash = sha1(images.join('|'));
-        const row = existingMap.get(firstSku);
         // Non-authoritative: once handled (imageHash matches), skip — don't even re-query.
         // Authoritative: always check, to catch images deleted in Shopify since last sync.
-        if (!authoritative && row?.imageHash === imageHash) continue;
-        imageOps.push({ parentCode: product.code, productId, images, alt: product.product_name || '', skus: matched.map((m) => m.sku), imageHash, stored: row?.imageMedia || [] });
+        if (!authoritative && existingMap.get(firstSku)?.imageHash === imageHash) continue;
+        imageOps.push({ parentCode: product.code, productId, images, skus: matched.map((m) => m.sku), imageHash });
     }
     if (!imageOps.length) return;
 
@@ -417,46 +417,29 @@ async function pushImages({ connection, token, scopedProducts, matchInfoBySku, e
     await queue.mapWithConcurrency(imageOps, async (op) => {
         try {
             const cur = await graphqlRequest(shop, token, PRODUCT_MEDIA_QUERY, { id: op.productId });
-            const currentIds = new Set((cur?.product?.media?.nodes || []).map((n) => n.id));
-            const storedByUrl = new Map(op.stored.map((m) => [m.url, m.mediaId]));
+            const nodes = cur?.product?.media?.nodes || [];
+            // Which of our images are already on the product (matched by the alt we stamped).
+            const presentUrls = new Set(nodes.map((n) => n.alt).filter(Boolean));
 
-            // Which of our images need (re)adding: never pushed, or their media was deleted.
-            // In non-authoritative mode we only act when the product has NO media at all.
             let toAdd;
             if (!authoritative) {
-                toAdd = currentIds.size === 0 ? op.images : [];
-            } else if (op.stored.length === 0 && currentIds.size > 0) {
-                // First authoritative pass on a product that already has media but no tracking
-                // yet (e.g. images pushed before this feature) — ADOPT the existing media rather
-                // than re-adding (which would duplicate). Map our urls to current ids by order.
-                toAdd = [];
-                const curArr = [...currentIds];
-                op.images.forEach((url, i) => { if (curArr[i]) storedByUrl.set(url, curArr[i]); });
+                // Fill only media-less products (created/handoff); never re-touch existing media.
+                toAdd = nodes.length === 0 ? op.images : [];
             } else {
-                toAdd = op.images.filter((url) => {
-                    const mid = storedByUrl.get(url);
-                    return !mid || !currentIds.has(mid);
-                });
+                // Re-add any of our images missing from the product (one or many).
+                toAdd = op.images.filter((url) => !presentUrls.has(url));
             }
 
             if (toAdd.length) {
-                const media = toAdd.map((url) => ({ originalSource: url, alt: op.alt, mediaContentType: 'IMAGE' }));
+                const media = toAdd.map((url) => ({ originalSource: url, alt: url, mediaContentType: 'IMAGE' }));
                 const data = await graphqlRequest(shop, token, PRODUCT_UPDATE_MEDIA_MUTATION, { product: { id: op.productId }, media });
                 const ue = data?.productUpdate?.userErrors || [];
                 const msg = ue.map((e) => e.message).join('; ');
                 if (ue.length && isStaleError(msg)) { markStale(op.parentCode, op.skus); return; }
                 if (ue.length) { counts.failed += 1; errors.push({ parentCode: op.parentCode, error: `images: ${msg}` }); return; }
                 counts.imagesPushed += toAdd.length;
-
-                // Capture the new media ids (appended in input order) to map them to our urls.
-                const after = await graphqlRequest(shop, token, PRODUCT_MEDIA_QUERY, { id: op.productId });
-                const newIds = (after?.product?.media?.nodes || []).map((n) => n.id).filter((id) => !currentIds.has(id));
-                toAdd.forEach((url, i) => { if (newIds[i]) storedByUrl.set(url, newIds[i]); });
             }
-
-            // Persist the url→mediaId map for the images we know about (drops removed urls).
-            const imageMedia = op.images.map((url) => ({ url, mediaId: storedByUrl.get(url) || null }));
-            for (const sku of op.skus) hashUpdates.push({ sku, imageHash: op.imageHash, imageMedia });
+            for (const sku of op.skus) hashUpdates.push({ sku, imageHash: op.imageHash });
         } catch (e) {
             if (isStaleError(e.message)) markStale(op.parentCode, op.skus);
             else { counts.failed += 1; errors.push({ parentCode: op.parentCode, error: `images: ${e.message}` }); }
@@ -588,12 +571,14 @@ function buildProductSetInput(plan, exportConfig, locationId, pricelistPriority,
             inventoryQuantities: [{ locationId, name: 'available', quantity: v.stock_amount || 0 }]
         };
         // A variant file must ALSO appear in the product files list (Shopify requirement).
-        if (vImg) vin.file = { originalSource: vImg, contentType: 'IMAGE' };
+        // alt = the source URL so we can reliably tell later which media is which (Shopify
+        // rehosts images on its CDN, so the URL is otherwise unrecoverable).
+        if (vImg) vin.file = { originalSource: vImg, contentType: 'IMAGE', alt: vImg };
         return vin;
     });
 
     const allFiles = [...new Set([...parentImages, ...variantImageUrls])].filter(Boolean)
-        .map((url) => ({ originalSource: url, contentType: 'IMAGE', alt: product.product_name || '' }));
+        .map((url) => ({ originalSource: url, contentType: 'IMAGE', alt: url }));
 
     const input = {
         title: product.product_name || product.code || 'Untitled',
