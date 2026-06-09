@@ -113,8 +113,43 @@ exports.callback = async (req, res) => {
 };
 
 /**
+ * Loads a connection's LIVE shop data — inventory locations + sales channels (publications) +
+ * whether the token can publish + whether a reconnect is needed. Best-effort: a failed Shopify
+ * call yields empty lists, never an error (except surfacing `needsReconnect`). Shared by the
+ * legacy single-store `status` and the per-store `connectionDetail` endpoints.
+ */
+async function loadLiveShopData(connection) {
+    let locations = [];
+    let publications = [];
+    // Whether the granted token can publish to sales channels. Connections made before the
+    // publications scopes were added won't have them → UI prompts a reconnect to enable it.
+    const publishingEnabled = connectionService.canPublish(connection);
+    // `needsReconnect` tells the UI to prompt a re-install — set when the stored token can't be
+    // refreshed (legacy non-expiring token, or an expired refresh token).
+    let needsReconnect = connection.status === 'error';
+    if (connection.status === 'active') {
+        try {
+            const token = await tokenService.getValidAccessToken(connection._id);
+            locations = await shopifyGraphql.listLocations(connection.shopDomain, token);
+            if (publishingEnabled) {
+                try {
+                    publications = await shopifyGraphql.listPublications(connection.shopDomain, token);
+                } catch (err) {
+                    console.error('[shopify] listPublications failed:', err.message);
+                }
+            }
+        } catch (err) {
+            if (err.code === 'REAUTH_REQUIRED') needsReconnect = true;
+            else console.error('[shopify] listLocations failed:', err.code || '', err.message);
+        }
+    }
+    return { locations, publications, publishingEnabled, needsReconnect };
+}
+
+/**
  * GET /shopify/status — current user's connection (or null), plus the shop's inventory
- * locations when connected (best-effort; an empty list is not an error).
+ * locations when connected (best-effort; an empty list is not an error). Legacy single-store
+ * shape; the multi-store UI uses `connections` + `connectionDetail` instead.
  */
 exports.status = async (req, res) => {
     try {
@@ -123,33 +158,38 @@ exports.status = async (req, res) => {
         if (!connection) {
             return res.json({ success: true, connected: false, connection: null, locations: [], needsReconnect: false });
         }
+        const live = await loadLiveShopData(connection);
+        res.json({ success: true, connected: connection.status === 'active', connection, ...live });
+    } catch (error) {
+        handleError(res, error);
+    }
+};
 
-        // `needsReconnect` tells the UI to prompt a re-install — set when the stored token can't
-        // be refreshed (legacy non-expiring token, or an expired refresh token).
-        let locations = [];
-        let publications = [];
-        // Whether the granted token can publish to sales channels. Connections made before the
-        // publications scopes were added won't have them → UI prompts a reconnect to enable it.
-        const publishingEnabled = connectionService.canPublish(connection);
-        let needsReconnect = connection.status === 'error';
-        if (connection.status === 'active') {
-            try {
-                const token = await tokenService.getValidAccessToken(connection._id);
-                locations = await shopifyGraphql.listLocations(connection.shopDomain, token);
-                if (publishingEnabled) {
-                    try {
-                        publications = await shopifyGraphql.listPublications(connection.shopDomain, token);
-                    } catch (err) {
-                        console.error('[shopify] listPublications failed:', err.message);
-                    }
-                }
-            } catch (err) {
-                if (err.code === 'REAUTH_REQUIRED') needsReconnect = true;
-                else console.error('[shopify] listLocations failed:', err.code || '', err.message);
-            }
-        }
+/**
+ * GET /shopify/connections — every store the current user has connected (lightweight; no
+ * Shopify API calls). Drives the multi-store switcher. Live per-store data (locations,
+ * publications) is loaded separately via {@link connectionDetail}.
+ */
+exports.connections = async (req, res) => {
+    try {
+        const { sub } = authUser(req);
+        const connections = await connectionService.listConnectionsForUser(sub);
+        res.json({ success: true, connections });
+    } catch (error) {
+        handleError(res, error);
+    }
+};
 
-        res.json({ success: true, connected: connection.status === 'active', connection, locations, publications, publishingEnabled, needsReconnect });
+/**
+ * GET /shopify/connection/:id/detail — one owned connection plus its live shop data (inventory
+ * locations + sales channels + publishing/reconnect flags). The switcher loads this on demand
+ * when a store is selected.
+ */
+exports.connectionDetail = async (req, res) => {
+    try {
+        const connection = await loadOwned(req);
+        const live = await loadLiveShopData(connection);
+        res.json({ success: true, connection, ...live });
     } catch (error) {
         handleError(res, error);
     }

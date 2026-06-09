@@ -105,7 +105,8 @@ async function upsertConnection({ ownerSub, ownerEmail, shopDomain, accessToken,
 
 /**
  * Returns the connection for a portal user (by Auth0 sub), public-shaped, or null.
- * A user has at most one active store in this first cut; returns the most recently updated.
+ * Returns the most recently updated — used by the legacy single-store `status` endpoint.
+ * Prefer {@link listConnectionsForUser} for the multi-store UI.
  */
 async function getConnectionForUser(ownerSub) {
     const db = getDb();
@@ -113,6 +114,24 @@ async function getConnectionForUser(ownerSub) {
         .collection(COLLECTION_NAME)
         .findOne({ ownerSub, status: { $ne: 'uninstalled' } }, { sort: { updatedAt: -1 } });
     return toPublic(conn);
+}
+
+/**
+ * Returns ALL of a portal user's connected stores (public-shaped), oldest-first for a stable
+ * switcher order. A single user can connect any number of Shopify stores — each is a separate
+ * `(ownerSub, shopDomain)` row with its own token, config, location and product map. This is a
+ * cheap query (no Shopify API calls); live locations/publications are loaded per-store on demand
+ * via the connection-detail endpoint.
+ * @returns {Promise<Array<Object>>}
+ */
+async function listConnectionsForUser(ownerSub) {
+    const db = getDb();
+    const conns = await db
+        .collection(COLLECTION_NAME)
+        .find({ ownerSub, status: { $ne: 'uninstalled' } })
+        .sort({ installedAt: 1 })
+        .toArray();
+    return conns.map(toPublic);
 }
 
 /**
@@ -308,6 +327,7 @@ module.exports = {
     canPublish,
     upsertConnection,
     getConnectionForUser,
+    listConnectionsForUser,
     getConnectionById,
     getConnectionWithToken,
     listActiveSyncable,
