@@ -114,6 +114,7 @@ async function bulkSetHashes(connectionId, updates) {
         if (u.priceHash !== undefined) set.priceHash = u.priceHash;
         if (u.contentHash !== undefined) set.contentHash = u.contentHash;
         if (u.imageHash !== undefined) set.imageHash = u.imageHash;
+        if (u.imageMedia !== undefined) set.imageMedia = u.imageMedia; // [{url, mediaId}] — tracks our pushed images
         if (u.publishHash !== undefined) set.publishHash = u.publishHash;
         return { updateOne: { filter: { connectionId: cid, sku: u.sku }, update: { $set: set } } };
     });

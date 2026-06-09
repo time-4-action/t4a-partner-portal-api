@@ -94,7 +94,7 @@ const PRODUCT_SET_MUTATION = `mutation ProductSet($input: ProductSetInput!, $syn
 
 // Phase D — image sync. productCreateMedia is deprecated on 2026-04; the supported path is
 // productUpdate with a `media` arg (adds media, processed asynchronously by Shopify).
-const PRODUCT_MEDIA_QUERY = `query ProductMedia($id: ID!) { product(id: $id) { media(first: 1) { nodes { id } } } }`;
+const PRODUCT_MEDIA_QUERY = `query ProductMedia($id: ID!) { product(id: $id) { media(first: 100) { nodes { id } } } }`;
 
 const PRODUCT_UPDATE_MEDIA_MUTATION = `mutation ProductUpdateMedia($product: ProductUpdateInput!, $media: [CreateMediaInput!]) {
   productUpdate(product: $product, media: $media) {
@@ -368,15 +368,20 @@ async function pushPortalAuthoritative({ connection, token, scopedProducts, matc
 }
 
 /**
- * Image sync (Phase D) — pushes the parent gallery for matched products. Runs in BOTH
- * `portal_authoritative` and `create_then_handoff` ownership (design §9): images are part of
- * the product the portal stands up. The media-less guard (only add to products with no media)
- * means it never duplicates media or touches a partner's own images, which is exactly the
- * "fill in what we created, leave the rest alone" behaviour create-then-handoff wants.
+ * Image sync (Phase D) — pushes the parent gallery + variant images for matched products.
  *
- * Delta-gated by a per-product `imageHash`. Mutates `counts`/`errors`, marks stale targets.
+ * We track, per product, which source URL maps to which Shopify media id (`imageMedia` on the
+ * map row). That lets us tell exactly which of OUR images are present without matching
+ * Shopify's rehosted CDN urls, so:
+ *   - `authoritative` (portal_authoritative): the portal OWNS the images. Every sync it checks
+ *     the product's current media and **re-adds any of ours that were deleted** in Shopify, and
+ *     adds newly-added catalogue images. No duplicates (only missing ones are added).
+ *   - non-authoritative (create_then_handoff): media-less guard — only fill products that have
+ *     NO media (the ones we created), never re-touch existing/partner media.
+ *
+ * Mutates `counts`/`errors`, marks stale targets.
  */
-async function pushImages({ connection, token, scopedProducts, matchInfoBySku, existingMap, counts, errors, staleSkus, unmatched }) {
+async function pushImages({ connection, token, scopedProducts, matchInfoBySku, existingMap, counts, errors, staleSkus, unmatched, authoritative }) {
     const shop = connection.shopDomain;
     const markStale = (parentCode, skus) => {
         for (const sku of skus) {
@@ -394,14 +399,17 @@ async function pushImages({ connection, token, scopedProducts, matchInfoBySku, e
             .map((v) => ({ sku: (variants.length ? v.code : product.code) || '' }))
             .filter((x) => x.sku && matchInfoBySku.get(x.sku)?.shopifyProductId);
         if (!matched.length) continue;
-        const productId = matchInfoBySku.get(matched[0].sku).shopifyProductId;
-        // Parent gallery + every variant's own image(s) — variant images were previously dropped.
+        const firstSku = matched[0].sku;
+        const productId = matchInfoBySku.get(firstSku).shopifyProductId;
         const variantImages = (product.child_products || []).flatMap((v) => v.images || []);
         const images = [...new Set([...(product.images || []), ...variantImages])].filter(Boolean);
         if (!images.length) continue;
         const imageHash = sha1(images.join('|'));
-        if (existingMap.get(matched[0].sku)?.imageHash === imageHash) continue; // already handled
-        imageOps.push({ parentCode: product.code, productId, images, alt: product.product_name || '', skus: matched.map((m) => m.sku), imageHash });
+        const row = existingMap.get(firstSku);
+        // Non-authoritative: once handled (imageHash matches), skip — don't even re-query.
+        // Authoritative: always check, to catch images deleted in Shopify since last sync.
+        if (!authoritative && row?.imageHash === imageHash) continue;
+        imageOps.push({ parentCode: product.code, productId, images, alt: product.product_name || '', skus: matched.map((m) => m.sku), imageHash, stored: row?.imageMedia || [] });
     }
     if (!imageOps.length) return;
 
@@ -409,17 +417,46 @@ async function pushImages({ connection, token, scopedProducts, matchInfoBySku, e
     await queue.mapWithConcurrency(imageOps, async (op) => {
         try {
             const cur = await graphqlRequest(shop, token, PRODUCT_MEDIA_QUERY, { id: op.productId });
-            const hasMedia = (cur?.product?.media?.nodes || []).length > 0;
-            if (!hasMedia) {
-                const media = op.images.map((url) => ({ originalSource: url, alt: op.alt, mediaContentType: 'IMAGE' }));
+            const currentIds = new Set((cur?.product?.media?.nodes || []).map((n) => n.id));
+            const storedByUrl = new Map(op.stored.map((m) => [m.url, m.mediaId]));
+
+            // Which of our images need (re)adding: never pushed, or their media was deleted.
+            // In non-authoritative mode we only act when the product has NO media at all.
+            let toAdd;
+            if (!authoritative) {
+                toAdd = currentIds.size === 0 ? op.images : [];
+            } else if (op.stored.length === 0 && currentIds.size > 0) {
+                // First authoritative pass on a product that already has media but no tracking
+                // yet (e.g. images pushed before this feature) — ADOPT the existing media rather
+                // than re-adding (which would duplicate). Map our urls to current ids by order.
+                toAdd = [];
+                const curArr = [...currentIds];
+                op.images.forEach((url, i) => { if (curArr[i]) storedByUrl.set(url, curArr[i]); });
+            } else {
+                toAdd = op.images.filter((url) => {
+                    const mid = storedByUrl.get(url);
+                    return !mid || !currentIds.has(mid);
+                });
+            }
+
+            if (toAdd.length) {
+                const media = toAdd.map((url) => ({ originalSource: url, alt: op.alt, mediaContentType: 'IMAGE' }));
                 const data = await graphqlRequest(shop, token, PRODUCT_UPDATE_MEDIA_MUTATION, { product: { id: op.productId }, media });
                 const ue = data?.productUpdate?.userErrors || [];
                 const msg = ue.map((e) => e.message).join('; ');
                 if (ue.length && isStaleError(msg)) { markStale(op.parentCode, op.skus); return; }
                 if (ue.length) { counts.failed += 1; errors.push({ parentCode: op.parentCode, error: `images: ${msg}` }); return; }
-                counts.imagesPushed += op.images.length;
+                counts.imagesPushed += toAdd.length;
+
+                // Capture the new media ids (appended in input order) to map them to our urls.
+                const after = await graphqlRequest(shop, token, PRODUCT_MEDIA_QUERY, { id: op.productId });
+                const newIds = (after?.product?.media?.nodes || []).map((n) => n.id).filter((id) => !currentIds.has(id));
+                toAdd.forEach((url, i) => { if (newIds[i]) storedByUrl.set(url, newIds[i]); });
             }
-            for (const sku of op.skus) hashUpdates.push({ sku, imageHash: op.imageHash });
+
+            // Persist the url→mediaId map for the images we know about (drops removed urls).
+            const imageMedia = op.images.map((url) => ({ url, mediaId: storedByUrl.get(url) || null }));
+            for (const sku of op.skus) hashUpdates.push({ sku, imageHash: op.imageHash, imageMedia });
         } catch (e) {
             if (isStaleError(e.message)) markStale(op.parentCode, op.skus);
             else { counts.failed += 1; errors.push({ parentCode: op.parentCode, error: `images: ${e.message}` }); }
@@ -929,7 +966,9 @@ async function executeRun(connection, job, token) {
                 : scopedProducts;
             if (imageProducts.length) {
                 await pushImages({
-                    connection, token, scopedProducts: imageProducts, matchInfoBySku, existingMap, counts, errors, staleSkus, unmatched
+                    connection, token, scopedProducts: imageProducts, matchInfoBySku, existingMap, counts, errors, staleSkus, unmatched,
+                    // portal_authoritative re-adds images deleted in Shopify; handoff only fills new products.
+                    authoritative: connection.config.ownership === 'portal_authoritative'
                 });
             }
         }
