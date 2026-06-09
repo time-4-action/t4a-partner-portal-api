@@ -28,6 +28,17 @@ const ERROR_STATUS_MAP = {
     SERVER_ERROR: 500
 };
 
+/**
+ * A run does several things at once (stock + create + content + images). Pick the most
+ * salient label for the activity "Type" column instead of always showing "Inventory".
+ */
+function runTypeLabel(c) {
+    if (c.createdProducts) return 'Create';
+    if (c.imagesPushed) return 'Images';
+    if (c.pricesPushed || c.contentPushed) return 'Content';
+    return 'Stock';
+}
+
 /** Shapes a stored sync-run document into the row the partner UI's activity table renders. */
 function toActivityRow(job) {
     const c = job.counts || {};
@@ -45,7 +56,7 @@ function toActivityRow(job) {
     const detail = bits.length ? bits.join(' · ') : (job.trigger || null);
     return {
         id: job._id.toString(),
-        type: job.type,
+        type: runTypeLabel(c),
         status: job.status,
         attempts: job.attempts || 1,
         time: (job.finishedAt || job.startedAt || job.createdAt)?.toISOString?.() || null,

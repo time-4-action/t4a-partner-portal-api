@@ -243,8 +243,7 @@ async function pushPortalAuthoritative({ connection, token, scopedProducts, matc
     const cfg = connection.config || {};
     const wantPrices = !!cfg.syncPrices;
     const wantContent = !!cfg.syncDescriptions;
-    const wantImages = !!cfg.syncImages;
-    if (!wantPrices && !wantContent && !wantImages) return;
+    if (!wantPrices && !wantContent) return;
 
     const vatMode = cfg.priceVatMode || 'inclusive';
     const futureGuard = cfg.futureDatedGuard !== false;
@@ -264,7 +263,6 @@ async function pushPortalAuthoritative({ connection, token, scopedProducts, matc
 
     const priceOps = []; // { parentCode, productId, variants:[{id,price}], hashes:[{sku,priceHash}] }
     const contentOps = []; // { parentCode, product:{id,title,descriptionHtml,tags}, skus:[], contentHash }
-    const imageOps = []; // { parentCode, productId, images:[url], alt, skus:[], imageHash }
 
     for (const product of scopedProducts) {
         const variants = product.child_products || [];
@@ -300,15 +298,6 @@ async function pushPortalAuthoritative({ connection, token, scopedProducts, matc
             const contentHash = sha1(JSON.stringify({ title, descriptionHtml, tags }));
             if (existingMap.get(matched[0].sku)?.contentHash !== contentHash) {
                 contentOps.push({ parentCode: product.code, product: { id: productId, title, descriptionHtml, tags }, skus: matched.map((m) => m.sku), contentHash });
-            }
-        }
-
-        if (wantImages) {
-            const images = [...new Set(product.images || [])].filter(Boolean);
-            const imageHash = sha1(images.join('|'));
-            // Only consider products whose image set we haven't handled yet.
-            if (images.length && existingMap.get(matched[0].sku)?.imageHash !== imageHash) {
-                imageOps.push({ parentCode: product.code, productId, images, alt: product.product_name || '', skus: matched.map((m) => m.sku), imageHash });
             }
         }
     }
@@ -355,9 +344,56 @@ async function pushPortalAuthoritative({ connection, token, scopedProducts, matc
         }
     });
 
-    // Images (Phase D): add the parent gallery — but only to products that have NO media yet, so
-    // we never duplicate media on re-sync or clobber a partner's own images. Once handled (pushed
-    // OR skipped because media already exists), the imageHash is recorded so we don't re-check.
+    // Merge price + content hash updates per SKU, then persist in one pass.
+    if (hashUpdates.length) {
+        const bySku = new Map();
+        for (const h of hashUpdates) {
+            const cur = bySku.get(h.sku) || { sku: h.sku };
+            if (h.priceHash !== undefined) cur.priceHash = h.priceHash;
+            if (h.contentHash !== undefined) cur.contentHash = h.contentHash;
+            bySku.set(h.sku, cur);
+        }
+        await productMap.bulkSetHashes(connection._id, [...bySku.values()]);
+    }
+}
+
+/**
+ * Image sync (Phase D) — pushes the parent gallery for matched products. Runs in BOTH
+ * `portal_authoritative` and `create_then_handoff` ownership (design §9): images are part of
+ * the product the portal stands up. The media-less guard (only add to products with no media)
+ * means it never duplicates media or touches a partner's own images, which is exactly the
+ * "fill in what we created, leave the rest alone" behaviour create-then-handoff wants.
+ *
+ * Delta-gated by a per-product `imageHash`. Mutates `counts`/`errors`, marks stale targets.
+ */
+async function pushImages({ connection, token, scopedProducts, matchInfoBySku, existingMap, counts, errors, staleSkus, unmatched }) {
+    const shop = connection.shopDomain;
+    const markStale = (parentCode, skus) => {
+        for (const sku of skus) {
+            if (staleSkus.has(sku)) continue;
+            staleSkus.add(sku);
+            unmatched.push({ sku, parentCode, reason: 'Removed in Shopify — will re-match next sync', tone: 'amber' });
+        }
+    };
+
+    const imageOps = [];
+    for (const product of scopedProducts) {
+        const variants = product.child_products || [];
+        const variantList = variants.length ? variants : [product];
+        const matched = variantList
+            .map((v) => ({ sku: (variants.length ? v.code : product.code) || '' }))
+            .filter((x) => x.sku && matchInfoBySku.get(x.sku)?.shopifyProductId);
+        if (!matched.length) continue;
+        const productId = matchInfoBySku.get(matched[0].sku).shopifyProductId;
+        const images = [...new Set(product.images || [])].filter(Boolean);
+        if (!images.length) continue;
+        const imageHash = sha1(images.join('|'));
+        if (existingMap.get(matched[0].sku)?.imageHash === imageHash) continue; // already handled
+        imageOps.push({ parentCode: product.code, productId, images, alt: product.product_name || '', skus: matched.map((m) => m.sku), imageHash });
+    }
+    if (!imageOps.length) return;
+
+    const hashUpdates = [];
     await queue.mapWithConcurrency(imageOps, async (op) => {
         try {
             const cur = await graphqlRequest(shop, token, PRODUCT_MEDIA_QUERY, { id: op.productId });
@@ -378,18 +414,7 @@ async function pushPortalAuthoritative({ connection, token, scopedProducts, matc
         }
     });
 
-    // Merge price + content + image hash updates per SKU, then persist in one pass.
-    if (hashUpdates.length) {
-        const bySku = new Map();
-        for (const h of hashUpdates) {
-            const cur = bySku.get(h.sku) || { sku: h.sku };
-            if (h.priceHash !== undefined) cur.priceHash = h.priceHash;
-            if (h.contentHash !== undefined) cur.contentHash = h.contentHash;
-            if (h.imageHash !== undefined) cur.imageHash = h.imageHash;
-            bySku.set(h.sku, cur);
-        }
-        await productMap.bulkSetHashes(connection._id, [...bySku.values()]);
-    }
+    if (hashUpdates.length) await productMap.bulkSetHashes(connection._id, hashUpdates);
 }
 
 /**
@@ -670,6 +695,12 @@ async function executeRun(connection, job, token) {
                 // Inventory (at this location), price + content were all set at creation → mark
                 // synced and record the stock location so future runs use the fast batched set.
                 await productMap.bulkSetState(connection._id, createdRows.map((r) => ({ sku: r.sku, state: 'synced', error: null, stockLocationId: locationId })));
+                // Make created products visible to the image step so they get their gallery this
+                // run too (create doesn't push media). In create_then_handoff this is the only
+                // place images come from; in portal_authoritative the image step fills them.
+                for (const r of createdRows) {
+                    matchInfoBySku.set(r.sku, { shopifyVariantId: r.shopifyVariantId, shopifyProductId: r.shopifyProductId });
+                }
             }
         }
 
@@ -726,11 +757,22 @@ async function executeRun(connection, job, token) {
 
         // ── Content + price push (Phase C) — only when the partner has opted up to the
         //    `portal_authoritative` ownership mode (design §9). Operates on matched products. ──
+        // Don't re-hit SKUs the stock push already found deleted.
+        for (const sku of staleSkus) matchInfoBySku.delete(sku);
+
+        // Price + description updates: portal_authoritative only (it overwrites managed fields
+        // every sync). create_then_handoff sets those once at creation and then leaves them.
         if (connection.config?.ownership === 'portal_authoritative') {
-            // Don't re-hit SKUs the stock push already found deleted.
-            for (const sku of staleSkus) matchInfoBySku.delete(sku);
             await pushPortalAuthoritative({
                 connection, token, scopedProducts, matchInfoBySku, existingMap, exportConfig, counts, errors, staleSkus, unmatched
+            });
+        }
+
+        // Images: in BOTH portal_authoritative and create_then_handoff (images are part of the
+        // product the portal stands up). The media-less guard keeps it safe in either mode.
+        if (connection.config?.syncImages && connection.config?.ownership !== 'stock_only') {
+            await pushImages({
+                connection, token, scopedProducts, matchInfoBySku, existingMap, counts, errors, staleSkus, unmatched
             });
         }
 
@@ -827,5 +869,6 @@ module.exports = {
     executeRun,
     buildScope,
     resolvePushPrice,
-    pushNewProducts
+    pushNewProducts,
+    pushImages
 };
