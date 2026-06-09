@@ -7,7 +7,7 @@ const { matchVariants } = require('./shopifyMatch.service');
 const productMap = require('./shopifyProductMap.service');
 const syncJobs = require('./shopifySyncJobs.service');
 const queue = require('./shopifyQueue.service');
-const { graphqlRequest, publishToPublications } = require('./shopifyGraphql.service');
+const { graphqlRequest, publishToPublications, unpublishFromPublications, listPublications } = require('./shopifyGraphql.service');
 
 /**
  * Stock-only sync engine — Phase A (design §8, plan Phase A).
@@ -420,6 +420,57 @@ async function pushImages({ connection, token, scopedProducts, matchInfoBySku, e
 }
 
 /**
+ * Publication management (sales channels) — `portal_authoritative` only. The portal owns the
+ * product, so its published channels are a managed field: every matched product is kept in
+ * sync with the connection's `publicationIds` (published to the chosen channels, unpublished
+ * from the rest). Delta-gated by a per-product `publishHash`, so it only fires when the
+ * selection actually changed. No-op when no channels are selected (we don't unpublish
+ * everything — that would hide the catalogue).
+ */
+async function pushPublications({ connection, token, scopedProducts, matchInfoBySku, existingMap, counts, errors }) {
+    const desired = [...(connection.config?.publicationIds || [])].sort();
+    if (!desired.length) return;
+
+    let allPubIds = [];
+    try {
+        allPubIds = (await listPublications(connection.shopDomain, token)).map((p) => p.id);
+    } catch (err) {
+        console.error('[shopify] listPublications (publish step) failed:', err.message);
+        return; // can't compute the complement → skip rather than guess
+    }
+    const complement = allPubIds.filter((id) => !desired.includes(id));
+    const publishHash = sha1(desired.join(','));
+    const shop = connection.shopDomain;
+
+    const ops = [];
+    for (const product of scopedProducts) {
+        const variants = product.child_products || [];
+        const variantList = variants.length ? variants : [product];
+        const firstSku = variantList.map((v) => (variants.length ? v.code : product.code) || '').find((sku) => matchInfoBySku.get(sku)?.shopifyProductId);
+        if (!firstSku) continue;
+        if (existingMap.get(firstSku)?.publishHash === publishHash) continue; // unchanged
+        ops.push({ parentCode: product.code, productId: matchInfoBySku.get(firstSku).shopifyProductId, skus: variantList.map((v) => (variants.length ? v.code : product.code) || '').filter((s) => matchInfoBySku.get(s)) });
+    }
+    if (!ops.length) return;
+
+    const hashUpdates = [];
+    await queue.mapWithConcurrency(ops, async (op) => {
+        try {
+            const pe = await publishToPublications(shop, token, op.productId, desired);
+            const ue = complement.length ? await unpublishFromPublications(shop, token, op.productId, complement) : [];
+            const msg = [...pe, ...ue].map((e) => e.message).join('; ');
+            if (msg && isStaleError(msg)) return; // product gone — stale handler elsewhere cleans it
+            if (msg) { counts.failed += 1; errors.push({ parentCode: op.parentCode, error: `publish: ${msg}` }); return; }
+            counts.publishedProducts += 1;
+            for (const sku of op.skus) hashUpdates.push({ sku, publishHash });
+        } catch (e) {
+            errors.push({ parentCode: op.parentCode, error: `publish: ${e.message}` });
+        }
+    });
+    if (hashUpdates.length) await productMap.bulkSetHashes(connection._id, hashUpdates);
+}
+
+/**
  * Activates one inventory item at the connection's location and sets its available quantity.
  * Used for items not yet stocked at that location (first sync, or after a location change).
  * Never throws — returns `{ ok, error }` so the caller records state like the batch path.
@@ -784,6 +835,11 @@ async function executeRun(connection, job, token) {
         if (connection.config?.ownership === 'portal_authoritative') {
             await pushPortalAuthoritative({
                 connection, token, scopedProducts, matchInfoBySku, existingMap, exportConfig, counts, errors, staleSkus, unmatched
+            });
+            // Sales channels are a managed field here too: keep existing products in sync with
+            // the selected channels (publish/unpublish), not just newly-created ones.
+            await pushPublications({
+                connection, token, scopedProducts, matchInfoBySku, existingMap, counts, errors
             });
         }
 

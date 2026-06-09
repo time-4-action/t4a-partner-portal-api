@@ -202,11 +202,28 @@ async function publishToPublications(shop, accessToken, publishableId, publicati
     return data?.publishablePublish?.userErrors || [];
 }
 
+const UNPUBLISH_MUTATION = `mutation Unpublish($id: ID!, $input: [PublicationInput!]!) {
+  publishableUnpublish(id: $id, input: $input) {
+    userErrors { field message }
+  }
+}`;
+
+/** Removes a product from a set of publications (sales channels). Requires `write_publications`. */
+async function unpublishFromPublications(shop, accessToken, publishableId, publicationIds) {
+    if (!publicationIds?.length) return [];
+    const data = await graphqlRequest(shop, accessToken, UNPUBLISH_MUTATION, {
+        id: publishableId,
+        input: publicationIds.map((publicationId) => ({ publicationId }))
+    });
+    return data?.publishableUnpublish?.userErrors || [];
+}
+
 module.exports = {
     graphqlRequest,
     listLocations,
     listPublications,
     publishToPublications,
+    unpublishFromPublications,
     // exported for unit-testing the backoff math
     _internals: { backoffMs, isThrottled, throttleStatusOf }
 };
