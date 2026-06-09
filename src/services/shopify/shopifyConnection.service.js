@@ -286,15 +286,21 @@ async function setStatus(id, status, extra = {}) {
 }
 
 /**
- * Marks every connection for a shop domain as uninstalled (app/uninstalled webhook).
- * The map/token are kept for a possible reinstall but the token is cleared to be safe.
+ * Marks every connection for a shop domain as uninstalled (app/uninstalled webhook). Both tokens
+ * are cleared (uninstall revokes them). The connection ROW is kept (status: 'uninstalled', hidden
+ * from the portal list) so a later reinstall reuses it and preserves the partner's config.
+ * @returns {Promise<Array<ObjectId>>} ids of the affected connections (so the caller can drop
+ *   their product maps).
  */
 async function markUninstalledByShop(shopDomain) {
     const db = getDb();
-    await db.collection(COLLECTION_NAME).updateMany(
+    const collection = db.collection(COLLECTION_NAME);
+    const affected = await collection.find({ shopDomain }, { projection: { _id: 1 } }).toArray();
+    await collection.updateMany(
         { shopDomain },
-        { $set: { status: 'uninstalled', accessTokenEnc: null, updatedAt: new Date() } }
+        { $set: { status: 'uninstalled', accessTokenEnc: null, refreshTokenEnc: null, updatedAt: new Date() } }
     );
+    return affected.map((c) => c._id);
 }
 
 /**

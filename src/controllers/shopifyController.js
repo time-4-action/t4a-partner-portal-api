@@ -1,6 +1,7 @@
 const oauthService = require('../services/shopify/shopifyOAuth.service');
 const connectionService = require('../services/shopify/shopifyConnection.service');
 const tokenService = require('../services/shopify/shopifyToken.service');
+const shopifyApi = require('../services/shopify/shopifyApi.service');
 const shopifyGraphql = require('../services/shopify/shopifyGraphql.service');
 const syncService = require('../services/shopify/shopifySync.service');
 const syncJobs = require('../services/shopify/shopifySyncJobs.service');
@@ -324,12 +325,22 @@ exports.activity = async (req, res) => {
 };
 
 /**
- * DELETE /shopify/connection/:id — disconnect (delete the stored token + connection).
- * Note: this removes our record; it does not uninstall the app from the merchant's side.
+ * DELETE /shopify/connection/:id — disconnect: uninstall the app from the merchant's Shopify
+ * admin AND delete our record + product map. So a portal disconnect mirrors a Shopify uninstall.
  */
 exports.disconnect = async (req, res) => {
     try {
         const connection = await loadOwned(req);
+        // Best-effort self-uninstall so the app is removed in Shopify too, not just in the portal.
+        // If the token can't be obtained/used (already uninstalled, refresh dead), we still drop
+        // our record — the merchant's app card may linger but it has no working access either way.
+        try {
+            const token = await tokenService.getValidAccessToken(connection._id);
+            await shopifyApi.uninstallApp(connection.shopDomain, token);
+        } catch (err) {
+            console.warn('[shopify] self-uninstall on disconnect failed (continuing):',
+                err.code || err.response?.status || err.message);
+        }
         await connectionService.deleteConnection(req.params.id);
         // Drop the now-orphaned product map so a later reinstall re-matches cleanly.
         await productMap.deleteForConnection(connection._id);
@@ -355,10 +366,14 @@ exports.webhook = async (req, res) => {
 
     try {
         switch (topic) {
-            case 'app/uninstalled':
-                await connectionService.markUninstalledByShop(shopDomain);
-                console.log(`[shopify] app uninstalled: ${shopDomain}`);
+            case 'app/uninstalled': {
+                // Merchant removed the app in Shopify → mark our connection(s) uninstalled (which
+                // hides them from the portal) and drop their product maps so a reinstall re-matches.
+                const ids = await connectionService.markUninstalledByShop(shopDomain);
+                await Promise.all(ids.map((id) => productMap.deleteForConnection(id)));
+                console.log(`[shopify] app uninstalled: ${shopDomain} (${ids.length} connection(s))`);
                 break;
+            }
             case 'shop/redact':
             case 'customers/redact':
             case 'customers/data_request':

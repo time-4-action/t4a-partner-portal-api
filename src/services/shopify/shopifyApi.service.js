@@ -123,11 +123,25 @@ async function getShopInfo(shop, accessToken) {
     return data.shop;
 }
 
+/**
+ * Uninstalls THIS app from the shop by revoking the current access token — Shopify's documented
+ * "app uninstalls itself" call (`DELETE /admin/api/<ver>/api_permissions/current.json`). It
+ * removes the app from the merchant's admin and triggers the `app/uninstalled` webhook. Used so
+ * that disconnecting in the portal also removes the app in Shopify. An already-invalid token
+ * 401s — the caller treats that as "already uninstalled" and proceeds.
+ * @param {string} shop - full myshopify domain
+ * @param {string} accessToken
+ */
+async function uninstallApp(shop, accessToken) {
+    await adminClient(shop, accessToken).delete('/api_permissions/current.json');
+}
+
 module.exports = {
     API_VERSION,
     REQUIRED_WEBHOOK_TOPICS,
     exchangeCodeForToken,
     refreshAccessToken,
     registerWebhooks,
-    getShopInfo
+    getShopInfo,
+    uninstallApp
 };
