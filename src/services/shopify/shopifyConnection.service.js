@@ -120,6 +120,28 @@ async function getConnectionById(id) {
 }
 
 /**
+ * Lists active connections that are **ready to sync** — have a live token, a chosen
+ * "Products to sync" export config, and a target location. Used by the automatic triggers
+ * (PNV-end delta, n8n reconcile) to fan a sync out across every connected store.
+ * Returns minimal docs (`_id`, `shopDomain`); the sync engine re-loads the token itself.
+ * @returns {Promise<Array<{ _id: ObjectId, shopDomain: string }>>}
+ */
+async function listActiveSyncable() {
+    const db = getDb();
+    return db.collection(COLLECTION_NAME)
+        .find(
+            {
+                status: 'active',
+                accessTokenEnc: { $ne: null },
+                'config.exportConfigId': { $ne: null },
+                shopifyLocationId: { $ne: null }
+            },
+            { projection: { _id: 1, shopDomain: 1 } }
+        )
+        .toArray();
+}
+
+/**
  * Returns the raw connection INCLUDING the encrypted token. For internal use by the
  * sync engine and the OAuth/locations flow — never expose the result over the API.
  */
@@ -276,6 +298,7 @@ module.exports = {
     getConnectionForUser,
     getConnectionById,
     getConnectionWithToken,
+    listActiveSyncable,
     updateConnectionConfig,
     updateTokens,
     updateLastSync,

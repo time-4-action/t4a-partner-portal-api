@@ -2,6 +2,7 @@ const { runPnvProductSync } = require('../services/pnv/pnvProductsSync.service')
 const { identifyProductCategories, categorizeExternalProducts } = require('../services/ai/categoryIdentification.service');
 const { getAiEnabledExports } = require('../services/exports.service');
 const { fireCallback } = require('../services/callbackWebhook.service');
+const { syncAllConnections } = require('../services/shopify/shopifySync.service');
 
 /**
  * POST /api/export/webhooks/sync/pnv
@@ -25,6 +26,12 @@ exports.triggerPnvSync = (req, res) => {
         try {
             const stats = await runPnvProductSync();
             const finishedAt = new Date();
+
+            // Near-live trigger (design §8.1): once the catalogue is refreshed, push to every
+            // connected Shopify store. Fire-and-forget so it never delays the PNV callback.
+            syncAllConnections({ trigger: 'pnv' })
+                .then((r) => console.log(`[shopify] PNV-triggered sync started for ${r.length} connection(s)`))
+                .catch((e) => console.error('[shopify] PNV-triggered sync error:', e.message));
 
             await fireCallback(webhook, {
                 event: 'pnv_sync_completed',
@@ -64,6 +71,27 @@ exports.triggerPnvSync = (req, res) => {
  * Responds immediately with 202. When done, POSTs a result payload to
  * webhook_url if provided in the request body.
  */
+/**
+ * POST /api/export/webhooks/sync/shopify
+ *
+ * Triggers a full Shopify reconcile across every connected store (design §8.1) — meant to be
+ * called on a schedule by n8n. Each store's run is kicked off in the background (serialized
+ * per shop); responds 202 with the per-connection start results.
+ */
+exports.triggerShopifyReconcile = async (req, res) => {
+    try {
+        const results = await syncAllConnections({ trigger: 'reconcile' });
+        res.status(202).json({
+            message: `Shopify reconcile started for ${results.length} connection(s).`,
+            startedAt: new Date().toISOString(),
+            results
+        });
+    } catch (err) {
+        console.error('[webhook] Shopify reconcile failed:', err.message);
+        res.status(500).json({ message: err.message });
+    }
+};
+
 /**
  * POST /api/export/webhooks/categorize
  *

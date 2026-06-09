@@ -698,8 +698,33 @@ async function startStockSync(connectionId, { trigger = 'manual' } = {}) {
     return job;
 }
 
+/**
+ * Fans a sync out across every sync-ready connection — the automatic triggers (design §8.1):
+ * the PNV-end delta push and the n8n nightly reconcile both call this. Each connection's run
+ * is kicked off in the background (serialized per shop), so this returns quickly after setup.
+ * Connections that aren't ready / are busy / need re-auth are skipped, never throwing.
+ *
+ * @param {{ trigger?: string }} [opts]
+ * @returns {Promise<Array<{ shop: string, jobId?: string, skipped?: string }>>}
+ */
+async function syncAllConnections({ trigger = 'reconcile' } = {}) {
+    const connections = await connectionService.listActiveSyncable();
+    const results = [];
+    for (const conn of connections) {
+        try {
+            const job = await startStockSync(conn._id, { trigger });
+            results.push({ shop: conn.shopDomain, jobId: job._id.toString() });
+        } catch (err) {
+            // SYNC_BUSY / REAUTH_REQUIRED / NO_EXPORT_CONFIG etc. — skip this store, keep going.
+            results.push({ shop: conn.shopDomain, skipped: err.code || err.message });
+        }
+    }
+    return results;
+}
+
 module.exports = {
     startStockSync,
+    syncAllConnections,
     // exported for tests / future triggers (PNV delta, n8n reconcile)
     executeRun,
     buildScope,
