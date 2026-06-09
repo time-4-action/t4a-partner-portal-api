@@ -1,7 +1,11 @@
 const oauthService = require('../services/shopify/shopifyOAuth.service');
 const connectionService = require('../services/shopify/shopifyConnection.service');
-const shopifyApi = require('../services/shopify/shopifyApi.service');
-const { decryptToken, verifyWebhookHmac } = require('../services/shopify/crypto.service');
+const tokenService = require('../services/shopify/shopifyToken.service');
+const shopifyGraphql = require('../services/shopify/shopifyGraphql.service');
+const syncService = require('../services/shopify/shopifySync.service');
+const syncJobs = require('../services/shopify/shopifySyncJobs.service');
+const productMap = require('../services/shopify/shopifyProductMap.service');
+const { verifyWebhookHmac } = require('../services/shopify/crypto.service');
 
 /**
  * Controller for the Shopify connection lifecycle (design §10).
@@ -11,12 +15,41 @@ const { decryptToken, verifyWebhookHmac } = require('../services/shopify/crypto.
 const ERROR_STATUS_MAP = {
     VALIDATION_ERROR: 400,
     INVALID_ID: 400,
+    NO_LOCATION: 400,
+    NO_EXPORT_CONFIG: 400,
     INVALID_HMAC: 401,
     INVALID_STATE: 401,
+    REAUTH_REQUIRED: 401,
     NOT_FOUND: 404,
     FORBIDDEN: 403,
+    NOT_ACTIVE: 409,
+    SYNC_BUSY: 409,
     SERVER_ERROR: 500
 };
+
+/** Shapes a stored sync-run document into the row the partner UI's activity table renders. */
+function toActivityRow(job) {
+    const c = job.counts || {};
+    const label = (c.inScope || 0) === 0
+        ? 'Nothing in scope'
+        : `${c.pushed || 0}/${c.matched || 0} pushed`;
+    let detail = job.error || null;
+    if (!detail) {
+        if (c.unmatched) detail = `${c.unmatched} unmatched`;
+        else if (c.failed) detail = `${c.failed} failed`;
+        else detail = job.trigger || null;
+    }
+    return {
+        id: job._id.toString(),
+        type: job.type,
+        status: job.status,
+        attempts: job.attempts || 1,
+        time: (job.finishedAt || job.startedAt || job.createdAt)?.toISOString?.() || null,
+        label,
+        detail,
+        trigger: job.trigger
+    };
+}
 
 function handleError(res, error) {
     const status = ERROR_STATUS_MAP[error.code] || 500;
@@ -72,22 +105,24 @@ exports.status = async (req, res) => {
         const { sub } = authUser(req);
         const connection = await connectionService.getConnectionForUser(sub);
         if (!connection) {
-            return res.json({ success: true, connected: false, connection: null, locations: [] });
+            return res.json({ success: true, connected: false, connection: null, locations: [], needsReconnect: false });
         }
 
+        // `needsReconnect` tells the UI to prompt a re-install — set when the stored token can't
+        // be refreshed (legacy non-expiring token, or an expired refresh token).
         let locations = [];
+        let needsReconnect = connection.status === 'error';
         if (connection.status === 'active') {
             try {
-                const raw = await connectionService.getConnectionWithToken(connection._id);
-                if (raw?.accessTokenEnc) {
-                    locations = await shopifyApi.listLocations(connection.shopDomain, decryptToken(raw.accessTokenEnc));
-                }
+                const token = await tokenService.getValidAccessToken(connection._id);
+                locations = await shopifyGraphql.listLocations(connection.shopDomain, token);
             } catch (err) {
-                console.error('[shopify] listLocations failed:', err.message);
+                if (err.code === 'REAUTH_REQUIRED') needsReconnect = true;
+                else console.error('[shopify] listLocations failed:', err.code || '', err.message);
             }
         }
 
-        res.json({ success: true, connected: connection.status === 'active', connection, locations });
+        res.json({ success: true, connected: connection.status === 'active', connection, locations, needsReconnect });
     } catch (error) {
         handleError(res, error);
     }
@@ -124,13 +159,60 @@ exports.updateConfig = async (req, res) => {
 };
 
 /**
+ * POST /shopify/connection/:id/sync — manual "Sync now" (Phase A: stock-only).
+ * Owner-checked. Starts the run in the background and responds 202 with the run id so the
+ * UI can poll `/activity`; the heavy push proceeds under the per-shop queue lock.
+ */
+exports.sync = async (req, res) => {
+    try {
+        const connection = await loadOwned(req);
+        const job = await syncService.startStockSync(connection._id, { trigger: 'manual' });
+        res.status(202).json({ success: true, job: toActivityRow(job) });
+    } catch (error) {
+        handleError(res, error);
+    }
+};
+
+/**
+ * GET /shopify/connection/:id/activity — recent sync runs + aggregate map counts + the
+ * latest run's unmatched "needs attention" list. Owner-checked. Replaces the UI's three
+ * MOCK_* constants with live data.
+ */
+exports.activity = async (req, res) => {
+    try {
+        const connection = await loadOwned(req);
+        const [runs, stateCounts, latest] = await Promise.all([
+            syncJobs.listRecentRuns(connection._id, 20),
+            productMap.getStateCounts(connection._id),
+            syncJobs.getLatestRun(connection._id)
+        ]);
+        res.json({
+            success: true,
+            jobs: runs.map(toActivityRow),
+            // synced/error come from the authoritative map; pending = SKUs the latest run
+            // couldn't match yet (awaiting a fix or a future create phase).
+            counts: {
+                synced: stateCounts.synced,
+                pending: latest?.counts?.unmatched || 0,
+                error: stateCounts.error
+            },
+            unmatched: latest?.unmatched || []
+        });
+    } catch (error) {
+        handleError(res, error);
+    }
+};
+
+/**
  * DELETE /shopify/connection/:id — disconnect (delete the stored token + connection).
  * Note: this removes our record; it does not uninstall the app from the merchant's side.
  */
 exports.disconnect = async (req, res) => {
     try {
-        await loadOwned(req);
+        const connection = await loadOwned(req);
         await connectionService.deleteConnection(req.params.id);
+        // Drop the now-orphaned product map so a later reinstall re-matches cleanly.
+        await productMap.deleteForConnection(connection._id);
         res.json({ success: true, message: 'Disconnected' });
     } catch (error) {
         handleError(res, error);

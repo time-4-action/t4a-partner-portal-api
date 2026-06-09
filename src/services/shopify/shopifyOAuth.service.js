@@ -104,6 +104,9 @@ async function handleCallback(query) {
         ownerEmail: payload.email,
         shopDomain: normalized,
         accessToken,
+        refreshToken: tokenResp.refresh_token,
+        expiresIn: tokenResp.expires_in,
+        refreshTokenExpiresIn: tokenResp.refresh_token_expires_in,
         scopes: grantedScopes,
         shopInfo
     });

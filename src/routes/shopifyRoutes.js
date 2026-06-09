@@ -16,6 +16,8 @@ router.get('/callback', shopifyController.callback);
 // ─── Connection management (JWT + export role, owner-checked in controller) ─────
 router.get('/status', jwtCheck, requireExportRole, shopifyController.status);
 router.put('/connection/:id/config', jwtCheck, requireExportRole, shopifyController.updateConfig);
+router.post('/connection/:id/sync', jwtCheck, requireExportRole, shopifyController.sync);
+router.get('/connection/:id/activity', jwtCheck, requireExportRole, shopifyController.activity);
 router.delete('/connection/:id', jwtCheck, requireExportRole, shopifyController.disconnect);
 
 // ─── Webhooks ───────────────────────────────────────────────────────────────

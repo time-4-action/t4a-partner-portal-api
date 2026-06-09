@@ -32,12 +32,18 @@ const DEFAULT_CONFIG = {
 };
 
 /**
- * Strips secrets (encrypted token) before a connection leaves the service for the API layer.
+ * Strips secrets (encrypted access + refresh tokens) before a connection leaves the service
+ * for the API layer.
  */
 function toPublic(conn) {
     if (!conn) return null;
-    const { accessTokenEnc, ...rest } = conn;
+    const { accessTokenEnc, refreshTokenEnc, ...rest } = conn;
     return { ...rest, _id: conn._id.toString(), connected: conn.status === 'active' };
+}
+
+/** Seconds-from-now → absolute Date, or null when the input is missing. */
+function expiryDate(seconds) {
+    return typeof seconds === 'number' ? new Date(Date.now() + seconds * 1000) : null;
 }
 
 /**
@@ -46,7 +52,7 @@ function toPublic(conn) {
  * duplicating. Preserves an existing `config` on re-install.
  * @returns {Promise<Object>} the public-shaped connection
  */
-async function upsertConnection({ ownerSub, ownerEmail, shopDomain, accessToken, scopes, shopInfo }) {
+async function upsertConnection({ ownerSub, ownerEmail, shopDomain, accessToken, refreshToken, expiresIn, refreshTokenExpiresIn, scopes, shopInfo }) {
     const db = getDb();
     const collection = db.collection(COLLECTION_NAME);
     const now = new Date();
@@ -58,6 +64,11 @@ async function upsertConnection({ ownerSub, ownerEmail, shopDomain, accessToken,
         ownerEmail: ownerEmail || null,
         shopDomain,
         accessTokenEnc: encryptToken(accessToken),
+        // Expiring offline tokens (2026-04 requirement): keep the refresh token + expiries so
+        // the token service can renew the ~60-min access token without re-prompting the user.
+        refreshTokenEnc: refreshToken ? encryptToken(refreshToken) : null,
+        tokenExpiresAt: expiryDate(expiresIn),
+        refreshTokenExpiresAt: expiryDate(refreshTokenExpiresIn),
         scopes: scopes && scopes.length ? scopes : DEFAULT_SCOPES,
         shopName: shopInfo?.name || existing?.shopName || null,
         shopCurrency: shopInfo?.currency || existing?.shopCurrency || null,
@@ -162,6 +173,41 @@ async function updateConnectionConfig(id, patch) {
 }
 
 /**
+ * Persists a renewed token set after a refresh. Obtaining a new expiring token retires the
+ * previous one, so this must overwrite both the access and refresh tokens atomically.
+ * @param {ObjectId|string} id
+ * @param {{ accessToken:string, refreshToken:string, expiresIn:number, refreshTokenExpiresIn:number }} tokens
+ */
+async function updateTokens(id, { accessToken, refreshToken, expiresIn, refreshTokenExpiresIn }) {
+    if (!ObjectId.isValid(id)) return;
+    await getDb().collection(COLLECTION_NAME).updateOne(
+        { _id: new ObjectId(id) },
+        {
+            $set: {
+                accessTokenEnc: encryptToken(accessToken),
+                refreshTokenEnc: refreshToken ? encryptToken(refreshToken) : null,
+                tokenExpiresAt: expiryDate(expiresIn),
+                refreshTokenExpiresAt: expiryDate(refreshTokenExpiresIn),
+                updatedAt: new Date()
+            }
+        }
+    );
+}
+
+/**
+ * Records the outcome of a sync run on the connection (drives the UI's "Last sync" /
+ * "Sync status" summary). Never touches the connection `status` field (active/uninstalled).
+ * @param {ObjectId|string} id
+ * @param {{ lastSyncAt?: Date, lastSyncStatus?: string }} fields
+ */
+async function updateLastSync(id, { lastSyncAt = new Date(), lastSyncStatus } = {}) {
+    if (!ObjectId.isValid(id)) return;
+    const set = { lastSyncAt, updatedAt: new Date() };
+    if (lastSyncStatus) set.lastSyncStatus = lastSyncStatus;
+    await getDb().collection(COLLECTION_NAME).updateOne({ _id: new ObjectId(id) }, { $set: set });
+}
+
+/**
  * Sets the connection status (e.g. 'uninstalled' on app/uninstalled webhook, 'error' on failure).
  */
 async function setStatus(id, status, extra = {}) {
@@ -231,6 +277,8 @@ module.exports = {
     getConnectionById,
     getConnectionWithToken,
     updateConnectionConfig,
+    updateTokens,
+    updateLastSync,
     setStatus,
     markUninstalledByShop,
     deleteConnection,

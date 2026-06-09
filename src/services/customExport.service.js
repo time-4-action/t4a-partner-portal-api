@@ -1145,6 +1145,10 @@ module.exports = {
     generateJsonExport,
     generateXmlExport,
     ensureIndexesAndMigrate,
+    // Reused by the Shopify sync engine to apply the same published-only narrowing +
+    // export-config filters, and to resolve a single price from pricelist[] later phases.
+    applyFilters,
+    getPriceFromPriority,
     VALID_PRESETS,
     COLUMN_HEADERS,
     DEFAULT_FILTERS
