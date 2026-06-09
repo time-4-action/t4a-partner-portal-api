@@ -689,8 +689,13 @@ async function executeRun(connection, job, token) {
 
         // ── Product create (Phase B) — turn unmatched products into listings. Runs before the
         //    stock push; created variants get their inventory set during creation, so they're
-        //    not in this run's stock batch (future runs maintain them as matched). ───────────
-        if (connection.config?.syncNewProducts && connection.config?.ownership !== 'stock_only') {
+        //    not in this run's stock batch (future runs maintain them as matched).
+        //    create_then_handoff ALWAYS creates (it's the mode's whole purpose), so an unmatched
+        //    product becomes a new listing rather than a "needs attention" item — regardless of
+        //    the New-products toggle. Other modes honour the toggle. ────────────────────────────
+        const wantCreate = connection.config?.ownership === 'create_then_handoff'
+            || (connection.config?.syncNewProducts && connection.config?.ownership !== 'stock_only');
+        if (wantCreate) {
             const createdRows = await pushNewProducts({
                 connection, token, scopedProducts, unmatched, matchInfoBySku, exportConfig, locationId, counts, errors
             });
