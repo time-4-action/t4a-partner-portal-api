@@ -39,6 +39,7 @@ function toActivityRow(job) {
     if (c.createdProducts) bits.push(`${c.createdProducts} created`);
     if (c.pricesPushed) bits.push(`${c.pricesPushed} prices`);
     if (c.contentPushed) bits.push(`${c.contentPushed} content`);
+    if (c.imagesPushed) bits.push(`${c.imagesPushed} images`);
     if (c.unmatched) bits.push(`${c.unmatched} unmatched`);
     if (c.failed) bits.push(`${c.failed} failed`);
     const detail = bits.length ? bits.join(' · ') : (job.trigger || null);

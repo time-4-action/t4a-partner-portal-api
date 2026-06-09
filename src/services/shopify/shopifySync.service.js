@@ -41,6 +41,17 @@ const INVENTORY_SET_MUTATION = `mutation InventorySet($input: InventorySetQuanti
   }
 }`;
 
+// Activates an inventory item at a location AND sets its available quantity. Needed because
+// `inventorySetQuantities` silently no-ops for an item that isn't yet stocked at the target
+// location (returns no error but creates no inventory level) — which broke syncing to a newly
+// chosen location. `@idempotent` is required on 2026-04 inventory mutations.
+const INVENTORY_ACTIVATE_MUTATION = `mutation InventoryActivate($inventoryItemId: ID!, $locationId: ID!, $available: Int, $idempotencyKey: String!) {
+  inventoryActivate(inventoryItemId: $inventoryItemId, locationId: $locationId, available: $available) @idempotent(key: $idempotencyKey) {
+    inventoryLevel { id }
+    userErrors { field message }
+  }
+}`;
+
 // Phase C — content/price push (only in `portal_authoritative` ownership).
 const VARIANTS_PRICE_MUTATION = `mutation VariantsPrice($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
   productVariantsBulkUpdate(productId: $productId, variants: $variants) {
@@ -67,6 +78,17 @@ const PRODUCT_CREATE_MUTATION = `mutation ProductCreate($product: ProductCreateI
 const VARIANTS_BULK_CREATE_MUTATION = `mutation VariantsBulkCreate($productId: ID!, $variants: [ProductVariantsBulkInput!]!, $strategy: ProductVariantsBulkCreateStrategy) {
   productVariantsBulkCreate(productId: $productId, variants: $variants, strategy: $strategy) {
     productVariants { id sku inventoryItem { id } }
+    userErrors { field message }
+  }
+}`;
+
+// Phase D — image sync. productCreateMedia is deprecated on 2026-04; the supported path is
+// productUpdate with a `media` arg (adds media, processed asynchronously by Shopify).
+const PRODUCT_MEDIA_QUERY = `query ProductMedia($id: ID!) { product(id: $id) { media(first: 1) { nodes { id } } } }`;
+
+const PRODUCT_UPDATE_MEDIA_MUTATION = `mutation ProductUpdateMedia($product: ProductUpdateInput!, $media: [CreateMediaInput!]) {
+  productUpdate(product: $product, media: $media) {
+    product { id }
     userErrors { field message }
   }
 }`;
@@ -221,7 +243,8 @@ async function pushPortalAuthoritative({ connection, token, scopedProducts, matc
     const cfg = connection.config || {};
     const wantPrices = !!cfg.syncPrices;
     const wantContent = !!cfg.syncDescriptions;
-    if (!wantPrices && !wantContent) return;
+    const wantImages = !!cfg.syncImages;
+    if (!wantPrices && !wantContent && !wantImages) return;
 
     const vatMode = cfg.priceVatMode || 'inclusive';
     const futureGuard = cfg.futureDatedGuard !== false;
@@ -241,6 +264,7 @@ async function pushPortalAuthoritative({ connection, token, scopedProducts, matc
 
     const priceOps = []; // { parentCode, productId, variants:[{id,price}], hashes:[{sku,priceHash}] }
     const contentOps = []; // { parentCode, product:{id,title,descriptionHtml,tags}, skus:[], contentHash }
+    const imageOps = []; // { parentCode, productId, images:[url], alt, skus:[], imageHash }
 
     for (const product of scopedProducts) {
         const variants = product.child_products || [];
@@ -276,6 +300,15 @@ async function pushPortalAuthoritative({ connection, token, scopedProducts, matc
             const contentHash = sha1(JSON.stringify({ title, descriptionHtml, tags }));
             if (existingMap.get(matched[0].sku)?.contentHash !== contentHash) {
                 contentOps.push({ parentCode: product.code, product: { id: productId, title, descriptionHtml, tags }, skus: matched.map((m) => m.sku), contentHash });
+            }
+        }
+
+        if (wantImages) {
+            const images = [...new Set(product.images || [])].filter(Boolean);
+            const imageHash = sha1(images.join('|'));
+            // Only consider products whose image set we haven't handled yet.
+            if (images.length && existingMap.get(matched[0].sku)?.imageHash !== imageHash) {
+                imageOps.push({ parentCode: product.code, productId, images, alt: product.product_name || '', skus: matched.map((m) => m.sku), imageHash });
             }
         }
     }
@@ -322,16 +355,60 @@ async function pushPortalAuthoritative({ connection, token, scopedProducts, matc
         }
     });
 
-    // Merge price + content hash updates per SKU, then persist in one pass.
+    // Images (Phase D): add the parent gallery — but only to products that have NO media yet, so
+    // we never duplicate media on re-sync or clobber a partner's own images. Once handled (pushed
+    // OR skipped because media already exists), the imageHash is recorded so we don't re-check.
+    await queue.mapWithConcurrency(imageOps, async (op) => {
+        try {
+            const cur = await graphqlRequest(shop, token, PRODUCT_MEDIA_QUERY, { id: op.productId });
+            const hasMedia = (cur?.product?.media?.nodes || []).length > 0;
+            if (!hasMedia) {
+                const media = op.images.map((url) => ({ originalSource: url, alt: op.alt, mediaContentType: 'IMAGE' }));
+                const data = await graphqlRequest(shop, token, PRODUCT_UPDATE_MEDIA_MUTATION, { product: { id: op.productId }, media });
+                const ue = data?.productUpdate?.userErrors || [];
+                const msg = ue.map((e) => e.message).join('; ');
+                if (ue.length && isStaleError(msg)) { markStale(op.parentCode, op.skus); return; }
+                if (ue.length) { counts.failed += 1; errors.push({ parentCode: op.parentCode, error: `images: ${msg}` }); return; }
+                counts.imagesPushed += op.images.length;
+            }
+            for (const sku of op.skus) hashUpdates.push({ sku, imageHash: op.imageHash });
+        } catch (e) {
+            if (isStaleError(e.message)) markStale(op.parentCode, op.skus);
+            else { counts.failed += 1; errors.push({ parentCode: op.parentCode, error: `images: ${e.message}` }); }
+        }
+    });
+
+    // Merge price + content + image hash updates per SKU, then persist in one pass.
     if (hashUpdates.length) {
         const bySku = new Map();
         for (const h of hashUpdates) {
             const cur = bySku.get(h.sku) || { sku: h.sku };
             if (h.priceHash !== undefined) cur.priceHash = h.priceHash;
             if (h.contentHash !== undefined) cur.contentHash = h.contentHash;
+            if (h.imageHash !== undefined) cur.imageHash = h.imageHash;
             bySku.set(h.sku, cur);
         }
         await productMap.bulkSetHashes(connection._id, [...bySku.values()]);
+    }
+}
+
+/**
+ * Activates one inventory item at the connection's location and sets its available quantity.
+ * Used for items not yet stocked at that location (first sync, or after a location change).
+ * Never throws — returns `{ ok, error }` so the caller records state like the batch path.
+ */
+async function activateInventory(shop, token, item, locationId) {
+    try {
+        const data = await graphqlRequest(shop, token, INVENTORY_ACTIVATE_MUTATION, {
+            inventoryItemId: item.shopifyInventoryItemId,
+            locationId,
+            available: item.quantity,
+            idempotencyKey: crypto.randomUUID()
+        });
+        const ue = data?.inventoryActivate?.userErrors || [];
+        return ue.length ? { ok: false, error: ue.map((e) => e.message).join('; ') } : { ok: true, error: null };
+    } catch (e) {
+        return { ok: false, error: e.message };
     }
 }
 
@@ -590,39 +667,60 @@ async function executeRun(connection, job, token) {
             });
             if (createdRows.length) {
                 await productMap.bulkUpsertMatches(connection._id, connection.shopDomain, createdRows);
-                // Inventory + price + content were all set at creation → mark synced.
-                await productMap.bulkSetState(connection._id, createdRows.map((r) => ({ sku: r.sku, state: 'synced', error: null })));
+                // Inventory (at this location), price + content were all set at creation → mark
+                // synced and record the stock location so future runs use the fast batched set.
+                await productMap.bulkSetState(connection._id, createdRows.map((r) => ({ sku: r.sku, state: 'synced', error: null, stockLocationId: locationId })));
             }
         }
 
         // ── Stock push (Phase A) — gated on the syncStock toggle (default on). ───────────
         if (connection.config?.syncStock !== false) {
-            const batches = chunk(pushable, QUANTITIES_PER_CALL);
+            const stateUpdates = [];
+            const recordOutcome = (it, outcome, activated) => {
+                if (outcome.ok) {
+                    counts.pushed++;
+                    const u = { sku: it.sku, state: 'synced', hash: sha1(it.quantity), error: null };
+                    // Remember we stocked this item at this location → fast batched set next time.
+                    if (activated) u.stockLocationId = locationId;
+                    stateUpdates.push(u);
+                } else if (isStaleError(outcome.error)) {
+                    // Target deleted in Shopify — drop the mapping (re-match next sync).
+                    staleSkus.add(it.sku);
+                    unmatched.push({ sku: it.sku, parentCode: it.parentCode, reason: 'Removed in Shopify — will re-match next sync', tone: 'amber' });
+                } else {
+                    counts.failed++;
+                    errors.push({ sku: it.sku, parentCode: it.parentCode, error: outcome.error });
+                    stateUpdates.push({ sku: it.sku, state: 'error', error: outcome.error });
+                }
+            };
+
+            // An item already stocked at THIS location can use the fast batched set; one that
+            // isn't (new item, or the partner changed the location) must be activated first —
+            // inventorySetQuantities silently no-ops on an un-stocked location.
+            const stockedHere = [];
+            const needActivate = [];
+            for (const it of pushable) {
+                if (existingMap.get(it.sku)?.stockLocationId === locationId) stockedHere.push(it);
+                else needActivate.push(it);
+            }
+
+            const batches = chunk(stockedHere, QUANTITIES_PER_CALL);
             const batchOutcomes = await queue.mapWithConcurrency(
                 batches,
                 (batch) => pushBatch(connection.shopDomain, token, locationId, job._id, batch)
             );
-
-            const stateUpdates = [];
             for (let b = 0; b < batches.length; b++) {
-                const outcomes = batchOutcomes[b];
                 for (const it of batches[b]) {
-                    const outcome = outcomes.get(it.sku) || { ok: false, error: 'No result' };
-                    if (outcome.ok) {
-                        counts.pushed++;
-                        stateUpdates.push({ sku: it.sku, state: 'synced', hash: sha1(it.quantity), error: null });
-                    } else if (isStaleError(outcome.error)) {
-                        // Target deleted in Shopify — drop the mapping (re-match next sync), don't
-                        // count as a failure or write an error state on a row we're removing.
-                        staleSkus.add(it.sku);
-                        unmatched.push({ sku: it.sku, parentCode: it.parentCode, reason: 'Removed in Shopify — will re-match next sync', tone: 'amber' });
-                    } else {
-                        counts.failed++;
-                        errors.push({ sku: it.sku, parentCode: it.parentCode, error: outcome.error });
-                        stateUpdates.push({ sku: it.sku, state: 'error', error: outcome.error });
-                    }
+                    recordOutcome(it, batchOutcomes[b].get(it.sku) || { ok: false, error: 'No result' }, false);
                 }
             }
+
+            const actOutcomes = await queue.mapWithConcurrency(
+                needActivate,
+                (it) => activateInventory(connection.shopDomain, token, it, locationId)
+            );
+            needActivate.forEach((it, i) => recordOutcome(it, actOutcomes[i], true));
+
             if (stateUpdates.length) await productMap.bulkSetState(connection._id, stateUpdates);
         }
 

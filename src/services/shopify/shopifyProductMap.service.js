@@ -78,7 +78,9 @@ async function bulkUpsertMatches(connectionId, shopDomain, matches) {
  * SKUs after the inventory mutation runs.
  *
  * @param {ObjectId|string} connectionId
- * @param {Array<{sku:string, state:'synced'|'error'|'pending', error?:string|null, hash?:string|null, pushedAt?:Date|null}>} updates
+ * `stockLocationId` records the location the item is currently stocked at (set after a
+ * successful inventory activate) so later syncs can use the fast batched set there.
+ * @param {Array<{sku:string, state:'synced'|'error'|'pending', error?:string|null, hash?:string|null, pushedAt?:Date|null, stockLocationId?:string}>} updates
  */
 async function bulkSetState(connectionId, updates) {
     if (!updates.length) return;
@@ -87,6 +89,7 @@ async function bulkSetState(connectionId, updates) {
     const ops = updates.map((u) => {
         const set = { state: u.state, error: u.error || null, updatedAt: now };
         if (u.hash !== undefined) set.lastHash = u.hash;
+        if (u.stockLocationId !== undefined) set.stockLocationId = u.stockLocationId;
         if (u.state === 'synced') set.lastPushedAt = u.pushedAt || now;
         return {
             updateOne: { filter: { connectionId: cid, sku: u.sku }, update: { $set: set } }
@@ -100,7 +103,7 @@ async function bulkSetState(connectionId, updates) {
  * push (Phase C). Kept separate from {@link bulkSetState} so a price/content update doesn't
  * disturb the row's stock sync state.
  * @param {ObjectId|string} connectionId
- * @param {Array<{sku:string, priceHash?:string, contentHash?:string}>} updates
+ * @param {Array<{sku:string, priceHash?:string, contentHash?:string, imageHash?:string}>} updates
  */
 async function bulkSetHashes(connectionId, updates) {
     if (!updates.length) return;
@@ -110,6 +113,7 @@ async function bulkSetHashes(connectionId, updates) {
         const set = { updatedAt: now };
         if (u.priceHash !== undefined) set.priceHash = u.priceHash;
         if (u.contentHash !== undefined) set.contentHash = u.contentHash;
+        if (u.imageHash !== undefined) set.imageHash = u.imageHash;
         return { updateOne: { filter: { connectionId: cid, sku: u.sku }, update: { $set: set } } };
     });
     await getDb().collection(COLLECTION_NAME).bulkWrite(ops, { ordered: false });
