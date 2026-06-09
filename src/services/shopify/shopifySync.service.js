@@ -56,6 +56,21 @@ const PRODUCT_UPDATE_MUTATION = `mutation ProductUpdate($product: ProductUpdateI
   }
 }`;
 
+// Phase B — product create (creates listings for unmatched products when syncNewProducts is on).
+const PRODUCT_CREATE_MUTATION = `mutation ProductCreate($product: ProductCreateInput!) {
+  productCreate(product: $product) {
+    product { id handle }
+    userErrors { field message }
+  }
+}`;
+
+const VARIANTS_BULK_CREATE_MUTATION = `mutation VariantsBulkCreate($productId: ID!, $variants: [ProductVariantsBulkInput!]!, $strategy: ProductVariantsBulkCreateStrategy) {
+  productVariantsBulkCreate(productId: $productId, variants: $variants, strategy: $strategy) {
+    productVariants { id sku inventoryItem { id } }
+    userErrors { field message }
+  }
+}`;
+
 const sha1 = (s) => crypto.createHash('sha1').update(String(s)).digest('hex');
 const chunk = (arr, size) => {
     const out = [];
@@ -320,6 +335,150 @@ async function pushPortalAuthoritative({ connection, token, scopedProducts, matc
     }
 }
 
+/** Option1 value for a variant: prefer `size`, fall back to the (unique) SKU for sizeless ones. */
+const deriveOptionValue = (v) => {
+    const size = v.size != null ? String(v.size).trim() : '';
+    return size || v.code || '';
+};
+
+/**
+ * Builds a `ProductVariantsBulkInput` for a to-be-created variant: SKU + barcode + resolved
+ * price + the Option1 value, and the starting inventory at the connection's location
+ * (`inventoryQuantities` both activates the item at that location and sets the quantity, so
+ * the freshly-created variant doesn't need a separate inventory push).
+ */
+function buildCreateVariantInput(plan, v, locationId, pricelistPriority, vatMode, futureGuard, nowMs) {
+    const sku = plan.skuOf(v);
+    const price = resolvePushPrice(v, pricelistPriority, vatMode, futureGuard, nowMs) || '0.00';
+    const optionName = plan.isNoVariant ? 'Title' : 'Size';
+    const optionValue = plan.isNoVariant ? 'Default Title' : deriveOptionValue(v);
+    return {
+        optionValues: [{ name: optionValue, optionName }],
+        price,
+        barcode: v.ean_code || null,
+        inventoryItem: { sku, tracked: true },
+        inventoryQuantities: [{ locationId, availableQuantity: v.stock_amount || 0 }]
+    };
+}
+
+/** Maps the variants returned by a bulk-create back to `shopify_product_map` rows (by SKU). */
+function createdRowsFromNodes(plan, productId, nodes) {
+    const bySku = new Map((nodes || []).map((n) => [n.sku, n]));
+    return plan.toCreate
+        .map((v) => {
+            const sku = plan.skuOf(v);
+            const node = bySku.get(sku);
+            if (!node) return null;
+            return {
+                parentCode: plan.product.code,
+                variantCode: plan.isNoVariant ? null : (v.code || null),
+                sku,
+                barcode: v.ean_code || null,
+                shopifyProductId: productId,
+                shopifyVariantId: node.id,
+                shopifyInventoryItemId: node.inventoryItem?.id || null
+            };
+        })
+        .filter(Boolean);
+}
+
+/**
+ * Phase B — creates listings for unmatched products (those genuinely not in the store) when
+ * `syncNewProducts` is on and ownership isn't stock-only. Two paths:
+ *   - parent has NO existing Shopify product → `productCreate` (+ options) then
+ *     `productVariantsBulkCreate` with REMOVE_STANDALONE_VARIANT.
+ *   - parent already exists (some variants matched) → `productVariantsBulkCreate` adds only the
+ *     missing variants to that product (no duplicate product).
+ * Title/description/tags/price/barcode/SKU and starting inventory are all set on creation.
+ *
+ * Returns the new `shopify_product_map` rows (caller upserts them). Created SKUs are removed
+ * from the `unmatched` report. Mutates `counts` and appends to `errors`.
+ */
+async function pushNewProducts({ connection, token, scopedProducts, unmatched, matchInfoBySku, exportConfig, locationId, counts, errors }) {
+    const cfg = connection.config || {};
+    const shop = connection.shopDomain;
+    const vatMode = cfg.priceVatMode || 'inclusive';
+    const futureGuard = cfg.futureDatedGuard !== false;
+    const pricelistPriority = cfg.pricelistPriority || [];
+    const nowMs = Date.now();
+
+    // Only create SKUs that truly aren't in the store — never duplicates / ambiguous / untracked.
+    const creatable = new Set(unmatched.filter((u) => u.reason === 'No SKU / barcode match in store').map((u) => u.sku));
+    if (!creatable.size) return [];
+
+    const plans = [];
+    for (const product of scopedProducts) {
+        const variants = product.child_products || [];
+        const isNoVariant = variants.length === 0;
+        const variantList = isNoVariant ? [product] : variants;
+        const skuOf = (v) => (isNoVariant ? product.code : v.code) || '';
+        const toCreate = variantList.filter((v) => creatable.has(skuOf(v)));
+        if (!toCreate.length) continue;
+        // If any sibling variant is already mapped, the Shopify product exists — add to it.
+        let existingProductId = null;
+        for (const v of variantList) {
+            const info = matchInfoBySku.get(skuOf(v));
+            if (info?.shopifyProductId) { existingProductId = info.shopifyProductId; break; }
+        }
+        plans.push({ product, isNoVariant, variantList, toCreate, existingProductId, skuOf });
+    }
+    if (!plans.length) return [];
+
+    const created = [];
+    const createdSkus = new Set();
+
+    await queue.mapWithConcurrency(plans, async (plan) => {
+        try {
+            const variantInputs = plan.toCreate.map((v) =>
+                buildCreateVariantInput(plan, v, locationId, pricelistPriority, vatMode, futureGuard, nowMs));
+
+            let productId = plan.existingProductId;
+            let strategy = 'DEFAULT';
+
+            if (!productId) {
+                const productInput = {
+                    title: plan.product.product_name || plan.product.code || 'Untitled',
+                    descriptionHtml: plan.product.detailed_description || plan.product.short_description || '',
+                    vendor: 'Patrik International',
+                    productType: plan.product.categories?.[0] || '',
+                    status: 'ACTIVE',
+                    tags: resolveTagsArray(plan.product, exportConfig) || []
+                };
+                if (!plan.isNoVariant) {
+                    const values = [...new Set(plan.toCreate.map(deriveOptionValue).filter(Boolean))].map((name) => ({ name }));
+                    productInput.productOptions = [{ name: 'Size', values }];
+                }
+                const cData = await graphqlRequest(shop, token, PRODUCT_CREATE_MUTATION, { product: productInput });
+                const cue = cData?.productCreate?.userErrors || [];
+                if (cue.length) throw new Error(cue.map((e) => e.message).join('; '));
+                productId = cData.productCreate.product.id;
+                strategy = 'REMOVE_STANDALONE_VARIANT';
+            }
+
+            const vData = await graphqlRequest(shop, token, VARIANTS_BULK_CREATE_MUTATION, { productId, variants: variantInputs, strategy });
+            const vue = vData?.productVariantsBulkCreate?.userErrors || [];
+            if (vue.length) throw new Error(vue.map((e) => e.message).join('; '));
+
+            const rows = createdRowsFromNodes(plan, productId, vData.productVariantsBulkCreate.productVariants);
+            for (const r of rows) { created.push(r); createdSkus.add(r.sku); }
+            if (rows.length) {
+                counts.createdVariants += rows.length;
+                if (!plan.existingProductId) counts.createdProducts += 1;
+            }
+        } catch (e) {
+            errors.push({ parentCode: plan.product.code, error: `create: ${e.message}` });
+        }
+    });
+
+    // Created SKUs are no longer "needs attention".
+    if (createdSkus.size) {
+        for (let i = unmatched.length - 1; i >= 0; i--) {
+            if (createdSkus.has(unmatched[i].sku)) unmatched.splice(i, 1);
+        }
+    }
+    return created;
+}
+
 /**
  * Executes a stock-only sync for a connection. Caller passes the pre-created run (job) so
  * the HTTP layer can return its id immediately; this function fills in the result.
@@ -412,6 +571,30 @@ async function executeRun(connection, job, token) {
         counts.matched = pushable.length;
         counts.unmatched = unmatched.length;
 
+        // sku → Shopify ids for matched variants (stored ∪ freshly matched). Shared by Phase B
+        // (detect a parent's existing product) and Phase C (price/content targets).
+        const matchInfoBySku = new Map();
+        for (const [sku, row] of existingMap) {
+            matchInfoBySku.set(sku, { shopifyVariantId: row.shopifyVariantId, shopifyProductId: row.shopifyProductId });
+        }
+        for (const m of newMatches) {
+            matchInfoBySku.set(m.sku, { shopifyVariantId: m.shopifyVariantId, shopifyProductId: m.shopifyProductId });
+        }
+
+        // ── Product create (Phase B) — turn unmatched products into listings. Runs before the
+        //    stock push; created variants get their inventory set during creation, so they're
+        //    not in this run's stock batch (future runs maintain them as matched). ───────────
+        if (connection.config?.syncNewProducts && connection.config?.ownership !== 'stock_only') {
+            const createdRows = await pushNewProducts({
+                connection, token, scopedProducts, unmatched, matchInfoBySku, exportConfig, locationId, counts, errors
+            });
+            if (createdRows.length) {
+                await productMap.bulkUpsertMatches(connection._id, connection.shopDomain, createdRows);
+                // Inventory + price + content were all set at creation → mark synced.
+                await productMap.bulkSetState(connection._id, createdRows.map((r) => ({ sku: r.sku, state: 'synced', error: null })));
+            }
+        }
+
         // ── Stock push (Phase A) — gated on the syncStock toggle (default on). ───────────
         if (connection.config?.syncStock !== false) {
             const batches = chunk(pushable, QUANTITIES_PER_CALL);
@@ -446,13 +629,6 @@ async function executeRun(connection, job, token) {
         // ── Content + price push (Phase C) — only when the partner has opted up to the
         //    `portal_authoritative` ownership mode (design §9). Operates on matched products. ──
         if (connection.config?.ownership === 'portal_authoritative') {
-            const matchInfoBySku = new Map();
-            for (const [sku, row] of existingMap) {
-                matchInfoBySku.set(sku, { shopifyVariantId: row.shopifyVariantId, shopifyProductId: row.shopifyProductId });
-            }
-            for (const m of newMatches) {
-                matchInfoBySku.set(m.sku, { shopifyVariantId: m.shopifyVariantId, shopifyProductId: m.shopifyProductId });
-            }
             // Don't re-hit SKUs the stock push already found deleted.
             for (const sku of staleSkus) matchInfoBySku.delete(sku);
             await pushPortalAuthoritative({
@@ -527,5 +703,6 @@ module.exports = {
     // exported for tests / future triggers (PNV delta, n8n reconcile)
     executeRun,
     buildScope,
-    resolvePushPrice
+    resolvePushPrice,
+    pushNewProducts
 };

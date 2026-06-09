@@ -36,6 +36,7 @@ function toActivityRow(job) {
         : `${c.pushed || 0}/${c.matched || 0} stock`;
     const bits = [];
     if (job.error) bits.push(job.error);
+    if (c.createdProducts) bits.push(`${c.createdProducts} created`);
     if (c.pricesPushed) bits.push(`${c.pricesPushed} prices`);
     if (c.contentPushed) bits.push(`${c.contentPushed} content`);
     if (c.unmatched) bits.push(`${c.unmatched} unmatched`);

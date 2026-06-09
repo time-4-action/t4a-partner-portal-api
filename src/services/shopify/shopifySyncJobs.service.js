@@ -19,7 +19,7 @@ const COLLECTION_NAME = 'shopify_sync_jobs';
 
 const toObjectId = (id) => (id instanceof ObjectId ? id : new ObjectId(id));
 
-const EMPTY_COUNTS = { inScope: 0, matched: 0, pushed: 0, unmatched: 0, failed: 0, pricesPushed: 0, contentPushed: 0 };
+const EMPTY_COUNTS = { inScope: 0, matched: 0, pushed: 0, unmatched: 0, failed: 0, pricesPushed: 0, contentPushed: 0, createdProducts: 0, createdVariants: 0 };
 
 /**
  * Opens a run in `running` state. Returned immediately to the controller so the HTTP
