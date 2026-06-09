@@ -12,10 +12,19 @@ const { encryptToken } = require('./crypto.service');
 const COLLECTION_NAME = 'shopify_connections';
 
 const DEFAULT_SCOPES = (process.env.SHOPIFY_SCOPES ||
-    'read_products,write_products,read_inventory,write_inventory,read_locations')
+    'read_products,write_products,read_inventory,write_inventory,read_locations,read_publications,write_publications')
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean);
+
+/** Scopes that enable listing + publishing to sales channels (publications). */
+const PUBLICATION_SCOPES = ['read_publications', 'write_publications'];
+
+/** True if the connection's granted scopes allow listing/publishing to sales channels. */
+function canPublish(conn) {
+    const granted = conn?.scopes || [];
+    return PUBLICATION_SCOPES.some((s) => granted.includes(s));
+}
 
 /** Default per-connection sync config — safe defaults: stock-only, no image push. */
 const DEFAULT_CONFIG = {
@@ -28,7 +37,8 @@ const DEFAULT_CONFIG = {
     syncPrices: false,
     syncDescriptions: false,
     syncImages: false,
-    ownership: 'stock_only' // 'stock_only' | 'portal_authoritative' | 'create_then_handoff'
+    ownership: 'stock_only', // 'stock_only' | 'portal_authoritative' | 'create_then_handoff'
+    publicationIds: [] // sales channels (publications) to publish created products to
 };
 
 /**
@@ -170,7 +180,8 @@ async function updateConnectionConfig(id, patch) {
 
     const allowed = [
         'exportConfigId', 'pricelistPriority', 'priceVatMode', 'futureDatedGuard',
-        'syncStock', 'syncNewProducts', 'syncPrices', 'syncDescriptions', 'syncImages', 'ownership'
+        'syncStock', 'syncNewProducts', 'syncPrices', 'syncDescriptions', 'syncImages', 'ownership',
+        'publicationIds'
     ];
     const set = { updatedAt: new Date() };
     if (patch.config) {
@@ -294,6 +305,7 @@ module.exports = {
     COLLECTION_NAME,
     DEFAULT_SCOPES,
     DEFAULT_CONFIG,
+    canPublish,
     upsertConnection,
     getConnectionForUser,
     getConnectionById,

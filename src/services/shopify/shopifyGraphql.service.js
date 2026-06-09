@@ -167,9 +167,46 @@ async function listLocations(shop, accessToken) {
     }));
 }
 
+const PUBLICATIONS_QUERY = `query Publications($first: Int!) {
+  publications(first: $first) {
+    nodes { id name }
+  }
+}`;
+
+/**
+ * Lists the shop's publications (sales channels — Online Store, Point of Sale, etc.) so the
+ * partner can choose where created products are published. Requires `read_publications`.
+ * @returns {Promise<Array<{ id: string, name: string }>>}
+ */
+async function listPublications(shop, accessToken) {
+    const data = await graphqlRequest(shop, accessToken, PUBLICATIONS_QUERY, { first: 50 });
+    return (data?.publications?.nodes || []).map((p) => ({ id: p.id, name: p.name }));
+}
+
+const PUBLISH_MUTATION = `mutation Publish($id: ID!, $input: [PublicationInput!]!) {
+  publishablePublish(id: $id, input: $input) {
+    userErrors { field message }
+  }
+}`;
+
+/**
+ * Publishes a product (or any publishable) to a set of publications. Requires
+ * `write_publications`. Returns the userErrors array (empty on success).
+ */
+async function publishToPublications(shop, accessToken, publishableId, publicationIds) {
+    if (!publicationIds?.length) return [];
+    const data = await graphqlRequest(shop, accessToken, PUBLISH_MUTATION, {
+        id: publishableId,
+        input: publicationIds.map((publicationId) => ({ publicationId }))
+    });
+    return data?.publishablePublish?.userErrors || [];
+}
+
 module.exports = {
     graphqlRequest,
     listLocations,
+    listPublications,
+    publishToPublications,
     // exported for unit-testing the backoff math
     _internals: { backoffMs, isThrottled, throttleStatusOf }
 };

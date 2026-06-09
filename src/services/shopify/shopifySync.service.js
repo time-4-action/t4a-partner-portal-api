@@ -7,7 +7,7 @@ const { matchVariants } = require('./shopifyMatch.service');
 const productMap = require('./shopifyProductMap.service');
 const syncJobs = require('./shopifySyncJobs.service');
 const queue = require('./shopifyQueue.service');
-const { graphqlRequest } = require('./shopifyGraphql.service');
+const { graphqlRequest, publishToPublications } = require('./shopifyGraphql.service');
 
 /**
  * Stock-only sync engine — Phase A (design §8, plan Phase A).
@@ -385,7 +385,9 @@ async function pushImages({ connection, token, scopedProducts, matchInfoBySku, e
             .filter((x) => x.sku && matchInfoBySku.get(x.sku)?.shopifyProductId);
         if (!matched.length) continue;
         const productId = matchInfoBySku.get(matched[0].sku).shopifyProductId;
-        const images = [...new Set(product.images || [])].filter(Boolean);
+        // Parent gallery + every variant's own image(s) — variant images were previously dropped.
+        const variantImages = (product.child_products || []).flatMap((v) => v.images || []);
+        const images = [...new Set([...(product.images || []), ...variantImages])].filter(Boolean);
         if (!images.length) continue;
         const imageHash = sha1(images.join('|'));
         if (existingMap.get(matched[0].sku)?.imageHash === imageHash) continue; // already handled
@@ -502,6 +504,7 @@ async function pushNewProducts({ connection, token, scopedProducts, unmatched, m
     const vatMode = cfg.priceVatMode || 'inclusive';
     const futureGuard = cfg.futureDatedGuard !== false;
     const pricelistPriority = cfg.pricelistPriority || [];
+    const publicationIds = cfg.publicationIds || []; // sales channels to publish new products to
     const nowMs = Date.now();
 
     // Only create SKUs that truly aren't in the store — never duplicates / ambiguous / untracked.
@@ -566,6 +569,13 @@ async function pushNewProducts({ connection, token, scopedProducts, unmatched, m
             if (rows.length) {
                 counts.createdVariants += rows.length;
                 if (!plan.existingProductId) counts.createdProducts += 1;
+            }
+
+            // Publish the freshly-created product to the chosen sales channels (Online Store,
+            // POS, …) so it's actually visible. Only for products we created here.
+            if (!plan.existingProductId && publicationIds.length) {
+                const pue = await publishToPublications(shop, token, productId, publicationIds);
+                if (pue.length) errors.push({ parentCode: plan.product.code, error: `publish: ${pue.map((e) => e.message).join('; ')}` });
             }
         } catch (e) {
             errors.push({ parentCode: plan.product.code, error: `create: ${e.message}` });

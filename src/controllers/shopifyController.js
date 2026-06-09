@@ -126,18 +126,29 @@ exports.status = async (req, res) => {
         // `needsReconnect` tells the UI to prompt a re-install — set when the stored token can't
         // be refreshed (legacy non-expiring token, or an expired refresh token).
         let locations = [];
+        let publications = [];
+        // Whether the granted token can publish to sales channels. Connections made before the
+        // publications scopes were added won't have them → UI prompts a reconnect to enable it.
+        const publishingEnabled = connectionService.canPublish(connection);
         let needsReconnect = connection.status === 'error';
         if (connection.status === 'active') {
             try {
                 const token = await tokenService.getValidAccessToken(connection._id);
                 locations = await shopifyGraphql.listLocations(connection.shopDomain, token);
+                if (publishingEnabled) {
+                    try {
+                        publications = await shopifyGraphql.listPublications(connection.shopDomain, token);
+                    } catch (err) {
+                        console.error('[shopify] listPublications failed:', err.message);
+                    }
+                }
             } catch (err) {
                 if (err.code === 'REAUTH_REQUIRED') needsReconnect = true;
                 else console.error('[shopify] listLocations failed:', err.code || '', err.message);
             }
         }
 
-        res.json({ success: true, connected: connection.status === 'active', connection, locations, needsReconnect });
+        res.json({ success: true, connected: connection.status === 'active', connection, locations, publications, publishingEnabled, needsReconnect });
     } catch (error) {
         handleError(res, error);
     }
