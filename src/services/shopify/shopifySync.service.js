@@ -683,6 +683,10 @@ async function executeRun(connection, job, token) {
             matchInfoBySku.set(m.sku, { shopifyVariantId: m.shopifyVariantId, shopifyProductId: m.shopifyProductId });
         }
 
+        // Parent codes created in THIS run — in create_then_handoff, images are pushed only for
+        // these (creation-time), never for products that already existed.
+        const createdParentCodes = new Set();
+
         // ── Product create (Phase B) — turn unmatched products into listings. Runs before the
         //    stock push; created variants get their inventory set during creation, so they're
         //    not in this run's stock batch (future runs maintain them as matched). ───────────
@@ -696,10 +700,10 @@ async function executeRun(connection, job, token) {
                 // synced and record the stock location so future runs use the fast batched set.
                 await productMap.bulkSetState(connection._id, createdRows.map((r) => ({ sku: r.sku, state: 'synced', error: null, stockLocationId: locationId })));
                 // Make created products visible to the image step so they get their gallery this
-                // run too (create doesn't push media). In create_then_handoff this is the only
-                // place images come from; in portal_authoritative the image step fills them.
+                // run too (create doesn't push media).
                 for (const r of createdRows) {
                     matchInfoBySku.set(r.sku, { shopifyVariantId: r.shopifyVariantId, shopifyProductId: r.shopifyProductId });
+                    createdParentCodes.add(r.parentCode);
                 }
             }
         }
@@ -769,11 +773,20 @@ async function executeRun(connection, job, token) {
         }
 
         // Images: in BOTH portal_authoritative and create_then_handoff (images are part of the
-        // product the portal stands up). The media-less guard keeps it safe in either mode.
+        // product the portal stands up), but with different scope:
+        //   - create_then_handoff → ONLY products created this run (images belong to the create;
+        //     existing products are never re-touched, so a later catalogue image change stays
+        //     intact in Shopify — the "handoff").
+        //   - portal_authoritative → any matched media-less product (the portal fills images).
         if (connection.config?.syncImages && connection.config?.ownership !== 'stock_only') {
-            await pushImages({
-                connection, token, scopedProducts, matchInfoBySku, existingMap, counts, errors, staleSkus, unmatched
-            });
+            const imageProducts = connection.config.ownership === 'create_then_handoff'
+                ? scopedProducts.filter((p) => createdParentCodes.has(p.code))
+                : scopedProducts;
+            if (imageProducts.length) {
+                await pushImages({
+                    connection, token, scopedProducts: imageProducts, matchInfoBySku, existingMap, counts, errors, staleSkus, unmatched
+                });
+            }
         }
 
         // Drop any stale mappings discovered this run; they re-match on the next sync.
