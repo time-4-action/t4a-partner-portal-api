@@ -575,6 +575,50 @@ const deleteExportConfig = async (id, hard = false) => {
 };
 
 /**
+ * Returns the distinct named pricelists present across the active catalogue — the same set
+ * the /export builder derives client-side from product data, but resolved server-side so the
+ * Shopify pricing panel can seed its priority list from REAL pricelist names (not mock).
+ *
+ * Flattens parent `pricelist[]` + every `child_products[].pricelist[]`, de-dupes by name,
+ * keeps a representative `vat` and the latest `valid_from`, newest-first.
+ * @returns {Promise<Array<{ name: string, vat: number, valid_from: string|Date|null }>>}
+ */
+const getDistinctPricelists = async () => {
+    const db = getDb();
+    const rows = await db.collection(PRODUCTS_COLLECTION).aggregate([
+        { $match: { active: true } },
+        {
+            $project: {
+                pls: {
+                    $concatArrays: [
+                        { $ifNull: ['$pricelist', []] },
+                        {
+                            $reduce: {
+                                input: { $ifNull: ['$child_products', []] },
+                                initialValue: [],
+                                in: { $concatArrays: ['$$value', { $ifNull: ['$$this.pricelist', []] }] }
+                            }
+                        }
+                    ]
+                }
+            }
+        },
+        { $unwind: '$pls' },
+        { $match: { 'pls.name': { $ne: null } } },
+        {
+            $group: {
+                _id: '$pls.name',
+                vat: { $first: '$pls.vat' },
+                valid_from: { $max: '$pls.valid_from' }
+            }
+        },
+        { $project: { _id: 0, name: '$_id', vat: { $ifNull: ['$vat', 0] }, valid_from: 1 } },
+        { $sort: { valid_from: -1 } }
+    ]).toArray();
+    return rows;
+};
+
+/**
  * Gets price from pricelist based on priority configuration
  * @param {Object} variant - Variant with pricelist
  * @param {Array} pricelistPriority - Priority configuration
@@ -1149,6 +1193,8 @@ module.exports = {
     // export-config filters, and to resolve a single price from pricelist[] later phases.
     applyFilters,
     getPriceFromPriority,
+    getDistinctPricelists,
+    resolveTagsArray,
     VALID_PRESETS,
     COLUMN_HEADERS,
     DEFAULT_FILTERS

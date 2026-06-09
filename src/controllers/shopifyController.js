@@ -5,6 +5,7 @@ const shopifyGraphql = require('../services/shopify/shopifyGraphql.service');
 const syncService = require('../services/shopify/shopifySync.service');
 const syncJobs = require('../services/shopify/shopifySyncJobs.service');
 const productMap = require('../services/shopify/shopifyProductMap.service');
+const { getDistinctPricelists } = require('../services/customExport.service');
 const { verifyWebhookHmac } = require('../services/shopify/crypto.service');
 
 /**
@@ -32,13 +33,14 @@ function toActivityRow(job) {
     const c = job.counts || {};
     const label = (c.inScope || 0) === 0
         ? 'Nothing in scope'
-        : `${c.pushed || 0}/${c.matched || 0} pushed`;
-    let detail = job.error || null;
-    if (!detail) {
-        if (c.unmatched) detail = `${c.unmatched} unmatched`;
-        else if (c.failed) detail = `${c.failed} failed`;
-        else detail = job.trigger || null;
-    }
+        : `${c.pushed || 0}/${c.matched || 0} stock`;
+    const bits = [];
+    if (job.error) bits.push(job.error);
+    if (c.pricesPushed) bits.push(`${c.pricesPushed} prices`);
+    if (c.contentPushed) bits.push(`${c.contentPushed} content`);
+    if (c.unmatched) bits.push(`${c.unmatched} unmatched`);
+    if (c.failed) bits.push(`${c.failed} failed`);
+    const detail = bits.length ? bits.join(' · ') : (job.trigger || null);
     return {
         id: job._id.toString(),
         type: job.type,
@@ -123,6 +125,19 @@ exports.status = async (req, res) => {
         }
 
         res.json({ success: true, connected: connection.status === 'active', connection, locations, needsReconnect });
+    } catch (error) {
+        handleError(res, error);
+    }
+};
+
+/**
+ * GET /shopify/pricelists — distinct named pricelists across the catalogue, so the pricing
+ * panel seeds its priority list from real pricelist names (mirrors the /export builder).
+ */
+exports.pricelists = async (req, res) => {
+    try {
+        const pricelists = await getDistinctPricelists();
+        res.json({ success: true, pricelists });
     } catch (error) {
         handleError(res, error);
     }

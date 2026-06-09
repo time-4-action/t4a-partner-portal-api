@@ -96,6 +96,26 @@ async function bulkSetState(connectionId, updates) {
 }
 
 /**
+ * Sets delta hashes (priceHash / contentHash) on map rows after a successful content/price
+ * push (Phase C). Kept separate from {@link bulkSetState} so a price/content update doesn't
+ * disturb the row's stock sync state.
+ * @param {ObjectId|string} connectionId
+ * @param {Array<{sku:string, priceHash?:string, contentHash?:string}>} updates
+ */
+async function bulkSetHashes(connectionId, updates) {
+    if (!updates.length) return;
+    const cid = toObjectId(connectionId);
+    const now = new Date();
+    const ops = updates.map((u) => {
+        const set = { updatedAt: now };
+        if (u.priceHash !== undefined) set.priceHash = u.priceHash;
+        if (u.contentHash !== undefined) set.contentHash = u.contentHash;
+        return { updateOne: { filter: { connectionId: cid, sku: u.sku }, update: { $set: set } } };
+    });
+    await getDb().collection(COLLECTION_NAME).bulkWrite(ops, { ordered: false });
+}
+
+/**
  * Aggregate of map state for the connection — feeds the UI's synced/error counters.
  * @param {ObjectId|string} connectionId
  * @returns {Promise<{ synced:number, error:number, total:number }>}
@@ -130,6 +150,7 @@ module.exports = {
     getMapBySku,
     bulkUpsertMatches,
     bulkSetState,
+    bulkSetHashes,
     getStateCounts,
     deleteForConnection
 };
