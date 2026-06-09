@@ -500,10 +500,26 @@ async function pushPublications({ connection, token, scopedProducts, matchInfoBy
     if (hashUpdates.length) await productMap.bulkSetHashes(connection._id, hashUpdates);
 }
 
+/** Sets available quantity for ONE already-stocked inventory item (single inventorySetQuantities). */
+async function setInventoryOne(shop, token, item, locationId) {
+    const input = {
+        name: 'available',
+        reason: 'correction',
+        referenceDocumentUri: `${PORTAL_APP_NS}/SyncJob/activate-fallback`,
+        quantities: [{ inventoryItemId: item.shopifyInventoryItemId, locationId, quantity: item.quantity, changeFromQuantity: null }]
+    };
+    const data = await graphqlRequest(shop, token, INVENTORY_SET_MUTATION, { input, idempotencyKey: crypto.randomUUID() });
+    const ue = data?.inventorySetQuantities?.userErrors || [];
+    return ue.length ? { ok: false, error: ue.map((e) => e.message).join('; ') } : { ok: true, error: null };
+}
+
 /**
  * Activates one inventory item at the connection's location and sets its available quantity.
  * Used for items not yet stocked at that location (first sync, or after a location change).
- * Never throws — returns `{ ok, error }` so the caller records state like the batch path.
+ *
+ * If the item turns out to be ALREADY active at the location, `inventoryActivate` rejects with
+ * "Not allowed to set available quantity when the item is already active" — in that case we
+ * fall back to `inventorySetQuantities` (the right call for an active item). Never throws.
  */
 async function activateInventory(shop, token, item, locationId) {
     try {
@@ -514,7 +530,10 @@ async function activateInventory(shop, token, item, locationId) {
             idempotencyKey: crypto.randomUUID()
         });
         const ue = data?.inventoryActivate?.userErrors || [];
-        return ue.length ? { ok: false, error: ue.map((e) => e.message).join('; ') } : { ok: true, error: null };
+        if (!ue.length) return { ok: true, error: null };
+        const msg = ue.map((e) => e.message).join('; ');
+        if (/already active/i.test(msg)) return await setInventoryOne(shop, token, item, locationId);
+        return { ok: false, error: msg };
     } catch (e) {
         return { ok: false, error: e.message };
     }
@@ -589,9 +608,11 @@ function buildProductSetInput(plan, exportConfig, locationId, pricelistPriority,
         tags: resolveTagsArray(product, exportConfig) || [],
         variants
     };
-    if (!plan.isNoVariant) {
-        input.productOptions = [{ name: 'Size', values: [...new Set(plan.toCreate.map(deriveOptionValue).filter(Boolean))].map((name) => ({ name })) }];
-    }
+    // productSet requires productOptions whenever variants are provided (even the single
+    // default variant of a no-variant product → Title / Default Title).
+    input.productOptions = plan.isNoVariant
+        ? [{ name: 'Title', values: [{ name: 'Default Title' }] }]
+        : [{ name: 'Size', values: [...new Set(plan.toCreate.map(deriveOptionValue).filter(Boolean))].map((name) => ({ name })) }];
     if (allFiles.length) input.files = allFiles;
     return input;
 }
