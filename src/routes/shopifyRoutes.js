@@ -6,6 +6,10 @@ const requireExportRole = require('../middleware/requireExportRole');
 const shopifyController = require('../controllers/shopifyController');
 
 // ─── OAuth ────────────────────────────────────────────────────────────────────
+// `entry` is the app's **App URL** — Shopify loads it (NO JWT) when a merchant opens the app
+// from their admin. Secured by the OAuth HMAC over the query; redirects into the portal.
+router.get('/entry', shopifyController.entry);
+
 // `connect` is started by a logged-in portal user (JWT + export role).
 router.get('/connect', jwtCheck, requireExportRole, shopifyController.connect);
 

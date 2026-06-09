@@ -6,7 +6,7 @@ const syncService = require('../services/shopify/shopifySync.service');
 const syncJobs = require('../services/shopify/shopifySyncJobs.service');
 const productMap = require('../services/shopify/shopifyProductMap.service');
 const { getDistinctPricelists } = require('../services/customExport.service');
-const { verifyWebhookHmac } = require('../services/shopify/crypto.service');
+const { verifyOAuthHmac, verifyWebhookHmac } = require('../services/shopify/crypto.service');
 
 /**
  * Controller for the Shopify connection lifecycle (design §10).
@@ -89,6 +89,38 @@ exports.connect = async (req, res) => {
         res.json({ success: true, url, shop });
     } catch (error) {
         handleError(res, error);
+    }
+};
+
+/**
+ * GET /shopify/entry — the app's **App URL** (the entry point Shopify loads when a merchant
+ * opens the app from their admin). Shopify appends a signed query (`shop`, `hmac`, `host`,
+ * `timestamp`, `session`). This app is **non-embedded** and **portal-first**, so the entry point
+ * doesn't render an app — it verifies the signature and routes the browser to the portal:
+ *   • shop already connected → open the portal on that store;
+ *   • shop not connected yet → open the portal's connect screen with the domain prefilled, where
+ *     the partner signs in (Auth0) and approves the install (binding the store to their account).
+ * It never renders a raw gated page — that's what App-Store reviewers test on a fresh store.
+ */
+exports.entry = async (req, res) => {
+    const returnUrl = process.env.SHOPIFY_PORTAL_RETURN_URL || '/';
+    const sep = returnUrl.includes('?') ? '&' : '?';
+    try {
+        // The request must be a genuine, untampered Shopify call before we trust `shop`.
+        if (!verifyOAuthHmac(req.query)) {
+            return res.status(400).send('Invalid request signature.');
+        }
+        const shop = oauthService.normalizeShopDomain(req.query.shop);
+        if (!shop) return res.status(400).send('Invalid shop parameter.');
+
+        const existing = await connectionService.findByShopDomain(shop);
+        if (existing) {
+            return res.redirect(`${returnUrl}${sep}shop=${encodeURIComponent(shop)}`);
+        }
+        return res.redirect(`${returnUrl}${sep}connect=1&shop=${encodeURIComponent(shop)}`);
+    } catch (error) {
+        console.error('[shopify] entry failed:', error.message);
+        return res.redirect(`${returnUrl}${sep}shopify=error&reason=entry_failed`);
     }
 };
 

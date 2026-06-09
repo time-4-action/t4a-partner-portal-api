@@ -135,6 +135,20 @@ async function listConnectionsForUser(ownerSub) {
 }
 
 /**
+ * Returns the most recent ACTIVE connection for a shop domain (public-shaped), or null.
+ * Used by the App-URL entry point to decide whether a store opening the app is already
+ * connected (→ open the portal on it) or not (→ send them to connect). A given shop can only
+ * be actively connected to one portal account at a time.
+ */
+async function findByShopDomain(shopDomain) {
+    const db = getDb();
+    const conn = await db
+        .collection(COLLECTION_NAME)
+        .findOne({ shopDomain, status: 'active' }, { sort: { updatedAt: -1 } });
+    return toPublic(conn);
+}
+
+/**
  * Returns a connection by id, public-shaped, or null.
  */
 async function getConnectionById(id) {
@@ -328,6 +342,7 @@ module.exports = {
     upsertConnection,
     getConnectionForUser,
     listConnectionsForUser,
+    findByShopDomain,
     getConnectionById,
     getConnectionWithToken,
     listActiveSyncable,
