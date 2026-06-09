@@ -5,7 +5,13 @@ const logger = require('./middleware/logger');
 const apiAnalyticsLogger = require('./middleware/analytics');
 const exportRoutes = require('./routes/export');
 
-app.use(express.json());
+// Capture the raw request body so Shopify webhook HMACs can be verified against the exact
+// bytes sent (a re-serialized JSON body would not match the signature).
+app.use(express.json({
+    verify: (req, _res, buf) => {
+        req.rawBody = buf;
+    }
+}));
 app.use(logger);
 app.use(apiAnalyticsLogger);
 app.set('trust proxy', true);

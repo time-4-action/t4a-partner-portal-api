@@ -16,6 +16,7 @@ console.log(`App Started (${process.env.NODE_ENV})`);
 const { app } = require('./src/app');
 const { connectToDb } = require('./src/services/db/mongo.service');
 const { ensureIndexesAndMigrate } = require('./src/services/customExport.service');
+const { ensureIndexes: ensureShopifyIndexes } = require('./src/services/shopify/shopifyConnection.service');
 
 const PORT = process.env.PORT || 3000;
 
@@ -23,6 +24,7 @@ const startServer = async () => {
 
   await connectToDb();
   await ensureIndexesAndMigrate();
+  await ensureShopifyIndexes();
 
   app.listen(PORT, () => {
     console.log(`Server is running on http://localhost:${PORT}`);
