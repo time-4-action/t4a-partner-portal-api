@@ -1200,8 +1200,13 @@ async function runScopeTarget({ connection, token, job, scopedProducts, items, l
         }
 
         // Resolve the inventory item id for every matchable item (stored map ∪ fresh matches).
+        // Tombstoned rows (handoff products deleted in store) are skipped — their Shopify ids are
+        // dead and we don't push to or recreate them until the partner asks.
         const inventoryItemBySku = new Map();
-        for (const [sku, row] of existingMap) inventoryItemBySku.set(sku, row.shopifyInventoryItemId);
+        for (const [sku, row] of existingMap) {
+            if (row.state === 'deleted_in_store') continue;
+            inventoryItemBySku.set(sku, row.shopifyInventoryItemId);
+        }
         for (const m of newMatches) inventoryItemBySku.set(m.sku, m.shopifyInventoryItemId);
 
         const pushable = items
@@ -1215,6 +1220,7 @@ async function runScopeTarget({ connection, token, job, scopedProducts, items, l
         // (detect a parent's existing product) and Phase C (price/content targets).
         const matchInfoBySku = new Map();
         for (const [sku, row] of existingMap) {
+            if (row.state === 'deleted_in_store') continue; // tombstoned — dead ids, skip
             matchInfoBySku.set(sku, { shopifyVariantId: row.shopifyVariantId, shopifyProductId: row.shopifyProductId });
         }
         for (const m of newMatches) {
@@ -1438,22 +1444,63 @@ async function executeRun(connection, job, token) {
         // shared across scopes (their SKUs are disjoint, so each scope only touches its own rows).
         const existingMap = await productMap.getMapBySku(connection._id);
 
-        // Pre-flight: drop mappings whose Shopify product was DELETED in the store. One bulk
-        // existence check up front means those SKUs become unmapped and flow into the normal
-        // match → create path THIS run (re-created instead of erroring on push and forcing a
-        // second sync). Reactive stale-handling at push time remains a backstop.
-        const mappedProductIds = [...new Set([...existingMap.values()].map((r) => r.shopifyProductId).filter(Boolean))];
+        // Per-SKU ownership across all scopes — used by the pre-flight to decide how to treat a
+        // product the merchant deleted in Shopify (handoff sources protect the deletion; the rest
+        // recreate). Resolved from each scope's effective config.
+        const ownershipBySku = new Map();
+        for (const t of targets) {
+            const own = resolveScopeConfig(connection, t).ownership || 'stock_only';
+            for (const it of t.items) ownershipBySku.set(it.sku, own);
+        }
+
+        // Handoff products the partner explicitly asked to recreate (via the "Recreate on next
+        // sync" action): drop their tombstone rows so they flow back into the normal match → create
+        // path THIS run. Done before the existence check so a still-deleted product isn't simply
+        // re-tombstoned.
+        const recreateSkus = [];
+        for (const [sku, row] of existingMap) {
+            if (row.state === 'deleted_in_store' && row.recreateRequested) recreateSkus.push(sku);
+        }
+        if (recreateSkus.length) {
+            await productMap.deleteBySkus(connection._id, recreateSkus);
+            for (const sku of recreateSkus) existingMap.delete(sku);
+            console.log(`[shopify] ${recreateSkus.length} handoff product(s) flagged for recreation (${connection.shopDomain})`);
+        }
+
+        // Pre-flight: detect mappings whose Shopify product was DELETED in the store. One bulk
+        // existence check up front. What we do with a deletion depends on the source's ownership:
+        //   - create_then_handoff → TOMBSTONE the row (state 'deleted_in_store'): the merchant
+        //     removed a handed-off listing, so we must NOT recreate it. It's surfaced as a warning
+        //     the partner can act on; the push/match phases skip it.
+        //   - any other mode → drop the row so the SKU becomes unmapped and is re-created this run
+        //     (the original behaviour; portal_authoritative stays authoritative).
+        // Already-tombstoned rows are excluded from the check (we know they're gone).
+        const mappedProductIds = [...new Set([...existingMap.values()]
+            .filter((r) => r.state !== 'deleted_in_store')
+            .map((r) => r.shopifyProductId).filter(Boolean))];
         if (mappedProductIds.length) {
             try {
                 const existing = await findExistingIds(connection.shopDomain, token, mappedProductIds);
-                const deletedSkus = [];
+                const deletedDrop = [];
+                const deletedHandoff = [];
                 for (const [sku, row] of existingMap) {
-                    if (row.shopifyProductId && !existing.has(row.shopifyProductId)) deletedSkus.push(sku);
+                    if (row.state === 'deleted_in_store') continue;
+                    if (row.shopifyProductId && !existing.has(row.shopifyProductId)) {
+                        if (ownershipBySku.get(sku) === 'create_then_handoff') deletedHandoff.push(sku);
+                        else deletedDrop.push(sku);
+                    }
                 }
-                if (deletedSkus.length) {
-                    await productMap.deleteBySkus(connection._id, deletedSkus);
-                    for (const sku of deletedSkus) existingMap.delete(sku);
-                    console.log(`[shopify] pre-flight dropped ${deletedSkus.length} mapping(s) for deleted products (${connection.shopDomain})`);
+                if (deletedDrop.length) {
+                    await productMap.deleteBySkus(connection._id, deletedDrop);
+                    for (const sku of deletedDrop) existingMap.delete(sku);
+                    console.log(`[shopify] pre-flight dropped ${deletedDrop.length} mapping(s) for deleted products (${connection.shopDomain})`);
+                }
+                if (deletedHandoff.length) {
+                    await productMap.markDeletedInStore(connection._id, deletedHandoff);
+                    // Keep the rows in the in-memory map but flip their state so the push/match
+                    // phases skip them (they stay "mapped" → never re-created this run).
+                    for (const sku of deletedHandoff) existingMap.get(sku).state = 'deleted_in_store';
+                    console.log(`[shopify] ${deletedHandoff.length} handoff product(s) removed in store — kept as warnings, not recreated (${connection.shopDomain})`);
                 }
             } catch (err) {
                 // Non-fatal — fall back to reactive stale handling at push time.
