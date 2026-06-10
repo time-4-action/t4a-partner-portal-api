@@ -14,7 +14,7 @@ No test suite exists (`npm test` just exits with an error).
 
 ## Architecture
 
-Node.js/Express API that syncs product data from **PNV** (Partner.net Vision) into **MongoDB**, enriches it with stock and pricing from **Metakocka**, and exposes configurable product exports. Scheduling is handled externally by **n8n** — there is no internal cron scheduler.
+Node.js/Express API that syncs product data from **PNV** (Partner.net Vision) into **MongoDB**, enriches it with stock and pricing from **Metakocka**, and exposes configurable product exports. Recurring work is scheduled **in-app**: the PNV catalogue refresh runs on the `PRODUCTS_DOWNLOAD_SCHEDULE` cron (`pnvScheduler.service.js`: PNV sync → AI categorization → Shopify push), and Own Source feeds run on their per-feed schedules (`externalScheduler.service.js`). The `/webhooks/sync/*` endpoints remain as manual/back-fill triggers (n8n no longer required).
 
 ### Startup sequence (`index.js`)
 
@@ -101,6 +101,6 @@ When picking this up, start from `shopify_integration.md` — its §0 status che
 
 ## Environment variables
 
-See README.md for the full table. Key variables: `MONGO_URI`, `MONGO_DB_NAME`, `PNV_BASE_URL`, `PNV_EXPORT_PRODUCTS_URL`, `PNV_USER`, `PNV_PASS`, `PNV_GROUP`, `PNV_USER_ID`, `METAKOCKA_ID`, `METAKOCKA_KEY`, `ANTHROPIC_API_KEY`, `WEBHOOK_API_KEY`.
+See README.md for the full table. Key variables: `MONGO_URI`, `MONGO_DB_NAME`, `PNV_BASE_URL`, `PNV_EXPORT_PRODUCTS_URL`, `PNV_USER`, `PNV_PASS`, `PNV_GROUP`, `PNV_USER_ID`, `METAKOCKA_ID`, `METAKOCKA_KEY`, `ANTHROPIC_API_KEY`, `WEBHOOK_API_KEY`, `PRODUCTS_DOWNLOAD_SCHEDULE`.
 
 `.env` files are loaded from `DATA_PATH` if set (Docker mounts `/data`), otherwise from the project root.

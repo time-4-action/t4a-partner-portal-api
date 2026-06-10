@@ -19,6 +19,7 @@ const { ensureIndexesAndMigrate } = require('./src/services/customExport.service
 const { ensureIndexes: ensureShopifyIndexes } = require('./src/services/shopify/shopifyConnection.service');
 const { ensureIndexes: ensureExternalIndexes } = require('./src/services/external/ownSource.service');
 const externalScheduler = require('./src/services/external/externalScheduler.service');
+const pnvScheduler = require('./src/services/pnv/pnvScheduler.service');
 
 const PORT = process.env.PORT || 3000;
 
@@ -35,10 +36,16 @@ const startServer = async () => {
 
   // Portal-driven Own Source feed scheduler (design §8.2) — self-serve, no n8n.
   externalScheduler.start();
+
+  // In-app PNV catalogue scheduler (PRODUCTS_DOWNLOAD_SCHEDULE cron) — replaces the n8n cron;
+  // the /webhooks/sync/* endpoints stay available as a manual/back-fill escape hatch.
+  await pnvScheduler.start();
 };
 
 const gracefulShutdown = async () => {
   console.log('Received shutdown signal, closing server gracefully...');
+  pnvScheduler.stop();
+  externalScheduler.stop();
   console.log('HTTP server closed.');
   process.exit(0);
 };

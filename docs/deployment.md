@@ -21,6 +21,8 @@
 | `METAKOCKA_KEY` | Yes | -- | Metakocka API key |
 | **AI** | | | |
 | `ANTHROPIC_API_KEY` | Yes | -- | Anthropic API key (AI categorization via Claude; required at startup) |
+| **Scheduling** | | | |
+| `PRODUCTS_DOWNLOAD_SCHEDULE` | No | -- | 5-field cron (e.g. `0 * * * *`) for the in-app PNV catalogue refresh (sync → AI categorization → Shopify push). Unset/`off` = disabled (webhook endpoints only) |
 | **Database** | | | |
 | `MONGO_URI` | Yes | -- | MongoDB connection string |
 | `MONGO_DB_NAME` | Yes | -- | MongoDB database name |
