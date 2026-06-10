@@ -187,7 +187,11 @@ const isStaleError = (msg) => /could not be found|does not exist|doesn'?t exist|
  */
 async function buildScope(config) {
     const db = getDb();
-    const products = await db.collection(PRODUCTS_COLLECTION).find({ active: true }).toArray();
+    // `active: { $ne: false }` (not `active: true`) so the base set matches the export
+    // preview / CSV path (product.service.js getAllProducts), which includes products
+    // whose `active` flag was never explicitly set. Using `active: true` silently
+    // dropped those from the sync while the preview still showed them.
+    const products = await db.collection(PRODUCTS_COLLECTION).find({ active: { $ne: false } }).toArray();
     const filtered = applyFilters(products, config.filters || {}, config.pricelistPriority || []);
     return { products: filtered, items: itemsFromProducts(filtered) };
 }
