@@ -27,6 +27,7 @@ router.get('/pricelists', jwtCheck, requireExportRole, requireAlpha, shopifyCont
 router.get('/connection/:id/detail', jwtCheck, requireExportRole, requireAlpha, shopifyController.connectionDetail);
 router.put('/connection/:id/config', jwtCheck, requireExportRole, requireAlpha, shopifyController.updateConfig);
 router.post('/connection/:id/sync', jwtCheck, requireExportRole, requireAlpha, shopifyController.sync);
+router.post('/connection/:id/recreate', jwtCheck, requireExportRole, requireAlpha, shopifyController.recreate);
 router.get('/connection/:id/activity', jwtCheck, requireExportRole, requireAlpha, shopifyController.activity);
 router.delete('/connection/:id', jwtCheck, requireExportRole, requireAlpha, shopifyController.disconnect);
 

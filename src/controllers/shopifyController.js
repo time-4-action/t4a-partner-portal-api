@@ -16,6 +16,7 @@ const { verifyOAuthHmac, verifyWebhookHmac } = require('../services/shopify/cryp
 
 const ERROR_STATUS_MAP = {
     VALIDATION_ERROR: 400,
+    BAD_REQUEST: 400,
     INVALID_ID: 400,
     NO_LOCATION: 400,
     NO_EXPORT_CONFIG: 400,
@@ -86,6 +87,28 @@ function toActivityRow(job) {
         error: job.error || null,
         errors: (job.errors || []).slice(0, 100)
     };
+}
+
+/**
+ * Groups tombstoned (deleted-in-store) map rows by their parent product — Shopify deletion is
+ * per-product, so the partner acts on the parent, not each variant SKU. Each group carries the
+ * variant SKUs, when it was first seen gone, and whether a recreate is already queued.
+ */
+function groupDeletedByParent(rows) {
+    const byParent = new Map();
+    for (const r of rows || []) {
+        const key = r.parentCode || r.sku;
+        let g = byParent.get(key);
+        if (!g) {
+            g = { parentCode: r.parentCode || null, skus: [], deletedInStoreAt: null, recreateRequested: false };
+            byParent.set(key, g);
+        }
+        g.skus.push(r.sku);
+        if (r.recreateRequested) g.recreateRequested = true;
+        const ts = r.deletedInStoreAt?.toISOString?.() || null;
+        if (ts && (!g.deletedInStoreAt || ts < g.deletedInStoreAt)) g.deletedInStoreAt = ts;
+    }
+    return [...byParent.values()].sort((a, b) => (a.deletedInStoreAt || '').localeCompare(b.deletedInStoreAt || ''));
 }
 
 function handleError(res, error) {
@@ -341,10 +364,11 @@ exports.activity = async (req, res) => {
         const connection = await loadOwned(req);
         // The panel shows a short window; the "view all" modal asks for more via ?limit=.
         const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 100);
-        const [runs, stateCounts, latest] = await Promise.all([
+        const [runs, stateCounts, latest, deletedRows] = await Promise.all([
             syncJobs.listRecentRuns(connection._id, limit),
             productMap.getStateCounts(connection._id),
-            syncJobs.getLatestRun(connection._id)
+            syncJobs.getLatestRun(connection._id),
+            productMap.getDeletedInStore(connection._id)
         ]);
         res.json({
             success: true,
@@ -356,8 +380,36 @@ exports.activity = async (req, res) => {
                 pending: latest?.counts?.unmatched || 0,
                 error: stateCounts.error
             },
-            unmatched: latest?.unmatched || []
+            unmatched: latest?.unmatched || [],
+            // Handed-off products the merchant deleted in Shopify — grouped by parent product so
+            // the UI can warn + offer a per-product "Recreate on next sync" action.
+            deletedInStore: groupDeletedByParent(deletedRows)
         });
+    } catch (error) {
+        handleError(res, error);
+    }
+};
+
+/**
+ * POST /shopify/connection/:id/recreate — queue (or un-queue) deleted-in-store handoff products
+ * for recreation on the NEXT sync. Owner-checked. Body: `{ parentCodes: string[], cancel?: bool }`.
+ * `cancel: true` is the undo — it cancels a queued recreation but keeps the product tombstoned.
+ * Only rows currently in the `deleted_in_store` state are touched; nothing is pushed now (the next
+ * run recreates them). Responds with the refreshed deleted-in-store list so the UI updates in place.
+ */
+exports.recreate = async (req, res) => {
+    try {
+        const connection = await loadOwned(req);
+        const parentCodes = Array.isArray(req.body?.parentCodes) ? req.body.parentCodes.filter(Boolean) : [];
+        if (!parentCodes.length) {
+            const error = new Error('No products selected to recreate');
+            error.code = 'BAD_REQUEST';
+            throw error;
+        }
+        const requested = req.body?.cancel !== true;
+        const flagged = await productMap.requestRecreate(connection._id, parentCodes, requested);
+        const deletedRows = await productMap.getDeletedInStore(connection._id);
+        res.json({ success: true, flagged, deletedInStore: groupDeletedByParent(deletedRows) });
     } catch (error) {
         handleError(res, error);
     }
