@@ -247,6 +247,9 @@ async function updateConnectionConfig(id, patch) {
         'exportConfigId', 'pricelistPriority', 'priceVatMode', 'futureDatedGuard',
         'syncStock', 'syncNewProducts', 'syncPrices', 'syncDescriptions', 'syncImages', 'ownership',
         'publicationIds',
+        // Shopify Option1 name for variants of newly-created products (e.g. "Size", "Volume").
+        // Per-source override lives on the scope; this is the connection-level fallback.
+        'variantOptionName',
         // `scope` selects WHAT this connection pushes: { type:'export_config', exportConfigId }
         // (default/back-compat) or { type:'own_source', feedId } (an external brand feed).
         'scope',

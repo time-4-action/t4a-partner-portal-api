@@ -68,6 +68,19 @@ const PRODUCT_UPDATE_MUTATION = `mutation ProductUpdate($product: ProductUpdateI
   }
 }`;
 
+// Phase C addendum — variant option NAME reconcile. Reads the current Option1 of matched
+// products in bulk, then renames mismatches to the configured name via productOptionUpdate.
+const PRODUCT_OPTIONS_QUERY = `query ProductOptions($ids: [ID!]!) {
+  nodes(ids: $ids) { ... on Product { id options { id name position } } }
+}`;
+
+const PRODUCT_OPTION_UPDATE_MUTATION = `mutation ProductOptionUpdate($productId: ID!, $option: OptionUpdateInput!) {
+  productOptionUpdate(productId: $productId, option: $option) {
+    product { id }
+    userErrors { field message }
+  }
+}`;
+
 // Phase B — product create (creates listings for unmatched products when syncNewProducts is on).
 const PRODUCT_CREATE_MUTATION = `mutation ProductCreate($product: ProductCreateInput!) {
   productCreate(product: $product) {
@@ -445,6 +458,78 @@ async function pushPortalAuthoritative({ connection, token, scopedProducts, matc
     }
 }
 
+/**
+ * Phase C addendum — keeps the variant option NAME of EXISTING products in line with the
+ * configured one (the scope's `variantOptionName` override, or the export's own Option1
+ * setting for Patrik sources). portal_authoritative only — it's a managed structural field.
+ *
+ * Deliberately runs ONLY when a name is explicitly configured: a source that just relies on
+ * the bare 'Size' default never mass-renames a store that already uses its own option names
+ * (translations, "Volume", …). No-variant products use Shopify's reserved Title / Default
+ * Title option and are always skipped.
+ *
+ * Cost: one bulk options read per 250 matched products per run; a rename mutation only for
+ * actual mismatches, so a settled store is read-only here.
+ */
+async function pushOptionRenames({ connection, token, scopedProducts, matchInfoBySku, exportConfig, counts, errors }) {
+    const cfg = connection.config || {};
+    const desired = (cfg.variantOptionName || '').trim() || (exportConfig?.option1Name || '').trim();
+    if (!desired || desired === 'Title') return;
+    const shop = connection.shopDomain;
+
+    // Unique matched product ids — only products with REAL variants (no-variant → Title, skip).
+    const byProductId = new Map(); // shopifyProductId → parentCode
+    for (const product of scopedProducts) {
+        const variants = product.child_products || [];
+        if (!variants.length) continue;
+        for (const v of variants) {
+            const info = matchInfoBySku.get(v.code || '');
+            if (info?.shopifyProductId) { byProductId.set(info.shopifyProductId, product.code); break; }
+        }
+    }
+    if (!byProductId.size) return;
+
+    // Bulk-read current option names; only mismatches become mutations.
+    const ids = [...byProductId.keys()];
+    const renameOps = [];
+    for (let i = 0; i < ids.length; i += 250) {
+        const batch = ids.slice(i, i + 250);
+        let data;
+        try {
+            data = await graphqlRequest(shop, token, PRODUCT_OPTIONS_QUERY, { ids: batch });
+        } catch (e) {
+            errors.push({ error: `option name: could not read product options: ${e.message}` });
+            continue;
+        }
+        for (const node of data?.nodes || []) {
+            if (!node?.id || !Array.isArray(node.options)) continue;
+            const opt = node.options.find((o) => o.position === 1) || node.options[0];
+            // 'Title' is Shopify's no-real-options placeholder — renaming it would force real
+            // options onto a default-variant product.
+            if (!opt || opt.name === 'Title' || opt.name === desired) continue;
+            renameOps.push({ productId: node.id, optionId: opt.id, parentCode: byProductId.get(node.id) });
+        }
+    }
+    if (!renameOps.length) return;
+
+    await queue.mapWithConcurrency(renameOps, async (op) => {
+        try {
+            const data = await graphqlRequest(shop, token, PRODUCT_OPTION_UPDATE_MUTATION, {
+                productId: op.productId,
+                option: { id: op.optionId, name: desired }
+            });
+            const ue = data?.productOptionUpdate?.userErrors || [];
+            if (ue.length) {
+                errors.push({ parentCode: op.parentCode, error: `option name: ${ue.map((e) => e.message).join('; ')}` });
+            } else {
+                counts.optionsRenamed += 1;
+            }
+        } catch (e) {
+            errors.push({ parentCode: op.parentCode, error: `option name: ${e.message}` });
+        }
+    });
+}
+
 /** First non-FAILED media node per alt URL (the alts we stamp are the source URLs). */
 const mediaIndexByAlt = (prod) => {
     const byAlt = new Map();
@@ -742,10 +827,10 @@ const deriveOptionValue = (v) => {
  * (`inventoryQuantities` both activates the item at that location and sets the quantity, so
  * the freshly-created variant doesn't need a separate inventory push).
  */
-function buildCreateVariantInput(plan, v, locationId, pricelistPriority, vatMode, futureGuard, nowMs) {
+function buildCreateVariantInput(plan, v, locationId, pricelistPriority, vatMode, futureGuard, nowMs, variantOptionName = 'Size') {
     const sku = plan.skuOf(v);
     const price = resolvePushPrice(v, pricelistPriority, vatMode, futureGuard, nowMs) || '0.00';
-    const optionName = plan.isNoVariant ? 'Title' : 'Size';
+    const optionName = plan.isNoVariant ? 'Title' : variantOptionName;
     const optionValue = plan.isNoVariant ? 'Default Title' : deriveOptionValue(v);
     return {
         optionValues: [{ name: optionValue, optionName }],
@@ -761,7 +846,7 @@ function buildCreateVariantInput(plan, v, locationId, pricelistPriority, vatMode
  * images linked (design §3.5). Each variant's own image becomes its variant image; the parent
  * gallery + all variant images form the product files. price/barcode/sku/inventory set inline.
  */
-function buildProductSetInput(plan, exportConfig, locationId, pricelistPriority, vatMode, futureGuard, nowMs, wantTags = true) {
+function buildProductSetInput(plan, exportConfig, locationId, pricelistPriority, vatMode, futureGuard, nowMs, wantTags = true, variantOptionName = 'Size') {
     const product = plan.product;
     const parentImages = [...new Set(product.images || [])].filter(Boolean);
     const variantImageUrls = [];
@@ -769,7 +854,7 @@ function buildProductSetInput(plan, exportConfig, locationId, pricelistPriority,
     const variants = plan.toCreate.map((v) => {
         const sku = plan.skuOf(v);
         const price = resolvePushPrice(v, pricelistPriority, vatMode, futureGuard, nowMs) || '0.00';
-        const optionName = plan.isNoVariant ? 'Title' : 'Size';
+        const optionName = plan.isNoVariant ? 'Title' : variantOptionName;
         const optionValue = plan.isNoVariant ? 'Default Title' : deriveOptionValue(v);
         const vImg = (v.images && v.images[0]) || null;
         if (vImg) variantImageUrls.push(vImg);
@@ -804,7 +889,7 @@ function buildProductSetInput(plan, exportConfig, locationId, pricelistPriority,
     // default variant of a no-variant product → Title / Default Title).
     input.productOptions = plan.isNoVariant
         ? [{ name: 'Title', values: [{ name: 'Default Title' }] }]
-        : [{ name: 'Size', values: [...new Set(plan.toCreate.map(deriveOptionValue).filter(Boolean))].map((name) => ({ name })) }];
+        : [{ name: variantOptionName, values: [...new Set(plan.toCreate.map(deriveOptionValue).filter(Boolean))].map((name) => ({ name })) }];
     if (allFiles.length) input.files = allFiles;
     return input;
 }
@@ -850,6 +935,12 @@ async function pushNewProducts({ connection, token, scopedProducts, unmatched, m
     const pricelistPriority = cfg.pricelistPriority || [];
     const publicationIds = cfg.publicationIds || []; // sales channels to publish new products to
     const wantTags = cfg.syncTags !== false; // tags on newly-created products (own toggle)
+    // Option1 name for created variants: per-source override → the export's own Variant Option
+    // setting (Patrik sources) → 'Size'. Own-source feeds have no export config, so they go
+    // override → 'Size'. Existing Shopify products keep whatever option name they already have.
+    const variantOptionName = (cfg.variantOptionName || '').trim()
+        || (exportConfig?.option1Name || '').trim()
+        || 'Size';
     const nowMs = Date.now();
 
     // Only create SKUs that truly aren't in the store — never duplicates / ambiguous / untracked.
@@ -884,7 +975,7 @@ async function pushNewProducts({ connection, token, scopedProducts, unmatched, m
 
             if (!plan.existingProductId) {
                 // New product → productSet (links each variant's own image to the variant).
-                const input = buildProductSetInput(plan, exportConfig, locationId, pricelistPriority, vatMode, futureGuard, nowMs, wantTags);
+                const input = buildProductSetInput(plan, exportConfig, locationId, pricelistPriority, vatMode, futureGuard, nowMs, wantTags, variantOptionName);
                 const data = await graphqlRequest(shop, token, PRODUCT_SET_MUTATION, { input, synchronous: true });
                 const ue = data?.productSet?.userErrors || [];
                 if (ue.length) throw new Error(ue.map((e) => e.message).join('; '));
@@ -893,7 +984,7 @@ async function pushNewProducts({ connection, token, scopedProducts, unmatched, m
             } else {
                 // Parent already exists → add only the missing variants (no whole-product reset).
                 const variantInputs = plan.toCreate.map((v) =>
-                    buildCreateVariantInput(plan, v, locationId, pricelistPriority, vatMode, futureGuard, nowMs));
+                    buildCreateVariantInput(plan, v, locationId, pricelistPriority, vatMode, futureGuard, nowMs, variantOptionName));
                 const vData = await graphqlRequest(shop, token, VARIANTS_BULK_CREATE_MUTATION, { productId: plan.existingProductId, variants: variantInputs, strategy: 'DEFAULT' });
                 const vue = vData?.productVariantsBulkCreate?.userErrors || [];
                 if (vue.length) throw new Error(vue.map((e) => e.message).join('; '));
@@ -958,7 +1049,8 @@ function scopeLabel(sc) {
 /** Per-source push settings (design: each source is configured independently). */
 const SCOPE_CONFIG_KEYS = [
     'ownership', 'syncStock', 'syncNewProducts', 'syncPrices', 'syncDescriptions', 'syncImages',
-    'syncTags', 'priceVatMode', 'futureDatedGuard', 'pricelistPriority', 'publicationIds'
+    'syncTags', 'priceVatMode', 'futureDatedGuard', 'pricelistPriority', 'publicationIds',
+    'variantOptionName'
 ];
 
 /**
@@ -1137,6 +1229,11 @@ async function runScopeTarget({ connection, token, job, scopedProducts, items, l
         if (connection.config?.ownership === 'portal_authoritative') {
             await pushPortalAuthoritative({
                 connection, token, scopedProducts, matchInfoBySku, existingMap, exportConfig, counts, errors, staleSkus, unmatched
+            });
+            // The variant option NAME is a managed field too: rename existing products' Option1
+            // when a name is explicitly configured (scope override or the export's setting).
+            await pushOptionRenames({
+                connection, token, scopedProducts, matchInfoBySku, exportConfig, counts, errors
             });
             // Sales channels are a managed field here too: keep existing products in sync with
             // the selected channels (publish/unpublish), not just newly-created ones.
