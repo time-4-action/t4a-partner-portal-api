@@ -172,6 +172,21 @@ async function loadLiveShopData(connection) {
                 }
             }
         } catch (err) {
+            // A 401 on a token we believe is valid means it's been revoked — i.e. the app was
+            // uninstalled in Shopify. The `app/uninstalled` webhook may never have reached us
+            // (Shopify can't POST to a localhost/unreachable dev API), so detect it lazily here
+            // and mirror exactly what the webhook does: mark the connection uninstalled (hides it
+            // from the portal list) and drop its product map. The UI removes it from the switcher.
+            if (err.code === 'SHOPIFY_AUTH' && err.status === 401) {
+                try {
+                    const ids = await connectionService.markUninstalledByShop(connection.shopDomain);
+                    await Promise.all(ids.map((id) => productMap.deleteForConnection(id)));
+                    console.log(`[shopify] detected uninstall on load: ${connection.shopDomain} (${ids.length} connection(s))`);
+                } catch (markErr) {
+                    console.error('[shopify] failed to mark uninstalled:', markErr.message);
+                }
+                return { locations: [], publications: [], publishingEnabled: false, needsReconnect: false, uninstalled: true };
+            }
             if (err.code === 'REAUTH_REQUIRED') needsReconnect = true;
             else console.error('[shopify] listLocations failed:', err.code || '', err.message);
         }

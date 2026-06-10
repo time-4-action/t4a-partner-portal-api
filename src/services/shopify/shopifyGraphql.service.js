@@ -109,10 +109,13 @@ async function graphqlRequest(shop, accessToken, query, variables = {}) {
             continue;
         }
 
-        // 401/403 — token invalid/revoked. Not retryable; surface a typed error.
+        // 401/403 — token invalid/revoked. Not retryable; surface a typed error. The HTTP
+        // status is carried so callers can distinguish a revoked token (401 — e.g. the app was
+        // uninstalled in Shopify) from a scope/permission refusal (403).
         if (status === 401 || status === 403) {
             const error = new Error(`Shopify auth failed (${status}) for ${shop}`);
             error.code = 'SHOPIFY_AUTH';
+            error.status = status;
             throw error;
         }
 
