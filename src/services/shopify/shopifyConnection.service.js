@@ -362,6 +362,21 @@ async function unlinkFeedFromConnections(feedId) {
 }
 
 /**
+ * Hard-deletes EVERY connection row for a shop domain — the `shop/redact` GDPR webhook.
+ * By the time Shopify sends it (48h after uninstall) the rows are already `uninstalled`
+ * with tokens cleared; this erases the residual record (domain, owner, config) entirely.
+ * @returns {Promise<Array<ObjectId>>} ids of the deleted connections (so the caller can
+ *   drop their product maps and sync history).
+ */
+async function deleteByShopDomain(shopDomain) {
+    const db = getDb();
+    const collection = db.collection(COLLECTION_NAME);
+    const affected = await collection.find({ shopDomain }, { projection: { _id: 1 } }).toArray();
+    await collection.deleteMany({ shopDomain });
+    return affected.map((c) => c._id);
+}
+
+/**
  * Hard-deletes a connection (explicit user disconnect). Returns true if removed.
  */
 async function deleteConnection(id) {
@@ -417,6 +432,7 @@ module.exports = {
     setStatus,
     markUninstalledByShop,
     unlinkFeedFromConnections,
+    deleteByShopDomain,
     deleteConnection,
     ensureIndexes
 };

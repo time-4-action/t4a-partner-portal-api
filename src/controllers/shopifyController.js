@@ -359,8 +359,10 @@ exports.disconnect = async (req, res) => {
                 err.code || err.response?.status || err.message);
         }
         await connectionService.deleteConnection(req.params.id);
-        // Drop the now-orphaned product map so a later reinstall re-matches cleanly.
+        // Drop the now-orphaned product map (so a later reinstall re-matches cleanly) and the
+        // sync-run history — a portal disconnect erases everything we hold for the store.
         await productMap.deleteForConnection(connection._id);
+        await syncJobs.deleteForConnection(connection._id);
         res.json({ success: true, message: 'Disconnected' });
     } catch (error) {
         handleError(res, error);
@@ -391,11 +393,22 @@ exports.webhook = async (req, res) => {
                 console.log(`[shopify] app uninstalled: ${shopDomain} (${ids.length} connection(s))`);
                 break;
             }
-            case 'shop/redact':
+            case 'shop/redact': {
+                // Sent ~48h after uninstall. Erase everything still held for the shop: the
+                // residual connection row (domain, owner, config), product maps and sync history.
+                const ids = await connectionService.deleteByShopDomain(shopDomain);
+                await Promise.all(ids.flatMap((id) => [
+                    productMap.deleteForConnection(id),
+                    syncJobs.deleteForConnection(id)
+                ]));
+                console.log(`[shopify] shop/redact: erased ${ids.length} connection(s) for ${shopDomain}`);
+                break;
+            }
             case 'customers/redact':
             case 'customers/data_request':
-                // One-way push app — we store no Shopify customer data. Acknowledge per GDPR.
-                console.log(`[shopify] GDPR webhook ${topic} for ${shopDomain} — no data held`);
+                // One-way push app — we never request customer scopes and hold no Shopify
+                // customer data, so there is nothing to redact/report. Acknowledge per GDPR.
+                console.log(`[shopify] GDPR webhook ${topic} for ${shopDomain} — no customer data held`);
                 break;
             default:
                 console.log(`[shopify] unhandled webhook topic: ${topic}`);

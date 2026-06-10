@@ -121,6 +121,16 @@ async function failStaleRuns(connectionId) {
     );
 }
 
+/**
+ * Removes every sync-run record for a connection. Called on portal disconnect and on the
+ * `shop/redact` GDPR webhook so no run history (shop domain, SKU lists) outlives the
+ * connection it belongs to.
+ * @param {ObjectId|string} connectionId
+ */
+async function deleteForConnection(connectionId) {
+    await getDb().collection(COLLECTION_NAME).deleteMany({ connectionId: toObjectId(connectionId) });
+}
+
 module.exports = {
     COLLECTION_NAME,
     EMPTY_COUNTS,
@@ -128,5 +138,6 @@ module.exports = {
     finishRun,
     listRecentRuns,
     getLatestRun,
-    failStaleRuns
+    failStaleRuns,
+    deleteForConnection
 };
