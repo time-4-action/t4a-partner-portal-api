@@ -12,6 +12,32 @@ const anthropic = new Anthropic({ apiKey: API_KEY });
 const MODEL_NAME = 'claude-haiku-4-5';
 const BATCH_SIZE = 30;
 
+// One progress doc per export (latest run wins) — the UI polls this while a run is going so
+// the user can see batches advancing instead of a silent background job.
+const RUNS_COLLECTION = 'ai_categorization_runs';
+
+/** Upserts the run-progress doc for an export. Best-effort: never blocks the run itself. */
+async function setRunProgress(exportId, patch) {
+    try {
+        await getDb().collection(RUNS_COLLECTION).updateOne(
+            { exportId: exportId.toString() },
+            { $set: { ...patch, updatedAt: new Date() } },
+            { upsert: true }
+        );
+    } catch (e) {
+        console.error('Failed to record AI run progress:', e.message);
+    }
+}
+
+/** Latest categorization run for an export, or null if it has never run. */
+async function getRunStatus(exportId) {
+    const run = await getDb().collection(RUNS_COLLECTION).findOne(
+        { exportId: exportId.toString() },
+        { projection: { _id: 0 } }
+    );
+    return run || null;
+}
+
 // Structured-outputs JSON schema (output_config.format) — the response is guaranteed to parse
 // against this. `additionalProperties: false` is required on every object by the API.
 const responseSchema = {
@@ -71,7 +97,7 @@ If you are unsure, use the ID for "Ostalo" or a similar general category if avai
 
         if (message.stop_reason === 'refusal') {
             console.error('Batch Error: model refused the request.');
-            return [];
+            return { results: [], error: 'The model refused the request.' };
         }
         if (message.stop_reason === 'max_tokens') {
             console.warn('Batch warning: output truncated at max_tokens — results may be incomplete.');
@@ -79,14 +105,15 @@ If you are unsure, use the ID for "Ostalo" or a similar general category if avai
 
         const text = message.content.find((b) => b.type === 'text')?.text || '{}';
         const jsonResponse = JSON.parse(text);
-        return jsonResponse.results || [];
+        return { results: jsonResponse.results || [], error: null };
 
     } catch (error) {
         console.error('Batch Error:', error.message);
         if (error instanceof Anthropic.APIError) {
             console.error(`Anthropic API error ${error.status} (${error.type || 'unknown'})`);
         }
-        return [];
+        // Surfaced on the run-progress doc so the UI can show WHY a run produced nothing.
+        return { results: [], error: error.message };
     }
 }
 
@@ -106,6 +133,11 @@ async function identifyProductCategories(exportId) {
 
         if (validCategories.length === 0) {
             console.warn(`No categories found for exportId: "${exportId}". Skipping categorization.`);
+            const now = new Date();
+            await setRunProgress(exportId, {
+                status: 'failed', error: 'No categories defined for this category set — add categories first.',
+                total: 0, processed: 0, categorized: 0, batch: 0, totalBatches: 0, startedAt: now, finishedAt: now
+            });
             return { exportId, productsFound: 0, productsCategorized: 0 };
         }
 
@@ -116,6 +148,11 @@ async function identifyProductCategories(exportId) {
 
         if (productsToCategorize.length === 0) {
             console.log(`No new products to categorize for exportId "${exportId}". All products are up to date.`);
+            const now = new Date();
+            await setRunProgress(exportId, {
+                status: 'done', error: null,
+                total: 0, processed: 0, categorized: 0, batch: 0, totalBatches: 0, startedAt: now, finishedAt: now
+            });
             return { exportId, productsFound: 0, productsCategorized: 0 };
         }
 
@@ -124,13 +161,21 @@ async function identifyProductCategories(exportId) {
         const categoryMap = new Map(categoriesForPrompt.map(c => [c.id, c.label]));
         const totalBatches = Math.ceil(productsToCategorize.length / BATCH_SIZE);
         let totalCategorized = 0;
+        let lastError = null;
+
+        await setRunProgress(exportId, {
+            status: 'running', error: null,
+            total: productsToCategorize.length, processed: 0, categorized: 0,
+            batch: 0, totalBatches, startedAt: new Date(), finishedAt: null
+        });
 
         for (let i = 0; i < productsToCategorize.length; i += BATCH_SIZE) {
             const batchNum = Math.floor(i / BATCH_SIZE) + 1;
             const batch = productsToCategorize.slice(i, i + BATCH_SIZE);
             console.log(`Processing batch ${batchNum}/${totalBatches} for exportId "${exportId}"...`);
 
-            const batchResults = await processBatch(batch, categoriesForPrompt, exportId);
+            const { results: batchResults, error: batchError } = await processBatch(batch, categoriesForPrompt, exportId);
+            if (batchError) lastError = batchError;
 
             const bulkOps = batchResults.map(result => {
                 const categoryName = categoryMap.get(String(result.catId));
@@ -161,7 +206,21 @@ async function identifyProductCategories(exportId) {
             } else {
                 console.log(`Batch ${batchNum}/${totalBatches} — no valid results to save.`);
             }
+
+            await setRunProgress(exportId, {
+                batch: batchNum,
+                processed: Math.min(i + BATCH_SIZE, productsToCategorize.length),
+                categorized: totalCategorized,
+                error: lastError
+            });
         }
+
+        await setRunProgress(exportId, {
+            // Nothing written AND batches errored → the run failed; partial results stay 'done'.
+            status: totalCategorized === 0 && lastError ? 'failed' : 'done',
+            error: lastError,
+            finishedAt: new Date()
+        });
 
         return {
             exportId,
@@ -171,6 +230,7 @@ async function identifyProductCategories(exportId) {
 
     } catch (error) {
         console.error(`Orchestrator Error for exportId "${exportId}":`, error.message);
+        await setRunProgress(exportId, { status: 'failed', error: error.message, finishedAt: new Date() });
         throw error;
     }
 }
@@ -225,7 +285,7 @@ async function categorizeExternalProducts(exportId, products) {
 
     for (let i = 0; i < products.length; i += BATCH_SIZE) {
         const batch = products.slice(i, i + BATCH_SIZE);
-        const batchResults = await processBatch(batch, categoriesForPrompt, `external:${exportId}`);
+        const { results: batchResults } = await processBatch(batch, categoriesForPrompt, `external:${exportId}`);
 
         for (const result of batchResults) {
             const categoryName = categoryMap.get(String(result.catId));
@@ -242,4 +302,4 @@ async function categorizeExternalProducts(exportId, products) {
     return { results: allResults };
 }
 
-module.exports = { identifyProductCategories, getCategoryNameForProductCode, categorizeExternalProducts };
+module.exports = { identifyProductCategories, getCategoryNameForProductCode, categorizeExternalProducts, getRunStatus };
