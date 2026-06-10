@@ -7,6 +7,7 @@ const webhookController = require('../controllers/webhookController');
 router.post('/sync/pnv', webhookApiKey, webhookController.triggerPnvSync);
 router.post('/sync/ai-categorization', webhookApiKey, webhookController.triggerAiCategorization);
 router.post('/sync/shopify', webhookApiKey, webhookController.triggerShopifyReconcile);
+router.post('/sync/external', webhookApiKey, webhookController.triggerExternalImport);
 router.post('/categorize', webhookApiKey, webhookController.categorizeExternal);
 
 module.exports = router;

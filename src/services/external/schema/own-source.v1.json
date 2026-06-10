@@ -1,0 +1,124 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://time-4-action.com/schemas/own-source.v1.json",
+  "title": "T4A Own Source feed (v1.0)",
+  "description": "A single JSON document = the complete current catalogue of one brand. Strictly formatted; the portal validates it, it does NOT transform it. Any violation rejects the whole import.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "brand", "currency", "generatedAt", "products"],
+  "properties": {
+    "schemaVersion": {
+      "description": "Must match a version the portal supports.",
+      "type": "string",
+      "enum": ["1.0"]
+    },
+    "brand": {
+      "description": "Becomes the Shopify vendor default and a UI label.",
+      "type": "string",
+      "minLength": 1
+    },
+    "currency": {
+      "description": "ISO-4217 currency code of all prices in the feed.",
+      "type": "string",
+      "pattern": "^[A-Z]{3}$"
+    },
+    "generatedAt": {
+      "description": "ISO-8601 UTC timestamp the feed was produced. Used for staleness checks.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "products": {
+      "description": "The full snapshot. Present = upsert, absent = removed (per the feed's removal policy).",
+      "type": "array",
+      "items": { "$ref": "#/$defs/product" }
+    }
+  },
+  "$defs": {
+    "product": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["externalId", "name", "variants"],
+      "properties": {
+        "externalId": {
+          "description": "Stable id of the parent in the supplier's system. Unique within the feed.",
+          "type": "string",
+          "minLength": 1
+        },
+        "name": { "type": "string", "minLength": 1 },
+        "descriptionHtml": { "type": "string" },
+        "vendor": { "type": "string" },
+        "productType": { "type": "string" },
+        "status": { "type": "string", "enum": ["active", "draft"] },
+        "tags": {
+          "description": "Flat tags, pushed to Shopify as-is.",
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "categoryPaths": {
+          "description": "\"A / B\" hierarchical paths; expanded to [\"A\", \"A / B\"] like the AI categories.",
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "images": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["src"],
+            "properties": {
+              "src": { "type": "string", "format": "uri" },
+              "alt": { "type": "string" }
+            }
+          }
+        },
+        "variants": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/variant" }
+        }
+      }
+    },
+    "variant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sku", "stock", "price"],
+      "properties": {
+        "sku": {
+          "description": "Identity key. Globally unique within the feed. Drives Shopify SKU->variant matching.",
+          "type": "string",
+          "minLength": 1
+        },
+        "barcode": { "type": "string" },
+        "option1": {
+          "description": "The variant option value (e.g. sail size). Falls back to SKU for sizeless.",
+          "type": "string"
+        },
+        "stock": { "type": "integer", "minimum": 0 },
+        "price": { "$ref": "#/$defs/price" },
+        "image": { "type": "string", "format": "uri" }
+      }
+    },
+    "price": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["amount", "vat", "taxMode"],
+      "properties": {
+        "amount": {
+          "description": "The price the supplier wants listed (markup already baked in).",
+          "type": "number",
+          "minimum": 0
+        },
+        "vat": {
+          "description": "VAT rate as a percentage (e.g. 22).",
+          "type": "number",
+          "minimum": 0
+        },
+        "taxMode": {
+          "description": "How `amount` is expressed; normalized to the portal's NET convention at ingest.",
+          "type": "string",
+          "enum": ["gross", "net"]
+        }
+      }
+    }
+  }
+}

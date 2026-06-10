@@ -3,6 +3,7 @@ const { identifyProductCategories, categorizeExternalProducts } = require('../se
 const { getAiEnabledExports } = require('../services/exports.service');
 const { fireCallback } = require('../services/callbackWebhook.service');
 const { syncAllConnections } = require('../services/shopify/shopifySync.service');
+const externalImport = require('../services/external/externalImport.service');
 
 /**
  * POST /api/export/webhooks/sync/pnv
@@ -90,6 +91,24 @@ exports.triggerShopifyReconcile = async (req, res) => {
         console.error('[webhook] Shopify reconcile failed:', err.message);
         res.status(500).json({ message: err.message });
     }
+};
+
+/**
+ * POST /api/export/webhooks/sync/external
+ *
+ * Escape hatch for an external nudge/back-fill of an Own Source feed (design §8.2). The portal's
+ * own scheduler is the real driver; this is NOT it. `webhookApiKey`-protected. Body `{ feedId }`
+ * triggers one feed; the import records its own outcome and triggers the Shopify push on success.
+ */
+exports.triggerExternalImport = (req, res) => {
+    const { feedId } = req.body || {};
+    if (!feedId) {
+        return res.status(400).json({ message: 'feedId is required.' });
+    }
+    externalImport.startImport(feedId, { trigger: 'webhook' }).catch((err) => {
+        console.error(`[webhook] external import for ${feedId} failed:`, err.message);
+    });
+    res.status(202).json({ message: `Import started for feed ${feedId}.`, startedAt: new Date().toISOString() });
 };
 
 /**

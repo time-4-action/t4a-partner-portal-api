@@ -968,6 +968,10 @@ const resolveCategoryName = (product, config) => {
  * e.g. AI category "Electronics / Phones" → ["Electronics", "Electronics / Phones"]
  */
 const resolveTagsArray = (product, config) => {
+    // External-feed products carry pre-resolved tags (flat `tags` + expanded `categoryPaths`,
+    // resolved at ingest — see external importer §7). They have no ai_categories/exportId, so
+    // prefer their stored tags and leave Patrik's AI-category path below untouched.
+    if (Array.isArray(product.tags) && product.source) return product.tags;
     const aiExportId = config?.filters?.aiExportId;
     if (aiExportId && aiExportId !== 'all') {
         const filtered = (product.ai_categories || []).filter(c => c.exportId === aiExportId);
@@ -1195,6 +1199,9 @@ module.exports = {
     getPriceFromPriority,
     getDistinctPricelists,
     resolveTagsArray,
+    // Reused by the external-feed importer to expand "A / B" category paths into the same
+    // hierarchical tag set Patrik's AI categories produce (one definition of the rule).
+    expandCategoryToTags,
     VALID_PRESETS,
     COLUMN_HEADERS,
     DEFAULT_FILTERS

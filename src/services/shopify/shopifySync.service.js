@@ -8,6 +8,7 @@ const productMap = require('./shopifyProductMap.service');
 const syncJobs = require('./shopifySyncJobs.service');
 const queue = require('./shopifyQueue.service');
 const { graphqlRequest, publishToPublications, unpublishFromPublications, listPublications, findExistingIds } = require('./shopifyGraphql.service');
+const externalProducts = require('../external/externalProducts.service');
 
 /**
  * Stock-only sync engine — Phase A (design §8, plan Phase A).
@@ -133,10 +134,19 @@ async function buildScope(config) {
     const db = getDb();
     const products = await db.collection(PRODUCTS_COLLECTION).find({ active: true }).toArray();
     const filtered = applyFilters(products, config.filters || {}, config.pricelistPriority || []);
+    return { products: filtered, items: itemsFromProducts(filtered) };
+}
 
+/**
+ * Flattens a list of products (internal shape) into the sellable inventory items the push
+ * operates on: one row per published variant SKU (or the parent for a no-variant product),
+ * SKU-less / duplicate SKUs dropped. Shared by {@link buildScope} (Patrik) and
+ * {@link buildExternalScope} (Own Source feeds) so both produce the identical contract.
+ */
+function itemsFromProducts(products) {
     const items = [];
     const seen = new Set();
-    for (const product of filtered) {
+    for (const product of products) {
         const variants = product.child_products || [];
         const rows = variants.length
             ? variants.map((v) => ({
@@ -161,7 +171,19 @@ async function buildScope(config) {
             items.push(row);
         }
     }
-    return { products: filtered, items };
+    return items;
+}
+
+/**
+ * The Own Source equivalent of {@link buildScope} (design §8.3): reads the published/active
+ * `external_products` for a feed and returns the IDENTICAL `{ products, items }` contract. The
+ * docs are already in the internal product shape, so everything downstream (matching, price via
+ * {@link resolvePushPrice}, tags via {@link resolveTagsArray}, create/content/image phases) is
+ * untouched — the engine is brand-blind.
+ */
+async function buildExternalScope(feedId) {
+    const products = await externalProducts.readPublished(feedId);
+    return { products, items: itemsFromProducts(products) };
 }
 
 /**
@@ -253,7 +275,10 @@ async function pushPortalAuthoritative({ connection, token, scopedProducts, matc
     const cfg = connection.config || {};
     const wantPrices = !!cfg.syncPrices;
     const wantContent = !!cfg.syncDescriptions;
-    if (!wantPrices && !wantContent) return;
+    // Tags are managed independently of the title/description (own toggle). `syncTags` defaults
+    // ON for back-compat (tags used to ride along with content).
+    const wantTags = cfg.syncTags !== false;
+    if (!wantPrices && !wantContent && !wantTags) return;
 
     const vatMode = cfg.priceVatMode || 'inclusive';
     const futureGuard = cfg.futureDatedGuard !== false;
@@ -301,13 +326,24 @@ async function pushPortalAuthoritative({ connection, token, scopedProducts, matc
             if (variantUpdates.length) priceOps.push({ parentCode: product.code, productId, variants: variantUpdates, hashes });
         }
 
-        if (wantContent) {
-            const title = product.product_name || '';
-            const descriptionHtml = product.detailed_description || product.short_description || '';
-            const tags = resolveTagsArray(product, exportConfig) || [];
-            const contentHash = sha1(JSON.stringify({ title, descriptionHtml, tags }));
+        if (wantContent || wantTags) {
+            // Only set the fields this source manages — title/description (wantContent) and/or
+            // tags (wantTags) — so one can be pushed without clobbering the other.
+            const productUpdate = { id: productId };
+            const hashParts = {};
+            if (wantContent) {
+                productUpdate.title = product.product_name || '';
+                productUpdate.descriptionHtml = product.detailed_description || product.short_description || '';
+                hashParts.title = productUpdate.title;
+                hashParts.descriptionHtml = productUpdate.descriptionHtml;
+            }
+            if (wantTags) {
+                productUpdate.tags = resolveTagsArray(product, exportConfig) || [];
+                hashParts.tags = productUpdate.tags;
+            }
+            const contentHash = sha1(JSON.stringify(hashParts));
             if (existingMap.get(matched[0].sku)?.contentHash !== contentHash) {
-                contentOps.push({ parentCode: product.code, product: { id: productId, title, descriptionHtml, tags }, skus: matched.map((m) => m.sku), contentHash });
+                contentOps.push({ parentCode: product.code, product: productUpdate, skus: matched.map((m) => m.sku), contentHash });
             }
         }
     }
@@ -570,7 +606,7 @@ function buildCreateVariantInput(plan, v, locationId, pricelistPriority, vatMode
  * images linked (design §3.5). Each variant's own image becomes its variant image; the parent
  * gallery + all variant images form the product files. price/barcode/sku/inventory set inline.
  */
-function buildProductSetInput(plan, exportConfig, locationId, pricelistPriority, vatMode, futureGuard, nowMs) {
+function buildProductSetInput(plan, exportConfig, locationId, pricelistPriority, vatMode, futureGuard, nowMs, wantTags = true) {
     const product = plan.product;
     const parentImages = [...new Set(product.images || [])].filter(Boolean);
     const variantImageUrls = [];
@@ -602,10 +638,11 @@ function buildProductSetInput(plan, exportConfig, locationId, pricelistPriority,
     const input = {
         title: product.product_name || product.code || 'Untitled',
         descriptionHtml: product.detailed_description || product.short_description || '',
-        vendor: 'Patrik International',
+        // Own-source products carry their own brand as `vendor`; Patrik products have none → default.
+        vendor: product.vendor || 'Patrik International',
         productType: product.categories?.[0] || '',
         status: 'ACTIVE',
-        tags: resolveTagsArray(product, exportConfig) || [],
+        tags: wantTags ? (resolveTagsArray(product, exportConfig) || []) : [],
         variants
     };
     // productSet requires productOptions whenever variants are provided (even the single
@@ -657,6 +694,7 @@ async function pushNewProducts({ connection, token, scopedProducts, unmatched, m
     const futureGuard = cfg.futureDatedGuard !== false;
     const pricelistPriority = cfg.pricelistPriority || [];
     const publicationIds = cfg.publicationIds || []; // sales channels to publish new products to
+    const wantTags = cfg.syncTags !== false; // tags on newly-created products (own toggle)
     const nowMs = Date.now();
 
     // Only create SKUs that truly aren't in the store — never duplicates / ambiguous / untracked.
@@ -691,7 +729,7 @@ async function pushNewProducts({ connection, token, scopedProducts, unmatched, m
 
             if (!plan.existingProductId) {
                 // New product → productSet (links each variant's own image to the variant).
-                const input = buildProductSetInput(plan, exportConfig, locationId, pricelistPriority, vatMode, futureGuard, nowMs);
+                const input = buildProductSetInput(plan, exportConfig, locationId, pricelistPriority, vatMode, futureGuard, nowMs, wantTags);
                 const data = await graphqlRequest(shop, token, PRODUCT_SET_MUTATION, { input, synchronous: true });
                 const ue = data?.productSet?.userErrors || [];
                 if (ue.length) throw new Error(ue.map((e) => e.message).join('; '));
@@ -736,69 +774,60 @@ async function pushNewProducts({ connection, token, scopedProducts, unmatched, m
 }
 
 /**
- * Executes a stock-only sync for a connection. Caller passes the pre-created run (job) so
- * the HTTP layer can return its id immediately; this function fills in the result.
+ * Resolves the connection's push targets — one per scope, each with its OWN Shopify location.
  *
- * @param {Object} connection - raw connection doc
- * @param {Object} job - the `running` job document from {@link syncJobs.startRun}
- * @param {string} token - a valid (refreshed) Admin API access token
+ * A connection can push several sources to the SAME store at DIFFERENT locations (e.g. Patrik at
+ * the main warehouse, a Point-7 feed at a brand location). That's modelled as `config.scopes[]`,
+ * each `{ type, exportConfigId|feedId, locationId }`. Back-compat: a legacy single `config.scope`
+ * (or bare `config.exportConfigId`) becomes one scope at the connection-level `shopifyLocationId`.
+ *
+ * @returns {Array<{ type:string, exportConfigId?:string, feedId?:string, locationId:string|null }>}
  */
-async function executeRun(connection, job, token) {
-    const counts = { ...syncJobs.EMPTY_COUNTS };
-    const unmatched = [];
-    const errors = [];
-    // SKUs whose Shopify target was deleted — their map rows are dropped at the end of the run
-    // so the next sync re-matches them instead of pushing to a dead id.
-    const staleSkus = new Set();
+function getScopeList(connection) {
+    const cfg = connection.config || {};
+    if (Array.isArray(cfg.scopes) && cfg.scopes.length) {
+        // Preserve the whole scope (it carries its own per-source push config), only defaulting
+        // the location to the connection-level one when the scope doesn't set its own.
+        return cfg.scopes.map((s) => ({ ...s, locationId: s.locationId || connection.shopifyLocationId || null }));
+    }
+    const single = cfg.scope
+        ?? (cfg.exportConfigId ? { type: 'export_config', exportConfigId: cfg.exportConfigId } : null);
+    return single ? [{ ...single, locationId: connection.shopifyLocationId || null }] : [];
+}
 
-    try {
-        const locationId = connection.shopifyLocationId;
-        if (!locationId) {
-            throw Object.assign(new Error('No Shopify location selected for this connection'), { code: 'NO_LOCATION' });
-        }
-        const exportConfigId = connection.config?.exportConfigId;
-        if (!exportConfigId) {
-            throw Object.assign(new Error('No "Products to sync" export configuration selected'), { code: 'NO_EXPORT_CONFIG' });
-        }
-        const exportConfig = await getExportConfigById(exportConfigId);
-        if (!exportConfig) {
-            throw Object.assign(new Error('The selected export configuration no longer exists'), { code: 'NO_EXPORT_CONFIG' });
-        }
+/** Short human label for a scope, for error messages. */
+function scopeLabel(sc) {
+    return sc.type === 'own_source' ? `feed ${sc.feedId}` : `export ${sc.exportConfigId}`;
+}
 
-        const { products: scopedProducts, items } = await buildScope(exportConfig);
-        counts.inScope = items.length;
-        if (!items.length) {
-            await syncJobs.finishRun(job._id, { status: 'done', counts, unmatched, errors });
-            await connectionService.updateLastSync(connection._id, { lastSyncStatus: 'done' });
-            return;
-        }
+/** Per-source push settings (design: each source is configured independently). */
+const SCOPE_CONFIG_KEYS = [
+    'ownership', 'syncStock', 'syncNewProducts', 'syncPrices', 'syncDescriptions', 'syncImages',
+    'syncTags', 'priceVatMode', 'futureDatedGuard', 'pricelistPriority', 'publicationIds'
+];
 
-        // Authoritative map: only look up SKUs we haven't mapped before (design §7).
-        const existingMap = await productMap.getMapBySku(connection._id);
+/**
+ * Resolves the EFFECTIVE push config for one scope. Each source configures its own ownership /
+ * what-to-sync / pricing / channels; a value the scope doesn't set falls back to the
+ * connection-level config (so legacy single-scope connections keep working unchanged).
+ */
+function resolveScopeConfig(connection, scope) {
+    const base = connection.config || {};
+    const out = {};
+    for (const k of SCOPE_CONFIG_KEYS) {
+        out[k] = scope[k] !== undefined ? scope[k] : base[k];
+    }
+    return out;
+}
 
-        // Pre-flight: drop mappings whose Shopify product was DELETED in the store. One bulk
-        // existence check up front means those SKUs become unmapped and flow into the normal
-        // match → create path THIS run (re-created instead of erroring on push and forcing a
-        // second sync). Reactive stale-handling at push time remains a backstop.
-        const mappedProductIds = [...new Set([...existingMap.values()].map((r) => r.shopifyProductId).filter(Boolean))];
-        if (mappedProductIds.length) {
-            try {
-                const existing = await findExistingIds(connection.shopDomain, token, mappedProductIds);
-                const deletedSkus = [];
-                for (const [sku, row] of existingMap) {
-                    if (row.shopifyProductId && !existing.has(row.shopifyProductId)) deletedSkus.push(sku);
-                }
-                if (deletedSkus.length) {
-                    await productMap.deleteBySkus(connection._id, deletedSkus);
-                    for (const sku of deletedSkus) existingMap.delete(sku);
-                    console.log(`[shopify] pre-flight dropped ${deletedSkus.length} mapping(s) for deleted products (${connection.shopDomain})`);
-                }
-            } catch (err) {
-                // Non-fatal — fall back to reactive stale handling at push time.
-                console.error('[shopify] pre-flight existence check failed:', err.message);
-            }
-        }
-
+/**
+ * Runs the full push pipeline (match → create → stock → content/price → images/publish) for ONE
+ * scope target at ONE location. Connection-wide state (the product map, the run job, the
+ * accumulating counts/errors/unmatched/staleSkus) is passed in and mutated, so several scopes in
+ * one run share one map read, one job, and one set of counts. SKUs are disjoint across scopes
+ * (Patrik SKUs vs feed SKUs), so each scope only touches its own rows.
+ */
+async function runScopeTarget({ connection, token, job, scopedProducts, items, locationId, exportConfig, existingMap, counts, errors, unmatched, staleSkus }) {
         const unmapped = items.filter((it) => !existingMap.has(it.sku));
 
         const newMatches = [];
@@ -848,7 +877,8 @@ async function executeRun(connection, job, token) {
         const pushable = items
             .filter((it) => inventoryItemBySku.get(it.sku))
             .map((it) => ({ ...it, shopifyInventoryItemId: inventoryItemBySku.get(it.sku) }));
-        counts.matched = pushable.length;
+        // Accumulate across scopes (this fn runs once per scope target in a multi-source run).
+        counts.matched += pushable.length;
         counts.unmatched = unmatched.length;
 
         // sku → Shopify ids for matched variants (stored ∪ freshly matched). Shared by Phase B
@@ -979,6 +1009,126 @@ async function executeRun(connection, job, token) {
             }
         }
 
+}
+
+/**
+ * Executes a sync for a connection across ALL its scope targets. Caller passes the pre-created
+ * run (job) so the HTTP layer can return its id immediately; this function fills in the result.
+ *
+ * Each scope is resolved to its source ({@link buildScope} / {@link buildExternalScope}) and its
+ * own location, then run through {@link runScopeTarget}. The product map is read once and the
+ * deleted-in-store pre-flight runs once (both are connection-wide); counts/errors/unmatched and
+ * the stale-SKU set accumulate across scopes into the single job.
+ *
+ * @param {Object} connection - raw connection doc
+ * @param {Object} job - the `running` job document from {@link syncJobs.startRun}
+ * @param {string} token - a valid (refreshed) Admin API access token
+ */
+async function executeRun(connection, job, token) {
+    const counts = { ...syncJobs.EMPTY_COUNTS };
+    const unmatched = [];
+    const errors = [];
+    // SKUs whose Shopify target was deleted — their map rows are dropped at the end of the run
+    // so the next sync re-matches them instead of pushing to a dead id.
+    const staleSkus = new Set();
+
+    try {
+        const scopeList = getScopeList(connection);
+        if (!scopeList.length) {
+            throw Object.assign(new Error('No "Products to sync" source selected'), { code: 'NO_EXPORT_CONFIG' });
+        }
+
+        // Build each scope target: resolve its source (products + items) and validate its location.
+        // A bad scope (no location / missing export config) is recorded and skipped so the OTHER
+        // scopes still sync — one misconfigured source can't block the rest.
+        const targets = [];
+        for (const sc of scopeList) {
+            if (!sc.locationId) {
+                errors.push({ error: `No Shopify location selected for ${scopeLabel(sc)}` });
+                continue;
+            }
+            try {
+                // `exportConfig` is consumed downstream ONLY by tag resolution + the create phase.
+                // Own-source products carry pre-resolved tags + vendor, so it stays null for feeds.
+                let exportConfig = null;
+                let built;
+                if (sc.type === 'own_source') {
+                    built = await buildExternalScope(sc.feedId);
+                } else {
+                    exportConfig = await getExportConfigById(sc.exportConfigId);
+                    if (!exportConfig) {
+                        errors.push({ error: `The export configuration for ${scopeLabel(sc)} no longer exists` });
+                        continue;
+                    }
+                    built = await buildScope(exportConfig);
+                }
+                targets.push({ ...sc, exportConfig, scopedProducts: built.products, items: built.items });
+            } catch (e) {
+                errors.push({ error: `Could not build ${scopeLabel(sc)}: ${e.message}` });
+            }
+        }
+
+        counts.inScope = targets.reduce((n, t) => n + t.items.length, 0);
+
+        if (!targets.length) {
+            // Every scope was misconfigured — finish as failed with the per-scope errors.
+            await syncJobs.finishRun(job._id, { status: 'failed', counts, unmatched, errors, error: errors[0]?.error });
+            await connectionService.updateLastSync(connection._id, { lastSyncStatus: 'failed' });
+            return;
+        }
+        if (counts.inScope === 0) {
+            const status = errors.length ? 'partial' : 'done';
+            await syncJobs.finishRun(job._id, { status, counts, unmatched, errors });
+            await connectionService.updateLastSync(connection._id, { lastSyncStatus: errors.length ? 'failed' : 'done' });
+            return;
+        }
+
+        // Authoritative map: only look up SKUs we haven't mapped before (design §7). Read ONCE and
+        // shared across scopes (their SKUs are disjoint, so each scope only touches its own rows).
+        const existingMap = await productMap.getMapBySku(connection._id);
+
+        // Pre-flight: drop mappings whose Shopify product was DELETED in the store. One bulk
+        // existence check up front means those SKUs become unmapped and flow into the normal
+        // match → create path THIS run (re-created instead of erroring on push and forcing a
+        // second sync). Reactive stale-handling at push time remains a backstop.
+        const mappedProductIds = [...new Set([...existingMap.values()].map((r) => r.shopifyProductId).filter(Boolean))];
+        if (mappedProductIds.length) {
+            try {
+                const existing = await findExistingIds(connection.shopDomain, token, mappedProductIds);
+                const deletedSkus = [];
+                for (const [sku, row] of existingMap) {
+                    if (row.shopifyProductId && !existing.has(row.shopifyProductId)) deletedSkus.push(sku);
+                }
+                if (deletedSkus.length) {
+                    await productMap.deleteBySkus(connection._id, deletedSkus);
+                    for (const sku of deletedSkus) existingMap.delete(sku);
+                    console.log(`[shopify] pre-flight dropped ${deletedSkus.length} mapping(s) for deleted products (${connection.shopDomain})`);
+                }
+            } catch (err) {
+                // Non-fatal — fall back to reactive stale handling at push time.
+                console.error('[shopify] pre-flight existence check failed:', err.message);
+            }
+        }
+
+        // Run each scope target at its own location AND its own push config, accumulating into the
+        // shared run state. Each source gets an "effective connection" — the real connection with
+        // its config swapped for the scope's effective config and the scope's location — so every
+        // downstream push helper (which reads `connection.config.*`) works unchanged.
+        for (const t of targets) {
+            if (!t.items.length) continue;
+            const scopeConn = { ...connection, config: resolveScopeConfig(connection, t), shopifyLocationId: t.locationId };
+            // Per-source AI-categorization for tags: override the export config's aiExportId when
+            // the scope sets one (Patrik sources). Own-source feeds carry pre-resolved tags.
+            const tagExportConfig = (t.exportConfig && t.aiExportId)
+                ? { ...t.exportConfig, filters: { ...(t.exportConfig.filters || {}), aiExportId: t.aiExportId } }
+                : t.exportConfig;
+            await runScopeTarget({
+                connection: scopeConn, token, job,
+                scopedProducts: t.scopedProducts, items: t.items, locationId: t.locationId, exportConfig: tagExportConfig,
+                existingMap, counts, errors, unmatched, staleSkus
+            });
+        }
+
         // Drop any stale mappings discovered this run; they re-match on the next sync.
         if (staleSkus.size) await productMap.deleteBySkus(connection._id, [...staleSkus]);
 
@@ -1065,12 +1215,37 @@ async function syncAllConnections({ trigger = 'reconcile' } = {}) {
     return results;
 }
 
+/**
+ * Fans the Shopify push out across every connection whose scope is a given Own Source feed —
+ * called by the importer after a feed re-imports so its change propagates to consuming stores.
+ * Each run is started in the background (serialized per shop); never throws.
+ * @param {string} feedId
+ * @param {{ trigger?: string }} [opts]
+ */
+async function syncConnectionsForFeed(feedId, { trigger = 'feed' } = {}) {
+    const connections = await connectionService.listConnectionsForFeed(feedId);
+    const results = [];
+    for (const conn of connections) {
+        try {
+            const job = await startStockSync(conn._id, { trigger });
+            results.push({ shop: conn.shopDomain, jobId: job._id.toString() });
+        } catch (err) {
+            results.push({ shop: conn.shopDomain, skipped: err.code || err.message });
+        }
+    }
+    return results;
+}
+
 module.exports = {
     startStockSync,
     syncAllConnections,
+    syncConnectionsForFeed,
     // exported for tests / future triggers (PNV delta, n8n reconcile)
     executeRun,
+    getScopeList,
+    resolveScopeConfig,
     buildScope,
+    buildExternalScope,
     resolvePushPrice,
     pushNewProducts,
     pushImages

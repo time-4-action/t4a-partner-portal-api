@@ -281,10 +281,12 @@ exports.updateConfig = async (req, res) => {
         await loadOwned(req);
         const updated = await connectionService.updateConnectionConfig(req.params.id, req.body || {});
 
-        // Initial push (design §8.1): the first time a connection becomes sync-ready (products +
+        // Initial push (design §8.1): the first time a connection becomes sync-ready (a source +
         // location chosen) and has never synced, kick off a sync so the partner doesn't have to
         // click "Sync now" for the very first run. Fire-and-forget; SYNC_BUSY guards re-saves.
-        if (updated.config?.exportConfigId && updated.shopifyLocationId && !updated.lastSyncAt) {
+        // A source is any of: legacy exportConfigId, a single `scope`, or a `scopes[]` array.
+        const hasSource = updated.config?.exportConfigId || updated.config?.scope || (updated.config?.scopes?.length > 0);
+        if (hasSource && updated.shopifyLocationId && !updated.lastSyncAt) {
             syncService.startStockSync(updated._id, { trigger: 'initial' }).catch(() => {});
         }
 

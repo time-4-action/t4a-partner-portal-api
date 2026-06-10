@@ -10,6 +10,7 @@ const customExportRoutes = require('../customExportRoutes');
 const rechargeRoutes = require('../rechargeRoutes');
 const webhookRoutes = require('../webhookRoutes');
 const shopifyRoutes = require('../shopifyRoutes');
+const externalRoutes = require('../externalRoutes');
 
 // Secure all routes with the JWT check middleware
 // router.use(jwtCheck);
@@ -22,6 +23,7 @@ router.use('/custom-export', customExportRoutes);
 router.use('/recharge', rechargeRoutes);
 router.use('/webhooks', webhookRoutes);
 router.use('/shopify', shopifyRoutes);
+router.use('/external', externalRoutes);
 
 // Custom error handler for JWT authentication errors
 router.use((err, req, res, next) => {

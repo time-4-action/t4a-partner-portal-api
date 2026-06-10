@@ -176,8 +176,40 @@ async function listActiveSyncable() {
             {
                 status: 'active',
                 accessTokenEnc: { $ne: null },
-                'config.exportConfigId': { $ne: null },
-                shopifyLocationId: { $ne: null }
+                // Syncable when a scope source is selected: the legacy export-config field, a single
+                // `config.scope`, or a `config.scopes[]` array. Locations are validated per-scope at
+                // run time (a multi-source connection holds its locations per scope, not on the
+                // connection), so a missing connection-level `shopifyLocationId` no longer excludes it.
+                $or: [
+                    { 'config.exportConfigId': { $ne: null } },
+                    { 'config.scope.type': { $exists: true } },
+                    { 'config.scopes.0': { $exists: true } }
+                ]
+            },
+            { projection: { _id: 1, shopDomain: 1 } }
+        )
+        .toArray();
+}
+
+/**
+ * Lists active, sync-ready connections whose scope is a specific Own Source feed — used by the
+ * importer to fan the Shopify push out to every store consuming a feed after it re-imports.
+ * @param {string} feedId
+ * @returns {Promise<Array<{ _id: ObjectId, shopDomain: string }>>}
+ */
+async function listConnectionsForFeed(feedId) {
+    const db = getDb();
+    return db.collection(COLLECTION_NAME)
+        .find(
+            {
+                status: 'active',
+                accessTokenEnc: { $ne: null },
+                // Match the feed whether it's the single `config.scope` or one entry of a
+                // multi-source `config.scopes[]` array.
+                $or: [
+                    { 'config.scope.type': 'own_source', 'config.scope.feedId': feedId },
+                    { 'config.scopes': { $elemMatch: { type: 'own_source', feedId } } }
+                ]
             },
             { projection: { _id: 1, shopDomain: 1 } }
         )
@@ -214,7 +246,13 @@ async function updateConnectionConfig(id, patch) {
     const allowed = [
         'exportConfigId', 'pricelistPriority', 'priceVatMode', 'futureDatedGuard',
         'syncStock', 'syncNewProducts', 'syncPrices', 'syncDescriptions', 'syncImages', 'ownership',
-        'publicationIds'
+        'publicationIds',
+        // `scope` selects WHAT this connection pushes: { type:'export_config', exportConfigId }
+        // (default/back-compat) or { type:'own_source', feedId } (an external brand feed).
+        'scope',
+        // `scopes[]` is the multi-source form: several sources pushed to the SAME store at
+        // DIFFERENT locations — each { type, exportConfigId|feedId, locationId }.
+        'scopes'
     ];
     const set = { updatedAt: new Date() };
     if (patch.config) {
@@ -304,6 +342,26 @@ async function markUninstalledByShop(shopDomain) {
 }
 
 /**
+ * Clears the scope on any connection linked to a now-deleted Own Source feed, so it stops
+ * trying to push a feed that no longer exists. Returns the number of connections unlinked.
+ * @param {string} feedId
+ */
+async function unlinkFeedFromConnections(feedId) {
+    const db = getDb();
+    // Clear a legacy single scope pointing at the feed…
+    const single = await db.collection(COLLECTION_NAME).updateMany(
+        { 'config.scope.type': 'own_source', 'config.scope.feedId': feedId },
+        { $set: { 'config.scope': null, updatedAt: new Date() } }
+    );
+    // …and pull the feed out of any multi-source `config.scopes[]` array.
+    const multi = await db.collection(COLLECTION_NAME).updateMany(
+        { 'config.scopes': { $elemMatch: { type: 'own_source', feedId } } },
+        { $pull: { 'config.scopes': { type: 'own_source', feedId } }, $set: { updatedAt: new Date() } }
+    );
+    return (single.modifiedCount || 0) + (multi.modifiedCount || 0);
+}
+
+/**
  * Hard-deletes a connection (explicit user disconnect). Returns true if removed.
  */
 async function deleteConnection(id) {
@@ -353,10 +411,12 @@ module.exports = {
     getConnectionWithToken,
     listActiveSyncable,
     updateConnectionConfig,
+    listConnectionsForFeed,
     updateTokens,
     updateLastSync,
     setStatus,
     markUninstalledByShop,
+    unlinkFeedFromConnections,
     deleteConnection,
     ensureIndexes
 };
