@@ -324,14 +324,11 @@ exports.updateConfig = async (req, res) => {
         await loadOwned(req);
         const updated = await connectionService.updateConnectionConfig(req.params.id, req.body || {});
 
-        // Initial push (design §8.1): the first time a connection becomes sync-ready (a source +
-        // location chosen) and has never synced, kick off a sync so the partner doesn't have to
-        // click "Sync now" for the very first run. Fire-and-forget; SYNC_BUSY guards re-saves.
-        // A source is any of: legacy exportConfigId, a single `scope`, or a `scopes[]` array.
-        const hasSource = updated.config?.exportConfigId || updated.config?.scope || (updated.config?.scopes?.length > 0);
-        if (hasSource && updated.shopifyLocationId && !updated.lastSyncAt) {
-            syncService.startStockSync(updated._id, { trigger: 'initial' }).catch(() => {});
-        }
+        // NOTE: the automatic "initial push" on first sync-ready save is intentionally DISABLED.
+        // Saving the config never triggers a sync — the partner explicitly clicks "Sync now"
+        // (and the scheduled/PNV auto-triggers still run). To re-enable, restore the block that
+        // fired `startStockSync(updated._id, { trigger: 'initial' })` when the connection became
+        // sync-ready (has a source + shopifyLocationId) and had never synced (!lastSyncAt).
 
         res.json({ success: true, data: updated });
     } catch (error) {
