@@ -821,6 +821,86 @@ const deriveOptionValue = (v) => {
     return size || v.code || '';
 };
 
+/** Longest common prefix of a list of strings. */
+const _lcp = (arr) => {
+    if (!arr.length) return '';
+    let p = arr[0];
+    for (const s of arr) {
+        let i = 0;
+        while (i < p.length && i < s.length && p[i] === s[i]) i++;
+        p = p.slice(0, i);
+        if (!p) break;
+    }
+    return p;
+};
+
+/** Longest common suffix of a list of strings. */
+const _lcs = (arr) => {
+    if (!arr.length) return '';
+    let p = arr[0];
+    for (const s of arr) {
+        let i = 0;
+        while (i < p.length && i < s.length && p[p.length - 1 - i] === s[s.length - 1 - i]) i++;
+        p = i ? p.slice(p.length - i) : '';
+        if (!p) break;
+    }
+    return p;
+};
+
+/** Trims surrounding separators/whitespace so " - GBM" → "GBM", "(no fins)" → "no fins". */
+const _cleanLabel = (s) =>
+    s.replace(/\s+/g, ' ').trim().replace(/^[\s\-–—:|/(),.]+/, '').replace(/[\s\-–—:|/(),.]+$/, '').trim();
+
+/**
+ * For a group of variant names that share a size, returns the part of each name that
+ * actually differs — i.e. each name with the group's common prefix and suffix removed.
+ * `["Patrik T-Wave 72 l", "Patrik T-Wave 72 l - GBM"]` → `["", " - GBM"]`.
+ */
+function diffLabels(names) {
+    const pre = _lcp(names);
+    const mids = names.map((n) => n.slice(pre.length));
+    const suf = _lcs(mids);
+    return mids.map((m) => (suf ? m.slice(0, m.length - suf.length) : m));
+}
+
+/**
+ * Shopify rejects two variants of the same product that share an Option1 value
+ * ("The variant '68' already exists"). When several PNV variants resolve to the same size,
+ * this disambiguates them from the PRODUCT NAME: it appends whatever part of the name
+ * differs across the colliding variants — `72` / `72 GBM` for "Patrik T-Wave 72 l" vs
+ * "…72 l - GBM". When the names are identical too (nothing meaningful to a customer), it
+ * falls back to a plain positional counter — `68`, `68 (2)`.
+ *
+ * Returns a Map<sku, optionValue>. Non-colliding sizes are returned unchanged. Callers skip
+ * no-variant products (their single 'Default Title' can't collide).
+ */
+function resolveOptionValues(toCreate, skuOf) {
+    const groups = new Map(); // size -> [{ sku, name }]
+    for (const v of toCreate) {
+        const value = deriveOptionValue(v);
+        if (!groups.has(value)) groups.set(value, []);
+        groups.get(value).push({ sku: skuOf(v), name: (v.product_name || '').trim() });
+    }
+    const result = new Map();
+    const used = new Set(); // product-wide, so a disambiguated value never collides with another
+    for (const [value, group] of groups) {
+        if (group.length === 1) { result.set(group[0].sku, value); used.add(value); continue; }
+        const labels = diffLabels(group.map((g) => g.name)).map(_cleanLabel);
+        group.forEach((g, i) => {
+            const base = labels[i] ? `${value} ${labels[i]}` : value;
+            let cand = base, n = 1;
+            while (used.has(cand)) { n++; cand = `${base} (${n})`; }
+            used.add(cand);
+            result.set(g.sku, cand);
+        });
+    }
+    return result;
+}
+
+/** Final Option1 value for a variant being created — disambiguated via {@link resolveOptionValues}. */
+const optionValueFor = (plan, v) =>
+    plan.isNoVariant ? 'Default Title' : (plan.optionValueBySku.get(plan.skuOf(v)) || deriveOptionValue(v));
+
 /**
  * Builds a `ProductVariantsBulkInput` for a to-be-created variant: SKU + barcode + resolved
  * price + the Option1 value, and the starting inventory at the connection's location
@@ -831,7 +911,7 @@ function buildCreateVariantInput(plan, v, locationId, pricelistPriority, vatMode
     const sku = plan.skuOf(v);
     const price = resolvePushPrice(v, pricelistPriority, vatMode, futureGuard, nowMs) || '0.00';
     const optionName = plan.isNoVariant ? 'Title' : variantOptionName;
-    const optionValue = plan.isNoVariant ? 'Default Title' : deriveOptionValue(v);
+    const optionValue = optionValueFor(plan, v);
     return {
         optionValues: [{ name: optionValue, optionName }],
         price,
@@ -855,7 +935,7 @@ function buildProductSetInput(plan, exportConfig, locationId, pricelistPriority,
         const sku = plan.skuOf(v);
         const price = resolvePushPrice(v, pricelistPriority, vatMode, futureGuard, nowMs) || '0.00';
         const optionName = plan.isNoVariant ? 'Title' : variantOptionName;
-        const optionValue = plan.isNoVariant ? 'Default Title' : deriveOptionValue(v);
+        const optionValue = optionValueFor(plan, v);
         const vImg = (v.images && v.images[0]) || null;
         if (vImg) variantImageUrls.push(vImg);
         const vin = {
@@ -889,7 +969,8 @@ function buildProductSetInput(plan, exportConfig, locationId, pricelistPriority,
     // default variant of a no-variant product → Title / Default Title).
     input.productOptions = plan.isNoVariant
         ? [{ name: 'Title', values: [{ name: 'Default Title' }] }]
-        : [{ name: variantOptionName, values: [...new Set(plan.toCreate.map(deriveOptionValue).filter(Boolean))].map((name) => ({ name })) }];
+        // Values must match each variant's (disambiguated) optionValue exactly, or productSet rejects it.
+        : [{ name: variantOptionName, values: [...new Set(variants.map((vin) => vin.optionValues[0].name).filter(Boolean))].map((name) => ({ name })) }];
     if (allFiles.length) input.files = allFiles;
     return input;
 }
@@ -961,7 +1042,9 @@ async function pushNewProducts({ connection, token, scopedProducts, unmatched, m
             const info = matchInfoBySku.get(skuOf(v));
             if (info?.shopifyProductId) { existingProductId = info.shopifyProductId; break; }
         }
-        plans.push({ product, isNoVariant, variantList, toCreate, existingProductId, skuOf });
+        // Disambiguate variants that would share an Option1 value (Shopify rejects duplicates).
+        const optionValueBySku = isNoVariant ? new Map() : resolveOptionValues(toCreate, skuOf);
+        plans.push({ product, isNoVariant, variantList, toCreate, existingProductId, skuOf, optionValueBySku });
     }
     if (!plans.length) return [];
 
