@@ -267,7 +267,7 @@ async function updateConnectionConfig(id, patch) {
         { $set: set },
         { returnDocument: 'after' }
     );
-    const updated = result.value || result; // driver compat
+    const updated = result; // driver v6+: the doc itself (or null), no {value} wrapper
     if (!updated) {
         const error = new Error('Connection not found');
         error.code = 'NOT_FOUND';

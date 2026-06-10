@@ -239,10 +239,11 @@ async function updateSource(feedId, patch = {}) {
         set.nextRunAt = computeNextRunAt(merged, Date.now());
     }
 
+    // Driver v6+: findOneAndUpdate returns the document itself (or null), no {value} wrapper.
     const res = await db.collection(COLLECTION_NAME).findOneAndUpdate(
         { feedId }, { $set: set }, { returnDocument: 'after' }
     );
-    return toPublic(res.value || res);
+    return res ? toPublic(res) : null;
 }
 
 /** Builds a dotted `$set` patch for a nested object (`{a:1}` → `{'k.a':1}`). */
@@ -308,7 +309,8 @@ async function claimDueSource(nowMs, instanceId, lockMs) {
         { $set: { lockedUntil: new Date(nowMs + lockMs), runningBy: instanceId } },
         { sort: { nextRunAt: 1 }, returnDocument: 'after' }
     );
-    return res.value || res;
+    // Driver v6+: the claimed doc itself, or null when nothing is due — no {value} wrapper.
+    return res;
 }
 
 const RUNS_COLLECTION = 'external_import_runs';
