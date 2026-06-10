@@ -1,74 +1,90 @@
-const { GoogleGenerativeAI, SchemaType } = require('@google/generative-ai');
+const Anthropic = require('@anthropic-ai/sdk');
 const { getDb } = require('../db/mongo.service');
 const { ObjectId } = require('mongodb');
 const { logAiUsage } = require('./analytics.service');
 
-const API_KEY = process.env.GOOGLE_API_KEY;
+const API_KEY = process.env.ANTHROPIC_API_KEY;
 if (!API_KEY) {
-    throw new Error('GOOGLE_API_KEY must be set in environment variables.');
+    throw new Error('ANTHROPIC_API_KEY must be set in environment variables.');
 }
-const genAI = new GoogleGenerativeAI(API_KEY);
+const anthropic = new Anthropic({ apiKey: API_KEY });
 
-const MODEL_NAME = 'gemini-2.5-flash';
+const MODEL_NAME = 'claude-haiku-4-5';
 const BATCH_SIZE = 30;
 
+// Structured-outputs JSON schema (output_config.format) — the response is guaranteed to parse
+// against this. `additionalProperties: false` is required on every object by the API.
 const responseSchema = {
-    type: SchemaType.OBJECT,
+    type: 'object',
     properties: {
         results: {
-            type: SchemaType.ARRAY,
+            type: 'array',
             items: {
-                type: SchemaType.OBJECT,
+                type: 'object',
                 properties: {
-                    code: { type: SchemaType.STRING },
-                    catId: { type: SchemaType.STRING }
+                    code: { type: 'string' },
+                    catId: { type: 'string' }
                 },
-                required: ["code", "catId"]
+                required: ['code', 'catId'],
+                additionalProperties: false
             }
         }
     },
-    required: ["results"]
+    required: ['results'],
+    additionalProperties: false
 };
 
 /**
- * Processes a batch of products to identify their categories using the Generative AI model.
+ * Processes a batch of products to identify their categories using Claude (Haiku).
  * @param {Array<Object>} products - The batch of products to categorize.
- * @param {Array<{id: number, label: string}>} validCategories - The list of valid categories for the AI to choose from.
+ * @param {Array<{id: string, label: string}>} validCategories - The list of valid categories for the AI to choose from.
  * @param {string} exportId - The identifier for the category export (e.g., 'tris').
- * @returns {Promise<Array<{code: string, catId: number}>>} A promise that resolves with the categorized results.
+ * @returns {Promise<Array<{code: string, catId: string}>>} A promise that resolves with the categorized results.
  */
 async function processBatch(products, validCategories, exportId) {
     try {
-        const model = genAI.getGenerativeModel({
+        const system = `You are a Product Mapping Assistant.
+You will be given a list of products. Some products may have a 'child_products' array which represent product variants.
+Use the information in 'child_products' to get more context about the parent product, but ONLY return a category for the parent product.
+Do NOT categorize items inside the 'child_products' array.
+Map each parent product to the most specific and correct category ID from this list: ${JSON.stringify(validCategories)}.
+If you are unsure, use the ID for "Ostalo" or a similar general category if available.`;
+
+        const message = await anthropic.messages.create({
             model: MODEL_NAME,
-            systemInstruction: `You are a Product Mapping Assistant. 
-            You will be given a list of products. Some products may have a 'child_products' array which represent product variants.
-            Use the information in 'child_products' to get more context about the parent product, but ONLY return a category for the parent product.
-            Do NOT categorize items inside the 'child_products' array.
-            Map each parent product to the most specific and correct category ID from this list: ${JSON.stringify(validCategories)}. 
-            If you are unsure, use the ID for "Ostalo" or a similar general category if available.`,
-            generationConfig: {
-                responseMimeType: "application/json",
-                responseSchema: responseSchema,
-            },
+            max_tokens: 8192,
+            // The system prompt (incl. the category list) is identical across all batches of a
+            // run — cache it so every batch after the first reads it at ~0.1× input price.
+            system: [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }],
+            output_config: { format: { type: 'json_schema', schema: responseSchema } },
+            messages: [{ role: 'user', content: `Categorize these products: ${JSON.stringify(products)}` }]
         });
 
-        const inputData = [...products];
-        const prompt = `Categorize these products: ${JSON.stringify(inputData)}`;
+        // Log AI usage analytics (mapped to the shape `logAiUsage`/the aiAnalytics collection expects).
+        const u = message.usage || {};
+        const inputTokens = (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0) + (u.cache_read_input_tokens || 0);
+        logAiUsage(exportId, {
+            promptTokenCount: inputTokens,
+            candidatesTokenCount: u.output_tokens || 0,
+            totalTokenCount: inputTokens + (u.output_tokens || 0)
+        }, MODEL_NAME);
 
-        const result = await model.generateContent(prompt);
+        if (message.stop_reason === 'refusal') {
+            console.error('Batch Error: model refused the request.');
+            return [];
+        }
+        if (message.stop_reason === 'max_tokens') {
+            console.warn('Batch warning: output truncated at max_tokens — results may be incomplete.');
+        }
 
-        // Log AI usage analytics
-        logAiUsage(exportId, result.response.usageMetadata, MODEL_NAME);
-
-        const jsonResponse = JSON.parse(result.response.text());
+        const text = message.content.find((b) => b.type === 'text')?.text || '{}';
+        const jsonResponse = JSON.parse(text);
         return jsonResponse.results || [];
 
     } catch (error) {
         console.error('Batch Error:', error.message);
-        // Log the full error for more details in case of API issues
-        if (error.response) {
-            console.error('API Response:', JSON.stringify(error.response.data, null, 2));
+        if (error instanceof Anthropic.APIError) {
+            console.error(`Anthropic API error ${error.status} (${error.type || 'unknown'})`);
         }
         return [];
     }

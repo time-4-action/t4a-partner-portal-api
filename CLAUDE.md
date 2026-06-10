@@ -57,7 +57,7 @@ Triggered by `POST /api/export/webhooks/sync/pnv`. Responds `202` immediately an
 
 ### AI categorization
 
-Triggered by `POST /api/export/webhooks/sync/ai-categorization`. Uses Google Gemini (`@google/generative-ai`) to assign categories to uncategorized products. Categories are stored as an `ai_categories` array on each product document, keyed by `exportId`.
+Triggered by `POST /api/export/webhooks/sync/ai-categorization`. Uses Anthropic Claude (`@anthropic-ai/sdk`, model `claude-haiku-4-5`, structured outputs) to assign categories to uncategorized products. Categories are stored as an `ai_categories` array on each product document, keyed by `exportId`.
 
 ### Custom exports (`src/services/customExport.service.js`)
 
@@ -101,6 +101,6 @@ When picking this up, start from `shopify_integration.md` — its §0 status che
 
 ## Environment variables
 
-See README.md for the full table. Key variables: `MONGO_URI`, `MONGO_DB_NAME`, `PNV_BASE_URL`, `PNV_EXPORT_PRODUCTS_URL`, `PNV_USER`, `PNV_PASS`, `PNV_GROUP`, `PNV_USER_ID`, `METAKOCKA_ID`, `METAKOCKA_KEY`, `GOOGLE_API_KEY`, `WEBHOOK_API_KEY`.
+See README.md for the full table. Key variables: `MONGO_URI`, `MONGO_DB_NAME`, `PNV_BASE_URL`, `PNV_EXPORT_PRODUCTS_URL`, `PNV_USER`, `PNV_PASS`, `PNV_GROUP`, `PNV_USER_ID`, `METAKOCKA_ID`, `METAKOCKA_KEY`, `ANTHROPIC_API_KEY`, `WEBHOOK_API_KEY`.
 
 `.env` files are loaded from `DATA_PATH` if set (Docker mounts `/data`), otherwise from the project root.

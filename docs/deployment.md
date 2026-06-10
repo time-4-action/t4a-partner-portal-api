@@ -20,7 +20,7 @@
 | `METAKOCKA_ID` | Yes | -- | Metakocka account ID |
 | `METAKOCKA_KEY` | Yes | -- | Metakocka API key |
 | **AI** | | | |
-| `GOOGLE_API_KEY` | No | -- | Google Gemini API key (required for AI categorization) |
+| `ANTHROPIC_API_KEY` | Yes | -- | Anthropic API key (AI categorization via Claude; required at startup) |
 | **Database** | | | |
 | `MONGO_URI` | Yes | -- | MongoDB connection string |
 | `MONGO_DB_NAME` | Yes | -- | MongoDB database name |
@@ -99,7 +99,7 @@ These build the image as `etiamsi/t4a-export-api` and push to the registry.
 - [ ] Verify PNV and Metakocka connectivity via the [health endpoint](api/health.md)
 - [ ] Set up n8n webhook workflows for scheduled syncs
 - [ ] (Optional) Configure Auth0 for JWT authentication
-- [ ] (Optional) Set `GOOGLE_API_KEY` for AI categorization
+- [ ] Set `ANTHROPIC_API_KEY` for AI categorization (Claude)
 
 ---
 
