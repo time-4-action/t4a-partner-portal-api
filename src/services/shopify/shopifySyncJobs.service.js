@@ -59,7 +59,7 @@ async function startRun(connectionId, shopDomain, { type = 'inventory', trigger 
  * @param {ObjectId|string} jobId
  * @param {{ status:string, counts?:Object, unmatched?:Array, errors?:Array, error?:string|null }} result
  */
-async function finishRun(jobId, { status, counts, unmatched, errors, error }) {
+async function finishRun(jobId, { status, counts, unmatched, errors, scopes, error }) {
     const now = new Date();
     await getDb().collection(COLLECTION_NAME).updateOne(
         { _id: toObjectId(jobId) },
@@ -69,6 +69,8 @@ async function finishRun(jobId, { status, counts, unmatched, errors, error }) {
                 counts: { ...EMPTY_COUNTS, ...(counts || {}) },
                 unmatched: unmatched || [],
                 errors: errors || [],
+                // What ran where: [{ type, source, locationId, ownership, products }] per scope.
+                scopes: scopes || [],
                 error: error || null,
                 finishedAt: now,
                 updatedAt: now

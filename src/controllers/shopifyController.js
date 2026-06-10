@@ -30,10 +30,22 @@ const ERROR_STATUS_MAP = {
 };
 
 /**
- * A run does several things at once (stock + create + content + images). Pick the most
- * salient label for the activity "Type" column instead of always showing "Inventory".
+ * The activity "Type" column shows HOW the run pushed — the ownership mode of its source(s):
+ * Stock only / Create + handoff / Portal authoritative, or "Mixed" when a multi-source run
+ * combined different modes. Falls back to the old what-it-did label for legacy runs recorded
+ * before per-scope summaries existed.
  */
-function runTypeLabel(c) {
+const OWNERSHIP_TYPE_LABEL = {
+    stock_only: 'Stock',
+    create_then_handoff: 'Create + handoff',
+    portal_authoritative: 'Portal authoritative'
+};
+
+function runTypeLabel(job) {
+    const owns = [...new Set((job.scopes || []).map((s) => s.ownership).filter(Boolean))];
+    if (owns.length > 1) return 'Mixed';
+    if (owns.length === 1) return OWNERSHIP_TYPE_LABEL[owns[0]] || owns[0];
+    const c = job.counts || {};
     if (c.createdProducts) return 'Create';
     if (c.imagesPushed || c.variantImagesLinked) return 'Images';
     if (c.pricesPushed || c.contentPushed) return 'Content';
@@ -59,13 +71,20 @@ function toActivityRow(job) {
     const detail = bits.length ? bits.join(' · ') : (job.trigger || null);
     return {
         id: job._id.toString(),
-        type: runTypeLabel(c),
+        type: runTypeLabel(job),
         status: job.status,
         attempts: job.attempts || 1,
         time: (job.finishedAt || job.startedAt || job.createdAt)?.toISOString?.() || null,
         label,
         detail,
-        trigger: job.trigger
+        trigger: job.trigger,
+        // Full per-run data for the UI's run-detail modal (the row fields above stay compact).
+        startedAt: job.startedAt?.toISOString?.() || null,
+        finishedAt: job.finishedAt?.toISOString?.() || null,
+        counts: c,
+        scopes: job.scopes || [],
+        error: job.error || null,
+        errors: (job.errors || []).slice(0, 100)
     };
 }
 
@@ -320,8 +339,10 @@ exports.sync = async (req, res) => {
 exports.activity = async (req, res) => {
     try {
         const connection = await loadOwned(req);
+        // The panel shows a short window; the "view all" modal asks for more via ?limit=.
+        const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 100);
         const [runs, stateCounts, latest] = await Promise.all([
-            syncJobs.listRecentRuns(connection._id, 20),
+            syncJobs.listRecentRuns(connection._id, limit),
             productMap.getStateCounts(connection._id),
             syncJobs.getLatestRun(connection._id)
         ]);

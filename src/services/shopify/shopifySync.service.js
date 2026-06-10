@@ -1183,6 +1183,9 @@ async function executeRun(connection, job, token) {
     const counts = { ...syncJobs.EMPTY_COUNTS };
     const unmatched = [];
     const errors = [];
+    // Per-source summary recorded on the run (the activity detail shows what ran where, and the
+    // run "type" is derived from the ownership mode(s) involved).
+    const scopes = [];
     // SKUs whose Shopify target was deleted — their map rows are dropped at the end of the run
     // so the next sync re-matches them instead of pushing to a dead id.
     const staleSkus = new Set();
@@ -1225,15 +1228,28 @@ async function executeRun(connection, job, token) {
 
         counts.inScope = targets.reduce((n, t) => n + t.items.length, 0);
 
+        for (const t of targets) {
+            scopes.push({
+                type: t.type || 'export_config',
+                // Own-source products carry their brand as `vendor`; Patrik scopes name their export.
+                source: t.type === 'own_source'
+                    ? (t.scopedProducts[0]?.vendor || t.feedId)
+                    : (t.exportConfig?.name || 'Export'),
+                locationId: t.locationId,
+                ownership: resolveScopeConfig(connection, t).ownership || 'stock_only',
+                products: t.items.length
+            });
+        }
+
         if (!targets.length) {
             // Every scope was misconfigured — finish as failed with the per-scope errors.
-            await syncJobs.finishRun(job._id, { status: 'failed', counts, unmatched, errors, error: errors[0]?.error });
+            await syncJobs.finishRun(job._id, { status: 'failed', counts, unmatched, errors, scopes, error: errors[0]?.error });
             await connectionService.updateLastSync(connection._id, { lastSyncStatus: 'failed' });
             return;
         }
         if (counts.inScope === 0) {
             const status = errors.length ? 'partial' : 'done';
-            await syncJobs.finishRun(job._id, { status, counts, unmatched, errors });
+            await syncJobs.finishRun(job._id, { status, counts, unmatched, errors, scopes });
             await connectionService.updateLastSync(connection._id, { lastSyncStatus: errors.length ? 'failed' : 'done' });
             return;
         }
@@ -1289,7 +1305,7 @@ async function executeRun(connection, job, token) {
 
         counts.unmatched = unmatched.length;
         const status = counts.failed || counts.unmatched ? 'partial' : 'done';
-        await syncJobs.finishRun(job._id, { status, counts, unmatched, errors });
+        await syncJobs.finishRun(job._id, { status, counts, unmatched, errors, scopes });
         await connectionService.updateLastSync(connection._id, {
             lastSyncStatus: counts.failed ? 'failed' : 'done'
         });
@@ -1300,6 +1316,7 @@ async function executeRun(connection, job, token) {
             counts,
             unmatched,
             errors,
+            scopes,
             error: err.message
         });
         await connectionService.updateLastSync(connection._id, { lastSyncStatus: 'failed' });
