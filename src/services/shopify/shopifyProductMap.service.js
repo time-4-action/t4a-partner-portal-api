@@ -152,6 +152,60 @@ async function deleteForConnection(connectionId) {
 }
 
 /**
+ * Tombstones map rows for products that were DELETED in the store but belong to a
+ * `create_then_handoff` source — the merchant chose to remove the listing, so we must NOT
+ * silently recreate it on the next sync (that would undo the "handoff"). The row is kept (not
+ * dropped) with `state: 'deleted_in_store'` so the sync engine skips it for push/match/create and
+ * the UI can surface it as a warning with a "Recreate on next sync" action. `recreateRequested`
+ * is reset to false — a fresh deletion is never auto-flagged for recreation.
+ * @param {ObjectId|string} connectionId
+ * @param {string[]} skus
+ * @returns {Promise<number>} rows tombstoned
+ */
+async function markDeletedInStore(connectionId, skus) {
+    if (!skus.length) return 0;
+    const now = new Date();
+    const result = await getDb().collection(COLLECTION_NAME).updateMany(
+        { connectionId: toObjectId(connectionId), sku: { $in: skus } },
+        { $set: { state: 'deleted_in_store', deletedInStoreAt: now, recreateRequested: false, updatedAt: now } }
+    );
+    return result.modifiedCount || 0;
+}
+
+/**
+ * Sets (or clears) the recreate flag on tombstoned rows (whole parent products). The partner
+ * clicks "Recreate on next sync" on a removed-in-store product (`requested = true`); the next run
+ * drops the flagged rows so they flow back through the normal create path. Passing
+ * `requested = false` is the undo — it leaves the product tombstoned (still a warning) but cancels
+ * the queued recreation. Only rows already in the `deleted_in_store` state are touched.
+ * @param {ObjectId|string} connectionId
+ * @param {string[]} parentCodes
+ * @param {boolean} [requested=true] - true to queue recreation, false to cancel a queued one
+ * @returns {Promise<number>} rows changed
+ */
+async function requestRecreate(connectionId, parentCodes, requested = true) {
+    if (!parentCodes.length) return 0;
+    const result = await getDb().collection(COLLECTION_NAME).updateMany(
+        { connectionId: toObjectId(connectionId), parentCode: { $in: parentCodes }, state: 'deleted_in_store' },
+        { $set: { recreateRequested: requested, updatedAt: new Date() } }
+    );
+    return result.modifiedCount || 0;
+}
+
+/**
+ * Lists tombstoned (deleted-in-store) rows for a connection so the UI can warn the partner that
+ * a handed-off product was removed in Shopify and offer to recreate it.
+ * @param {ObjectId|string} connectionId
+ * @returns {Promise<Array<Object>>} the raw tombstone rows
+ */
+async function getDeletedInStore(connectionId) {
+    return getDb()
+        .collection(COLLECTION_NAME)
+        .find({ connectionId: toObjectId(connectionId), state: 'deleted_in_store' })
+        .toArray();
+}
+
+/**
  * Removes specific SKUs' map rows for a connection. Used to drop **stale** mappings when a
  * push reports the Shopify variant/inventory item no longer exists (the merchant deleted the
  * product). Dropping the row makes the SKU unmapped again, so the next sync re-matches it
@@ -176,6 +230,9 @@ module.exports = {
     bulkSetState,
     bulkSetHashes,
     getStateCounts,
+    markDeletedInStore,
+    requestRecreate,
+    getDeletedInStore,
     deleteForConnection,
     deleteBySkus
 };
