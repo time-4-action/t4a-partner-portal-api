@@ -95,7 +95,13 @@ const PRODUCT_SET_MUTATION = `mutation ProductSet($input: ProductSetInput!, $syn
 
 // Phase D — image sync. productCreateMedia is deprecated on 2026-04; the supported path is
 // productUpdate with a `media` arg (adds media, processed asynchronously by Shopify).
-const PRODUCT_MEDIA_QUERY = `query ProductMedia($id: ID!) { product(id: $id) { media(first: 100) { nodes { id alt } } } }`;
+// The query also pulls media `status` (a FAILED node must not count as "present") and each
+// variant's linked media — deleting a product image in Shopify silently drops its variant
+// link too, so the reconcile has to restore both.
+const PRODUCT_MEDIA_QUERY = `query ProductMedia($id: ID!) { product(id: $id) {
+  media(first: 100) { nodes { id alt status } }
+  variants(first: 100) { nodes { id sku media(first: 10) { nodes { id alt } } } }
+} }`;
 
 const PRODUCT_UPDATE_MEDIA_MUTATION = `mutation ProductUpdateMedia($product: ProductUpdateInput!, $media: [CreateMediaInput!]) {
   productUpdate(product: $product, media: $media) {
@@ -104,7 +110,43 @@ const PRODUCT_UPDATE_MEDIA_MUTATION = `mutation ProductUpdateMedia($product: Pro
   }
 }`;
 
+// Variant images: links existing product media to a variant / removes a stale link. The media
+// must be READY — freshly-added media is processed asynchronously, so the caller polls first.
+const VARIANT_APPEND_MEDIA_MUTATION = `mutation VariantAppendMedia($productId: ID!, $variantMedia: [ProductVariantAppendMediaInput!]!) {
+  productVariantAppendMedia(productId: $productId, variantMedia: $variantMedia) {
+    productVariants { id }
+    userErrors { field message }
+  }
+}`;
+
+const VARIANT_DETACH_MEDIA_MUTATION = `mutation VariantDetachMedia($productId: ID!, $variantMedia: [ProductVariantDetachMediaInput!]!) {
+  productVariantDetachMedia(productId: $productId, variantMedia: $variantMedia) {
+    productVariants { id }
+    userErrors { field message }
+  }
+}`;
+
+// Restores the gallery order (zero-based positions; evaluated in order). Async job Shopify-side.
+const PRODUCT_REORDER_MEDIA_MUTATION = `mutation ProductReorderMedia($id: ID!, $moves: [MoveInput!]!) {
+  productReorderMedia(id: $id, moves: $moves) {
+    job { id }
+    mediaUserErrors { field message }
+  }
+}`;
+
+// Removes media stuck in FAILED (source URL not downloadable etc.) — a failed node still
+// carries our alt, so left in place it would mask the image as "present" forever.
+// (productDeleteMedia is deprecated in favour of fileDelete, but that needs the write_files
+// scope the app doesn't request; this form still validates on 2026-04.)
+const PRODUCT_DELETE_MEDIA_MUTATION = `mutation ProductDeleteMedia($productId: ID!, $mediaIds: [ID!]!) {
+  productDeleteMedia(productId: $productId, mediaIds: $mediaIds) {
+    deletedMediaIds
+    mediaUserErrors { field message }
+  }
+}`;
+
 const sha1 = (s) => crypto.createHash('sha1').update(String(s)).digest('hex');
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const chunk = (arr, size) => {
     const out = [];
     for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
@@ -403,6 +445,90 @@ async function pushPortalAuthoritative({ connection, token, scopedProducts, matc
     }
 }
 
+/** First non-FAILED media node per alt URL (the alts we stamp are the source URLs). */
+const mediaIndexByAlt = (prod) => {
+    const byAlt = new Map();
+    for (const n of prod?.media?.nodes || []) {
+        if (n.alt && n.status !== 'FAILED' && !byAlt.has(n.alt)) byAlt.set(n.alt, n);
+    }
+    return byAlt;
+};
+
+/**
+ * Re-fetches the product until freshly-added media has finished Shopify-side processing
+ * (linking and reliable reordering both need settled media). Bounded poll — anything still
+ * processing after it is picked up on the next sync (authoritative re-checks every run).
+ */
+async function settleMedia({ shop, token, op, firstLoad, addedNow, desired }) {
+    let prod = firstLoad;
+    const refetch = async () => (await graphqlRequest(shop, token, PRODUCT_MEDIA_QUERY, { id: op.productId }))?.product;
+    const pending = () => (prod?.media?.nodes || []).some(
+        (n) => n.alt && desired.has(n.alt) && n.status !== 'READY' && n.status !== 'FAILED'
+    );
+    if (addedNow) { await sleep(1500); prod = await refetch(); }
+    for (let i = 0; i < 5 && pending(); i++) { await sleep(2000); prod = await refetch(); }
+    return prod || firstLoad;
+}
+
+/**
+ * portal_authoritative only: the gallery ORDER is managed too. A re-added image lands at the
+ * END of the gallery (and merchants can drag-sort), so whenever our media's order drifts from
+ * the catalogue's image order it is restored — our media moves to the front in catalogue
+ * order; merchant-added media keeps its relative order after it. Fires only on actual drift
+ * (the reorder is an async Shopify job).
+ */
+async function reorderGallery({ shop, token, op, prod, counts, errors }) {
+    const byAlt = mediaIndexByAlt(prod);
+    const desiredIds = op.images.map((url) => byAlt.get(url)?.id).filter(Boolean);
+    const currentIds = (prod?.media?.nodes || []).map((n) => n.id);
+    if (desiredIds.every((id, i) => currentIds[i] === id)) return; // already in order
+    const moves = desiredIds.map((id, i) => ({ id, newPosition: String(i) }));
+    const data = await graphqlRequest(shop, token, PRODUCT_REORDER_MEDIA_MUTATION, { id: op.productId, moves });
+    const ue = data?.productReorderMedia?.mediaUserErrors || [];
+    if (ue.length) { counts.failed += 1; errors.push({ parentCode: op.parentCode, error: `image order: ${ue.map((e) => e.message).join('; ')}` }); }
+}
+
+/**
+ * (Re)links each variant to its own image (`variant.images[0]`), matched by media alt. Runs
+ * after the gallery reconcile because both halves of the same problem end here: a media
+ * deleted in Shopify takes its variant link down with it (the re-added copy is a NEW media
+ * id), and media pushed onto an already-existing matched product lands in the gallery only,
+ * never linked to a variant. An append is paired with a detach of any OTHER portal-managed
+ * media still linked to that variant (so the right image shows); merchant-added variant media
+ * is never touched. Takes the settled product from {@link settleMedia} (media must be READY).
+ */
+async function linkVariantImages({ shop, token, op, prod, desired, counts, errors }) {
+    const wants = (op.variantWants || []).filter((w) => desired.has(w.url));
+    if (!wants.length) return;
+
+    const byAlt = mediaIndexByAlt(prod);
+    const variantsBySku = new Map((prod?.variants?.nodes || []).map((v) => [v.sku, v]));
+    const appends = [];
+    const detaches = [];
+    for (const w of wants) {
+        const variant = variantsBySku.get(w.sku);
+        const media = byAlt.get(w.url);
+        if (!variant || !media || media.status !== 'READY') continue; // not linkable this run
+        const linked = variant.media?.nodes || [];
+        if (linked.some((m) => m.id === media.id)) continue; // already correct
+        const stale = linked.filter((m) => m.alt && desired.has(m.alt)).map((m) => m.id);
+        if (stale.length) detaches.push({ variantId: variant.id, mediaIds: stale });
+        appends.push({ variantId: variant.id, mediaIds: [media.id] });
+    }
+
+    if (detaches.length) {
+        const d = await graphqlRequest(shop, token, VARIANT_DETACH_MEDIA_MUTATION, { productId: op.productId, variantMedia: detaches });
+        const ue = d?.productVariantDetachMedia?.userErrors || [];
+        if (ue.length) { counts.failed += 1; errors.push({ parentCode: op.parentCode, error: `variant images (detach): ${ue.map((e) => e.message).join('; ')}` }); return; }
+    }
+    if (appends.length) {
+        const a = await graphqlRequest(shop, token, VARIANT_APPEND_MEDIA_MUTATION, { productId: op.productId, variantMedia: appends });
+        const ue = a?.productVariantAppendMedia?.userErrors || [];
+        if (ue.length) { counts.failed += 1; errors.push({ parentCode: op.parentCode, error: `variant images: ${ue.map((e) => e.message).join('; ')}` }); return; }
+        counts.variantImagesLinked += appends.length;
+    }
+}
+
 /**
  * Image sync (Phase D) — pushes the parent gallery + variant images for matched products.
  *
@@ -412,9 +538,12 @@ async function pushPortalAuthoritative({ connection, token, scopedProducts, matc
  *   - `authoritative` (portal_authoritative): the portal OWNS the images. Each sync it compares
  *     our desired set to the media currently present (by alt) and **re-adds any that are
  *     missing** — whether one image was deleted or all of them — without duplicating the ones
- *     still there. New catalogue images are added too.
+ *     still there. New catalogue images are added too. Media stuck in FAILED is dropped first
+ *     (a failed node still carries our alt and would mask the image as "present" forever).
+ *     Each variant is then (re)linked to its own image ({@link linkVariantImages}).
  *   - non-authoritative (create_then_handoff): media-less guard — only fill products that have
- *     NO media (the ones we created), never re-touch existing/partner media.
+ *     NO media (the ones we created), never re-touch existing/partner media. Variants are
+ *     linked once, at that fill.
  *
  * Mutates `counts`/`errors`, marks stale targets.
  */
@@ -445,15 +574,30 @@ async function pushImages({ connection, token, scopedProducts, matchInfoBySku, e
         // Non-authoritative: once handled (imageHash matches), skip — don't even re-query.
         // Authoritative: always check, to catch images deleted in Shopify since last sync.
         if (!authoritative && existingMap.get(firstSku)?.imageHash === imageHash) continue;
-        imageOps.push({ parentCode: product.code, productId, images, skus: matched.map((m) => m.sku), imageHash });
+        // Each variant's own image (its first), for the variant-link pass.
+        const variantWants = variants
+            .map((v) => ({ sku: v.code || '', url: (v.images || [])[0] || null }))
+            .filter((w) => w.sku && w.url && matchInfoBySku.get(w.sku)?.shopifyProductId);
+        imageOps.push({ parentCode: product.code, productId, images, skus: matched.map((m) => m.sku), imageHash, variantWants });
     }
     if (!imageOps.length) return;
 
     const hashUpdates = [];
     await queue.mapWithConcurrency(imageOps, async (op) => {
         try {
-            const cur = await graphqlRequest(shop, token, PRODUCT_MEDIA_QUERY, { id: op.productId });
-            const nodes = cur?.product?.media?.nodes || [];
+            const desired = new Set(op.images);
+            const firstLoad = (await graphqlRequest(shop, token, PRODUCT_MEDIA_QUERY, { id: op.productId }))?.product;
+            let nodes = firstLoad?.media?.nodes || [];
+
+            // Drop FAILED nodes carrying one of our alts so the image can be re-attempted.
+            const failedNodes = nodes.filter((n) => n.status === 'FAILED' && desired.has(n.alt));
+            if (failedNodes.length) {
+                await graphqlRequest(shop, token, PRODUCT_DELETE_MEDIA_MUTATION, {
+                    productId: op.productId, mediaIds: failedNodes.map((n) => n.id)
+                }).catch(() => {});
+                nodes = nodes.filter((n) => !failedNodes.includes(n));
+            }
+
             // Which of our images are already on the product (matched by the alt we stamped).
             const presentUrls = new Set(nodes.map((n) => n.alt).filter(Boolean));
 
@@ -475,6 +619,17 @@ async function pushImages({ connection, token, scopedProducts, matchInfoBySku, e
                 if (ue.length) { counts.failed += 1; errors.push({ parentCode: op.parentCode, error: `images: ${msg}` }); return; }
                 counts.imagesPushed += toAdd.length;
             }
+
+            // Gallery order + variant-image links: authoritative reconciles every run; handoff
+            // only at its one-time fill (so created/filled products still get variant images).
+            if (authoritative || toAdd.length) {
+                const settled = await settleMedia({ shop, token, op, firstLoad, addedNow: toAdd.length > 0, desired });
+                // Order is managed in portal_authoritative — a re-added image lands at the END
+                // of the gallery, so restore the catalogue order when it drifted.
+                if (authoritative) await reorderGallery({ shop, token, op, prod: settled, counts, errors });
+                await linkVariantImages({ shop, token, op, prod: settled, desired, counts, errors });
+            }
+
             for (const sku of op.skus) hashUpdates.push({ sku, imageHash: op.imageHash });
         } catch (e) {
             if (isStaleError(e.message)) markStale(op.parentCode, op.skus);
