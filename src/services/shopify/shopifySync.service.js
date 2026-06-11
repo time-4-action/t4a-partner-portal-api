@@ -68,6 +68,24 @@ const PRODUCT_UPDATE_MUTATION = `mutation ProductUpdate($product: ProductUpdateI
   }
 }`;
 
+// Authoritative content drift check — pulls the CURRENT title/description/tags straight from the
+// store so a merchant's manual edit can be detected and overwritten. Batched via `nodes`.
+const PRODUCT_CONTENT_QUERY = `query ProductContent($ids: [ID!]!) {
+  nodes(ids: $ids) { ... on Product { id title descriptionHtml tags } }
+}`;
+
+// Authoritative price drift check — current Shopify variant prices, to catch a merchant editing a
+// price in-store. Batched via `nodes`.
+const VARIANT_PRICE_QUERY = `query VariantPrices($ids: [ID!]!) {
+  nodes(ids: $ids) { ... on ProductVariant { id price } }
+}`;
+
+// Authoritative publication drift check — which channels each product is CURRENTLY published on,
+// so a merchant publishing/unpublishing in-store is brought back to the managed selection.
+const PRODUCT_PUBLICATIONS_QUERY = `query ProductPublications($ids: [ID!]!) {
+  nodes(ids: $ids) { ... on Product { id resourcePublications(first: 50) { nodes { isPublished publication { id } } } } }
+}`;
+
 // Phase C addendum — variant option NAME reconcile. Reads the current Option1 of matched
 // products in bulk, then renames mismatches to the configured name via productOptionUpdate.
 const PRODUCT_OPTIONS_QUERY = `query ProductOptions($ids: [ID!]!) {
@@ -319,14 +337,82 @@ async function pushBatch(shop, token, locationId, jobId, batch) {
     return outcomes;
 }
 
+// Order-independent, whitespace-trimmed key for a tag list so reordered/identical tag sets
+// compare equal (Shopify returns tags alphabetised — a plain join would always "differ").
+function tagsKey(tags) {
+    return [...(tags || [])].map((t) => String(t).trim()).filter(Boolean).sort().join('');
+}
+
+// True when the LIVE store content diverges from what the portal wants to push — i.e. a merchant
+// edited the title/description/tags in Shopify (or the source changed and the store is stale).
+// descriptionHtml is trimmed before comparing (Shopify may re-serialise leading/trailing space).
+function contentDrifted(candidate, live) {
+    if (candidate.wantContent) {
+        if ((candidate.product.title || '') !== (live.title || '')) return true;
+        if ((candidate.product.descriptionHtml || '').trim() !== (live.descriptionHtml || '').trim()) return true;
+    }
+    if (candidate.wantTags && tagsKey(candidate.product.tags) !== tagsKey(live.tags)) return true;
+    return false;
+}
+
+// Batched fetch of current title/description/tags for the given product ids (200 per call).
+async function fetchLiveContent(shop, token, productIds) {
+    const out = new Map();
+    const ids = [...new Set(productIds.filter(Boolean))];
+    const CHUNK = 200;
+    for (let i = 0; i < ids.length; i += CHUNK) {
+        const data = await graphqlRequest(shop, token, PRODUCT_CONTENT_QUERY, { ids: ids.slice(i, i + CHUNK) });
+        for (const n of data?.nodes || []) {
+            if (n && n.id) out.set(n.id, { title: n.title || '', descriptionHtml: n.descriptionHtml || '', tags: n.tags || [] });
+        }
+    }
+    return out;
+}
+
+// Batched fetch of current variant prices (variantId → price string), for price drift detection.
+async function fetchLivePrices(shop, token, variantIds) {
+    const out = new Map();
+    const ids = [...new Set(variantIds.filter(Boolean))];
+    const CHUNK = 200;
+    for (let i = 0; i < ids.length; i += CHUNK) {
+        const data = await graphqlRequest(shop, token, VARIANT_PRICE_QUERY, { ids: ids.slice(i, i + CHUNK) });
+        for (const n of data?.nodes || []) {
+            if (n && n.id) out.set(n.id, n.price);
+        }
+    }
+    return out;
+}
+
+// Batched fetch of each product's CURRENTLY-published publication ids (productId → sorted id[]).
+async function fetchLivePublications(shop, token, productIds) {
+    const out = new Map();
+    const ids = [...new Set(productIds.filter(Boolean))];
+    const CHUNK = 200;
+    for (let i = 0; i < ids.length; i += CHUNK) {
+        const data = await graphqlRequest(shop, token, PRODUCT_PUBLICATIONS_QUERY, { ids: ids.slice(i, i + CHUNK) });
+        for (const n of data?.nodes || []) {
+            if (!n || !n.id) continue;
+            const pubIds = (n.resourcePublications?.nodes || [])
+                .filter((rp) => rp.isPublished && rp.publication?.id)
+                .map((rp) => rp.publication.id)
+                .sort();
+            out.set(n.id, pubIds);
+        }
+    }
+    return out;
+}
+
 /**
  * Phase C — pushes variant prices and product content for MATCHED products, in
  * `portal_authoritative` mode only. Per the ownership contract (design §9) the portal
  * overwrites the fields it manages (price, title, description, tags) on every sync.
  *
- * Delta-gated: a per-variant `priceHash` and a per-product `contentHash` (stored on the map
- * rows) let unchanged products skip the API call entirely. A failed product never blocks the
- * rest; failures are reported and the hash is NOT advanced, so the next run retries.
+ * Both prices and content are drift-gated against the LIVE store (not just a local source hash):
+ * the current Shopify variant prices and title/description/tags are fetched and a push happens
+ * whenever they differ from the portal's source — so a merchant editing a managed field in Shopify
+ * is overwritten on the next run (the whole point of authoritative mode). If a live fetch fails the
+ * step falls back to the old source-hash gate for that run. A failed product never blocks the rest;
+ * failures are reported and the hash is NOT advanced, so the next run retries.
  *
  * Mutates `counts` (pricesPushed / contentPushed / failed) and appends to `errors`.
  */
@@ -357,6 +443,8 @@ async function pushPortalAuthoritative({ connection, token, scopedProducts, matc
 
     const priceOps = []; // { parentCode, productId, variants:[{id,price}], hashes:[{sku,priceHash}] }
     const contentOps = []; // { parentCode, product:{id,title,descriptionHtml,tags}, skus:[], contentHash }
+    const priceCandidates = []; // every price-managed variant; filtered to priceOps by live drift
+    const contentCandidates = []; // every content-managed product; filtered to contentOps by live drift
 
     for (const product of scopedProducts) {
         const variants = product.child_products || [];
@@ -372,17 +460,11 @@ async function pushPortalAuthoritative({ connection, token, scopedProducts, matc
         if (!productId) continue;
 
         if (wantPrices) {
-            const variantUpdates = [];
-            const hashes = [];
             for (const { v, sku, info } of matched) {
                 const price = resolvePushPrice(v, pricelistPriority, vatMode, futureGuard, nowMs);
                 if (price == null) continue; // nothing resolvable — leave the variant's price alone
-                const priceHash = sha1(price);
-                if (existingMap.get(sku)?.priceHash === priceHash) continue; // delta: unchanged
-                variantUpdates.push({ id: info.shopifyVariantId, price });
-                hashes.push({ sku, priceHash });
+                priceCandidates.push({ parentCode: product.code, productId, variantId: info.shopifyVariantId, sku, price, priceHash: sha1(price) });
             }
-            if (variantUpdates.length) priceOps.push({ parentCode: product.code, productId, variants: variantUpdates, hashes });
         }
 
         if (wantContent || wantTags) {
@@ -401,8 +483,61 @@ async function pushPortalAuthoritative({ connection, token, scopedProducts, matc
                 hashParts.tags = productUpdate.tags;
             }
             const contentHash = sha1(JSON.stringify(hashParts));
-            if (existingMap.get(matched[0].sku)?.contentHash !== contentHash) {
-                contentOps.push({ parentCode: product.code, product: productUpdate, skus: matched.map((m) => m.sku), contentHash });
+            contentCandidates.push({
+                parentCode: product.code, productId, product: productUpdate,
+                skus: matched.map((m) => m.sku), contentHash, wantContent, wantTags
+            });
+        }
+    }
+
+    // Prices, like content, are drift-corrected against the LIVE store so a merchant editing a
+    // variant price in Shopify is overwritten. Drifted variants are re-grouped into per-product ops
+    // (the bulk price mutation is keyed by product). Live-fetch failure falls back to the old
+    // per-variant source-hash gate.
+    if (priceCandidates.length) {
+        let livePriceById = null;
+        try {
+            livePriceById = await fetchLivePrices(shop, token, priceCandidates.map((c) => c.variantId));
+        } catch (e) {
+            console.error(`[shopify] price drift fetch failed, falling back to source-hash gate (${shop}):`, e.message);
+        }
+        const byProduct = new Map();
+        for (const c of priceCandidates) {
+            let drifted;
+            if (livePriceById) {
+                if (!livePriceById.has(c.variantId)) continue; // variant gone — stale path handles it
+                drifted = Number(livePriceById.get(c.variantId)).toFixed(2) !== Number(c.price).toFixed(2);
+            } else {
+                drifted = existingMap.get(c.sku)?.priceHash !== c.priceHash;
+            }
+            if (!drifted) continue;
+            let g = byProduct.get(c.productId);
+            if (!g) { g = { parentCode: c.parentCode, productId: c.productId, variants: [], hashes: [] }; byProduct.set(c.productId, g); }
+            g.variants.push({ id: c.variantId, price: c.price });
+            g.hashes.push({ sku: c.sku, priceHash: c.priceHash });
+        }
+        for (const g of byProduct.values()) priceOps.push(g);
+    }
+
+    // Decide which content candidates actually need a push by comparing against the LIVE store, so
+    // a merchant's in-Shopify edit (title/description/tags) is caught and overwritten. If the live
+    // fetch fails, fall back to the old source-hash gate — still pushes genuine source changes,
+    // just can't see in-store drift that run.
+    if (contentCandidates.length) {
+        let liveById = null;
+        try {
+            liveById = await fetchLiveContent(shop, token, contentCandidates.map((c) => c.productId));
+        } catch (e) {
+            console.error(`[shopify] content drift fetch failed, falling back to source-hash gate (${shop}):`, e.message);
+        }
+        for (const c of contentCandidates) {
+            const op = { parentCode: c.parentCode, product: c.product, skus: c.skus, contentHash: c.contentHash };
+            if (liveById) {
+                const live = liveById.get(c.productId);
+                if (!live) continue; // vanished in store — existence/stale paths handle it, not content
+                if (contentDrifted(c, live)) contentOps.push(op);
+            } else if (existingMap.get(c.skus[0])?.contentHash !== c.contentHash) {
+                contentOps.push(op);
             }
         }
     }
@@ -752,14 +887,38 @@ async function pushPublications({ connection, token, scopedProducts, matchInfoBy
     const publishHash = sha1(desired.join(','));
     const shop = connection.shopDomain;
 
-    const ops = [];
+    // Candidate = every matched product; the live-drift pass below decides which actually need a
+    // publish/unpublish. (Was gated on a config-only `publishHash`, which never noticed a merchant
+    // changing a product's channels in-store — authoritative mode must overwrite that.)
+    const candidates = [];
     for (const product of scopedProducts) {
         const variants = product.child_products || [];
         const variantList = variants.length ? variants : [product];
         const firstSku = variantList.map((v) => (variants.length ? v.code : product.code) || '').find((sku) => matchInfoBySku.get(sku)?.shopifyProductId);
         if (!firstSku) continue;
-        if (existingMap.get(firstSku)?.publishHash === publishHash) continue; // unchanged
-        ops.push({ parentCode: product.code, productId: matchInfoBySku.get(firstSku).shopifyProductId, skus: variantList.map((v) => (variants.length ? v.code : product.code) || '').filter((s) => matchInfoBySku.get(s)) });
+        candidates.push({ parentCode: product.code, productId: matchInfoBySku.get(firstSku).shopifyProductId, firstSku, skus: variantList.map((v) => (variants.length ? v.code : product.code) || '').filter((s) => matchInfoBySku.get(s)) });
+    }
+    if (!candidates.length) return;
+
+    // Compare each product's CURRENT published channels against the managed selection; push only on
+    // drift. Live-fetch failure falls back to the old config-only hash gate for this run.
+    let livePubsById = null;
+    try {
+        livePubsById = await fetchLivePublications(shop, token, candidates.map((c) => c.productId));
+    } catch (err) {
+        console.error(`[shopify] publication drift fetch failed, falling back to hash gate (${shop}):`, err.message);
+    }
+    const ops = [];
+    for (const c of candidates) {
+        if (livePubsById) {
+            const live = livePubsById.get(c.productId);
+            if (!live) continue; // product gone — stale path handles it
+            const current = live.filter((id) => allPubIds.includes(id)).join(',');
+            if (current === desired.join(',')) continue; // already on exactly the managed channels
+        } else if (existingMap.get(c.firstSku)?.publishHash === publishHash) {
+            continue; // fallback: config unchanged
+        }
+        ops.push({ parentCode: c.parentCode, productId: c.productId, skus: c.skus });
     }
     if (!ops.length) return;
 
