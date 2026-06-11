@@ -38,6 +38,11 @@ const INSTANCE_ID = `api_${crypto.randomBytes(4).toString('hex')}`;
 let timer = null;
 let ticking = false;
 
+// Periodic "still armed" log so liveness is visible without waiting for an actual run. Throttled
+// so the 30 s tick doesn't spam the log; first tick after boot logs immediately (lastHeartbeatMs=0).
+const HEARTBEAT_MS = 10 * 60 * 1000;
+let lastHeartbeatMs = 0;
+
 /** The configured cron expression, or null when the scheduler is disabled. */
 function configuredSchedule() {
     const raw = (process.env.PRODUCTS_DOWNLOAD_SCHEDULE || '').trim();
@@ -71,6 +76,26 @@ async function ensureState(schedule) {
     }
 }
 
+/**
+ * Releases a run-lock left behind by a PREVIOUS process. A run that was claimed but never
+ * reached finishSlot (crash, OOM, or — most commonly — a redeploy mid-pipeline) leaves
+ * `lockedUntil` up to LOCK_MS (90 min) in the future with `runningBy` pointing at the now-dead
+ * process. ensureState never clears it (lock fields are `$setOnInsert` only), so the next due
+ * slot can't be claimed until the lock expires — the scheduler looks dead for up to 90 minutes,
+ * even across a restart and even after the schedule is changed. We just booted as a fresh
+ * process, so any persisted lock is by definition orphaned (this design ticks on ONE instance).
+ * Clear it so the next due slot fires immediately.
+ */
+async function releaseOrphanLock() {
+    const res = await getDb().collection(STATE_COLLECTION).updateOne(
+        { _id: STATE_ID, runningBy: { $ne: null } },
+        { $set: { lockedUntil: null, runningBy: null } }
+    );
+    if (res.modifiedCount) {
+        console.log('[pnv-scheduler] cleared an orphaned run-lock from a previous process (a run was interrupted mid-flight).');
+    }
+}
+
 /** Atomically claims a due slot. Returns the state doc when claimed, null otherwise. */
 async function claimDueSlot(nowMs) {
     const now = new Date(nowMs);
@@ -82,6 +107,31 @@ async function claimDueSlot(nowMs) {
         },
         { $set: { lockedUntil: new Date(nowMs + LOCK_MS), runningBy: INSTANCE_ID, lastStartedAt: now } }
     );
+}
+
+/**
+ * Logs a throttled "armed" heartbeat (at most every HEARTBEAT_MS) showing the next run time and
+ * how long until it's due — so an operator can confirm the scheduler is alive between runs, and
+ * spot a stuck/future nextRunAt or a held lock without reading the DB.
+ */
+async function heartbeat(nowMs) {
+    if (nowMs - lastHeartbeatMs < HEARTBEAT_MS) return;
+    lastHeartbeatMs = nowMs;
+    try {
+        const st = await getDb().collection(STATE_COLLECTION)
+            .findOne({ _id: STATE_ID }, { projection: { nextRunAt: 1, lockedUntil: 1, runningBy: 1 } });
+        if (!st?.nextRunAt) {
+            console.log('[pnv-scheduler] armed — no nextRunAt set yet.');
+            return;
+        }
+        const dueInS = Math.round((new Date(st.nextRunAt).getTime() - nowMs) / 1000);
+        const locked = st.runningBy && st.lockedUntil && new Date(st.lockedUntil).getTime() > nowMs
+            ? ` — RUN IN PROGRESS (locked by ${st.runningBy} until ${new Date(st.lockedUntil).toISOString()})`
+            : '';
+        console.log(`[pnv-scheduler] armed — next run ${new Date(st.nextRunAt).toISOString()} (${dueInS >= 0 ? `in ${dueInS}s` : `${-dueInS}s overdue`})${locked}`);
+    } catch (err) {
+        console.error('[pnv-scheduler] heartbeat read failed:', err.message);
+    }
 }
 
 /** Records the run outcome, advances `nextRunAt` from NOW (no burst catch-up), frees the lock. */
@@ -186,8 +236,9 @@ async function tick() {
     try {
         const schedule = configuredSchedule();
         if (!schedule) return;
-        const claimed = await claimDueSlot(Date.now());
-        if (!claimed) return;
+        const nowMs = Date.now();
+        const claimed = await claimDueSlot(nowMs);
+        if (!claimed) { await heartbeat(nowMs); return; }
 
         const startedAt = new Date();
         try {
@@ -220,6 +271,9 @@ async function start() {
     }
     if (timer) return;
     await ensureState(schedule);
+    // Heal a lock orphaned by an interrupted previous run BEFORE the first tick, so a slot that
+    // came due while we were down (or during a redeploy) can be claimed right away.
+    await releaseOrphanLock();
     timer = setInterval(() => { tick().catch(() => {}); }, TICK_MS);
     if (timer.unref) timer.unref(); // don't keep the process alive for the timer alone
     console.log(`[pnv-scheduler] started (instance ${INSTANCE_ID}, tick ${TICK_MS / 1000}s).`);
