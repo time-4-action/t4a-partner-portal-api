@@ -110,38 +110,65 @@ async function finishSlot(schedule, { result, error = null, stats = null, starte
  * AI/Shopify failures are logged but never fail the run — the catalogue itself synced.
  */
 async function runScheduledRefresh() {
-    console.log('[pnv-scheduler] catalogue refresh starting…');
-    const stats = await runPnvProductSync();
-    console.log(`[pnv-scheduler] PNV sync done — ${stats.totalProcessed} processed (${stats.created} created, ${stats.updated} updated, ${stats.deactivated} deactivated)`);
+    const startedMs = Date.now();
+    const secsSince = (fromMs) => ((Date.now() - fromMs) / 1000).toFixed(1);
+    console.log('[pnv-scheduler] ════════ catalogue refresh starting ════════');
 
-    // AI categorization for every AI-enabled category set — BEFORE the Shopify push so newly
-    // created products carry their categories (tags) on the first push.
+    // ── Stage 1/3: PNV catalogue sync (download → parse → Metakocka enrich → upsert) ──
+    console.log('[pnv-scheduler] [1/3] PNV product sync starting…');
+    const pnvMs = Date.now();
+    const stats = await runPnvProductSync();
+    console.log(`[pnv-scheduler] [1/3] PNV sync done in ${secsSince(pnvMs)}s — ${stats.totalProcessed} processed (${stats.created} created, ${stats.updated} updated, ${stats.deactivated} deactivated)`);
+
+    // ── Stage 2/3: AI categorization for every AI-enabled category set — BEFORE the Shopify push
+    // so newly created products carry their categories (tags) on the first push. ──
+    console.log('[pnv-scheduler] [2/3] AI categorization starting…');
+    const aiMs = Date.now();
     let aiRuns = [];
+    let aiTotalCategorized = 0;
     try {
         const aiExports = await getAiEnabledExports();
+        console.log(`[pnv-scheduler] [2/3] ${aiExports.length} AI-enabled category set(s) to process`);
         for (const exp of aiExports) {
             const id = exp._id.toString();
+            const label = exp.name || id;
             try {
+                const expMs = Date.now();
                 const r = await identifyProductCategories(id);
                 aiRuns.push({ exportId: id, categorized: r.productsCategorized });
-                console.log(`[pnv-scheduler] AI categorization "${exp.name || id}": ${r.productsCategorized}/${r.productsFound} categorized`);
+                aiTotalCategorized += r.productsCategorized || 0;
+                console.log(`[pnv-scheduler] [2/3]   "${label}": ${r.productsCategorized}/${r.productsFound} categorized in ${secsSince(expMs)}s`);
             } catch (err) {
                 aiRuns.push({ exportId: id, error: err.message });
-                console.error(`[pnv-scheduler] AI categorization failed for ${id}:`, err.message);
+                console.error(`[pnv-scheduler] [2/3]   "${label}" FAILED:`, err.message);
             }
         }
+        console.log(`[pnv-scheduler] [2/3] AI categorization done in ${secsSince(aiMs)}s — ${aiTotalCategorized} product(s) categorized across ${aiExports.length} set(s)`);
     } catch (err) {
-        console.error('[pnv-scheduler] could not list AI-enabled category sets:', err.message);
+        console.error('[pnv-scheduler] [2/3] could not list AI-enabled category sets:', err.message);
     }
 
-    // Near-live Shopify push across every connected store. The fan-out call returns once the
-    // background runs are started (each serialized per shop) — we don't wait for the pushes.
+    // ── Stage 3/3: near-live Shopify push across every connected store. The fan-out call returns
+    // once the background runs are STARTED (each serialized per shop) — we don't wait for the
+    // pushes themselves; per-store progress is logged by the Shopify sync engine. ──
+    console.log('[pnv-scheduler] [3/3] Shopify push fan-out starting…');
+    const shopMs = Date.now();
     try {
         const results = await syncAllConnections({ trigger: 'pnv' });
-        console.log(`[pnv-scheduler] Shopify push started for ${results.length} connection(s)`);
+        const started = results.filter((r) => r.jobId);
+        const skipped = results.filter((r) => !r.jobId);
+        console.log(`[pnv-scheduler] [3/3] Shopify fan-out done in ${secsSince(shopMs)}s — ${started.length} started, ${skipped.length} skipped (${results.length} connection(s))`);
+        for (const r of started) {
+            console.log(`[pnv-scheduler] [3/3]   started ${r.shop} (job ${r.jobId})`);
+        }
+        for (const r of skipped) {
+            console.log(`[pnv-scheduler] [3/3]   skipped ${r.shop}: ${r.skipped}`);
+        }
     } catch (err) {
-        console.error('[pnv-scheduler] Shopify push fan-out failed:', err.message);
+        console.error('[pnv-scheduler] [3/3] Shopify push fan-out failed:', err.message);
     }
+
+    console.log(`[pnv-scheduler] ════════ refresh pipeline complete in ${secsSince(startedMs)}s ════════`);
 
     return {
         totalProcessed: stats.totalProcessed,

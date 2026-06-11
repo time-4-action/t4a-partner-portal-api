@@ -120,9 +120,11 @@ const runPnvProductSync = async () => {
         }
 
         // Step 1: Authenticate and get the session cookie required for all subsequent API calls.
+        console.log('[pnv-sync] authenticating with PNV…');
         const cookie = getAuthCookie();
 
         // Step 2: Request the PNV server to generate a new product export file and return its download link.
+        console.log('[pnv-sync] requesting export file generation…');
         const downloadLink = await monitorFunction(
             () => fetchPnvDownloadLink(cookie),
             'fetchPnvDownloadLink'
@@ -139,15 +141,26 @@ const runPnvProductSync = async () => {
 
         // Ensure the target directory exists before attempting to write the file.
         await fs.mkdir(saveDir, { recursive: true });
-        
+
         // Step 4: Download the file from the PNV server to the local path.
+        console.log(`[pnv-sync] downloading products CSV → ${savePath}`);
+        const dlMs = Date.now();
         await downloadFile(fileUrl, savePath, cookie);
+        try {
+            const { size } = await fs.stat(savePath);
+            console.log(`[pnv-sync] download complete in ${((Date.now() - dlMs) / 1000).toFixed(1)}s — ${(size / 1024 / 1024).toFixed(2)} MB`);
+        } catch {
+            console.log(`[pnv-sync] download complete in ${((Date.now() - dlMs) / 1000).toFixed(1)}s`);
+        }
 
         // Step 5: After a successful download, trigger the service to process the CSV file and sync with the DB.
+        console.log('[pnv-sync] parsing CSV + Metakocka enrichment + DB upsert…');
+        const procMs = Date.now();
         const stats = await monitorFunction(
             () => processPnvProductExport(),
             'processPnvProductExport'
         );
+        console.log(`[pnv-sync] processing complete in ${((Date.now() - procMs) / 1000).toFixed(1)}s`);
 
         return stats;
 
