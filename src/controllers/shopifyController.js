@@ -138,13 +138,15 @@ exports.connect = async (req, res) => {
 
 /**
  * GET /shopify/entry — the app's **App URL** (the entry point Shopify loads when a merchant
- * opens the app from their admin). Shopify appends a signed query (`shop`, `hmac`, `host`,
- * `timestamp`, `session`). This app is **non-embedded** and **portal-first**, so the entry point
- * doesn't render an app — it verifies the signature and routes the browser to the portal:
+ * opens the app from their admin, and the target the App-Store reviewer hits on a fresh store).
+ * Shopify appends a signed query (`shop`, `hmac`, `host`, `timestamp`, `session`). This app is
+ * **non-embedded** and **portal-first**, so the entry point doesn't render an app — it verifies
+ * the signature and:
  *   • shop already connected → open the portal on that store;
- *   • shop not connected yet → open the portal's connect screen with the domain prefilled, where
- *     the partner signs in (Auth0) and approves the install (binding the store to their account).
- * It never renders a raw gated page — that's what App-Store reviewers test on a fresh store.
+ *   • shop NOT connected yet → 302 **straight to the Shopify OAuth grant**. This satisfies the
+ *     "immediately authenticate after install" App-Store check (which runs unauthenticated, so we
+ *     can't bounce to the login-gated portal first). The grant uses an anonymous signed state; the
+ *     resulting callback routes the merchant into the portal to finish binding (see {@link callback}).
  */
 exports.entry = async (req, res) => {
     const returnUrl = process.env.SHOPIFY_PORTAL_RETURN_URL || '/';
@@ -161,7 +163,9 @@ exports.entry = async (req, res) => {
         if (existing) {
             return res.redirect(`${returnUrl}${sep}shop=${encodeURIComponent(shop)}`);
         }
-        return res.redirect(`${returnUrl}${sep}connect=1&shop=${encodeURIComponent(shop)}`);
+        // Not connected → begin OAuth immediately (anonymous install — no portal user yet).
+        const { url } = oauthService.buildInstallUrl({ shopInput: shop });
+        return res.redirect(url);
     } catch (error) {
         console.error('[shopify] entry failed:', error.message);
         return res.redirect(`${returnUrl}${sep}shopify=error&reason=entry_failed`);
@@ -176,8 +180,18 @@ exports.entry = async (req, res) => {
 exports.callback = async (req, res) => {
     const returnUrl = process.env.SHOPIFY_PORTAL_RETURN_URL || '/';
     try {
-        const { connection, webhooks } = await oauthService.handleCallback(req.query);
+        const result = await oauthService.handleCallback(req.query);
         const sep = returnUrl.includes('?') ? '&' : '?';
+
+        // Anonymous install (merchant came from the App URL, not the portal): we haven't persisted
+        // anything. Send them into the portal with the shop prefilled — the UI's ResumeConnect
+        // auto-relaunches OAuth as the signed-in user, which lands back here WITH a portal user and
+        // creates the owned connection. (App already approved → Shopify re-grants silently.)
+        if (result.anonymous) {
+            return res.redirect(`${returnUrl}${sep}shop=${encodeURIComponent(result.shop)}`);
+        }
+
+        const { connection, webhooks } = result;
         let target = `${returnUrl}${sep}shopify=connected&shop=${encodeURIComponent(connection.shopDomain)}`;
         if (webhooks.failed.length) target += '&webhooks=partial';
         res.redirect(target);

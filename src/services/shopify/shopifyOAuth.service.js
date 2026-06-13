@@ -1,5 +1,6 @@
 const { signState, verifyState, verifyOAuthHmac } = require('./crypto.service');
 const shopifyApi = require('./shopifyApi.service');
+const shopifyGraphql = require('./shopifyGraphql.service');
 const connectionService = require('./shopifyConnection.service');
 
 /**
@@ -27,8 +28,18 @@ function normalizeShopDomain(input) {
 }
 
 /**
- * Builds the Shopify OAuth authorize URL for a connecting portal user.
- * @param {{ shopInput: string, sub: string, email?: string|null }} args
+ * Builds the Shopify OAuth authorize URL.
+ *
+ * Two callers:
+ *   • Portal-initiated (`/shopify/connect`, JWT) — passes `sub`/`email`; the install binds to
+ *     that portal user directly in {@link handleCallback}.
+ *   • Shopify-initiated (the App URL `/shopify/entry`, NO portal session) — passes no `sub`. This
+ *     is the App-Store "immediately authenticate after install" path: a merchant opening the app
+ *     on a fresh store is sent straight to the OAuth grant. The resulting callback is "anonymous"
+ *     (see {@link handleCallback}) and routes the merchant into the portal to finish connecting
+ *     (sign in → the UI auto-resumes OAuth, now authenticated → the connection binds to them).
+ *
+ * @param {{ shopInput: string, sub?: string, email?: string|null }} args
  * @returns {{ url: string, shop: string }}
  */
 function buildInstallUrl({ shopInput, sub, email }) {
@@ -40,7 +51,9 @@ function buildInstallUrl({ shopInput, sub, email }) {
     }
     if (!process.env.SHOPIFY_API_KEY) throw new Error('SHOPIFY_API_KEY must be set.');
 
-    const state = signState({ sub, email, shop });
+    // `sub` is omitted for a Shopify-initiated install — the signed state still binds the flow to
+    // this shop + a nonce (anti-CSRF); the portal user is bound later when the UI resumes OAuth.
+    const state = signState({ sub: sub || null, email: email || null, shop });
     const params = new URLSearchParams({
         client_id: process.env.SHOPIFY_API_KEY,
         scope: connectionService.DEFAULT_SCOPES.join(','),
@@ -51,10 +64,17 @@ function buildInstallUrl({ shopInput, sub, email }) {
 }
 
 /**
- * Handles the OAuth callback. Verifies hmac + state, exchanges the code for a token,
- * persists the connection, and registers mandatory webhooks.
+ * Handles the OAuth callback. Verifies hmac + state, then:
+ *   • Anonymous install (no portal user in state — the Shopify-initiated App-URL path): returns
+ *     `{ anonymous: true, shop }` WITHOUT exchanging the code. The controller routes the merchant
+ *     into the portal, where the UI resumes OAuth as the signed-in user and the real connection is
+ *     persisted. (Shopify silently re-grants the already-approved app, so the merchant isn't
+ *     prompted again.) This keeps tokens bound to a known portal user — we never persist an
+ *     ownerless connection.
+ *   • Portal-initiated install (state carries the user's `sub`): exchanges the code, persists the
+ *     connection, and registers the API webhooks.
  * @param {Object} query - parsed callback query (`code`, `shop`, `state`, `hmac`, ...)
- * @returns {Promise<{ connection: Object, webhooks: Object }>}
+ * @returns {Promise<{ anonymous: true, shop: string } | { connection: Object, webhooks: Object }>}
  */
 async function handleCallback(query) {
     const { shop, code, state } = query;
@@ -72,7 +92,7 @@ async function handleCallback(query) {
         throw error;
     }
 
-    // State proves the caller started the flow and binds it to a portal user (anti-CSRF).
+    // State proves the caller started the flow and binds it to this shop (anti-CSRF).
     let payload;
     try {
         payload = verifyState(state);
@@ -87,6 +107,12 @@ async function handleCallback(query) {
         throw error;
     }
 
+    // Shopify-initiated install: no portal user yet. Don't exchange/persist — hand off to the
+    // portal, which re-runs OAuth as the signed-in user to create the owned connection.
+    if (!payload.sub) {
+        return { anonymous: true, shop: normalized };
+    }
+
     const tokenResp = await shopifyApi.exchangeCodeForToken(normalized, code);
     const accessToken = tokenResp.access_token;
     const grantedScopes = (tokenResp.scope || '').split(',').map((s) => s.trim()).filter(Boolean);
@@ -94,7 +120,7 @@ async function handleCallback(query) {
     // Confirm the token works and capture shop metadata; non-fatal if it fails.
     let shopInfo = null;
     try {
-        shopInfo = await shopifyApi.getShopInfo(normalized, accessToken);
+        shopInfo = await shopifyGraphql.getShopInfo(normalized, accessToken);
     } catch (err) {
         console.error('[shopify] getShopInfo failed after install:', err.message);
     }
@@ -113,7 +139,7 @@ async function handleCallback(query) {
 
     let webhooks = { registered: [], failed: [] };
     try {
-        webhooks = await shopifyApi.registerWebhooks(normalized, accessToken);
+        webhooks = await shopifyGraphql.registerWebhooks(normalized, accessToken);
     } catch (err) {
         console.error('[shopify] webhook registration failed:', err.message);
     }

@@ -240,6 +240,71 @@ async function findExistingIds(shop, accessToken, ids) {
     return existing;
 }
 
+const SHOP_INFO_QUERY = `query ShopInfo {
+  shop {
+    name
+    myshopifyDomain
+    currencyCode
+  }
+}`;
+
+/**
+ * Fetches basic shop info (name, currency) right after install to confirm the token works.
+ * GraphQL replacement for the old REST `GET /shop.json` (App-Store requirement 2.2.4 — new public
+ * apps must use the GraphQL Admin API). Normalized to the `{ name, currency }` shape the
+ * connection upsert already expects (REST exposed `currency`; GraphQL exposes `currencyCode`).
+ * @returns {Promise<{ name: string|null, currency: string|null, domain: string|null }>}
+ */
+async function getShopInfo(shop, accessToken) {
+    const data = await graphqlRequest(shop, accessToken, SHOP_INFO_QUERY);
+    const s = data?.shop || {};
+    return { name: s.name || null, currency: s.currencyCode || null, domain: s.myshopifyDomain || null };
+}
+
+// Topics we register via the API on every install, as GraphQL `WebhookSubscriptionTopic` enums.
+// ONLY `APP_UNINSTALLED` belongs here — the GDPR/compliance topics are declared in the Partner
+// Dashboard (App setup → Compliance webhooks), not registered via the API. The single
+// `/shopify/webhooks` endpoint handles all topics at runtime.
+const API_WEBHOOK_TOPICS = ['APP_UNINSTALLED'];
+
+const WEBHOOK_CREATE_MUTATION = `mutation WebhookCreate($topic: WebhookSubscriptionTopic!, $sub: WebhookSubscriptionInput!) {
+  webhookSubscriptionCreate(topic: $topic, webhookSubscription: $sub) {
+    webhookSubscription { id }
+    userErrors { field message }
+  }
+}`;
+
+/**
+ * Registers the API-registerable webhooks via the GraphQL Admin API (`webhookSubscriptionCreate`)
+ * — replaces the old REST `POST /webhooks.json` (requirement 2.2.4). Idempotent: re-registering an
+ * existing topic/address returns an "already taken" userError, which we treat as success so one
+ * benign duplicate never blocks the others.
+ * @returns {Promise<{ registered: string[], failed: Array<{topic:string,error:string}> }>}
+ */
+async function registerWebhooks(shop, accessToken) {
+    const callbackUrl = `${process.env.SHOPIFY_API_BASE_URL}/shopify/webhooks`;
+    const registered = [];
+    const failed = [];
+
+    for (const topic of API_WEBHOOK_TOPICS) {
+        try {
+            const data = await graphqlRequest(shop, accessToken, WEBHOOK_CREATE_MUTATION, {
+                topic,
+                sub: { callbackUrl, format: 'JSON' }
+            });
+            const errs = data?.webhookSubscriptionCreate?.userErrors || [];
+            if (!errs.length || errs.some((e) => /taken|already/i.test(e.message))) {
+                registered.push(topic);
+            } else {
+                failed.push({ topic, error: errs.map((e) => e.message).join('; ') });
+            }
+        } catch (err) {
+            failed.push({ topic, error: err.message });
+        }
+    }
+    return { registered, failed };
+}
+
 module.exports = {
     graphqlRequest,
     listLocations,
@@ -247,6 +312,9 @@ module.exports = {
     listPublications,
     publishToPublications,
     unpublishFromPublications,
+    getShopInfo,
+    registerWebhooks,
+    API_WEBHOOK_TOPICS,
     // exported for unit-testing the backoff math
     _internals: { backoffMs, isThrottled, throttleStatusOf }
 };
