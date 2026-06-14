@@ -20,6 +20,7 @@ const { ensureIndexes: ensureShopifyIndexes } = require('./src/services/shopify/
 const { ensureIndexes: ensureExternalIndexes } = require('./src/services/external/ownSource.service');
 const externalScheduler = require('./src/services/external/externalScheduler.service');
 const pnvScheduler = require('./src/services/pnv/pnvScheduler.service');
+const shopifyPendingCleanup = require('./src/services/shopify/pendingCleanup.service');
 
 const PORT = process.env.PORT || 3000;
 
@@ -40,12 +41,17 @@ const startServer = async () => {
   // In-app PNV catalogue scheduler (PRODUCTS_DOWNLOAD_SCHEDULE cron) — replaces the n8n cron;
   // the /webhooks/sync/* endpoints stay available as a manual/back-fill escape hatch.
   await pnvScheduler.start();
+
+  // Sweep abandoned PENDING Shopify installs (merchant approved OAuth but never claimed) so we
+  // never hold an unbound store's token longer than the TTL.
+  shopifyPendingCleanup.start();
 };
 
 const gracefulShutdown = async () => {
   console.log('Received shutdown signal, closing server gracefully...');
   pnvScheduler.stop();
   externalScheduler.stop();
+  shopifyPendingCleanup.stop();
   console.log('HTTP server closed.');
   process.exit(0);
 };

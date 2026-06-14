@@ -104,6 +104,112 @@ async function upsertConnection({ ownerSub, ownerEmail, shopDomain, accessToken,
 }
 
 /**
+ * Creates (or refreshes) a PENDING connection for a Shopify-initiated install — the merchant
+ * approved OAuth from the App URL before signing into the portal, so we hold the token but have
+ * no owner yet. `ownerSub` is null and `status` is 'pending'; the row is claimed (→ active) when an
+ * approved partner signs in, or uninstalled+deleted on decline / by the cleanup sweep. Keyed by
+ * `(ownerSub: null, shopDomain)` so a repeat install just refreshes the same pending row rather
+ * than duplicating (and `createdAt` is bumped so the sweep clock restarts on each attempt).
+ * @returns {Promise<Object>} the public-shaped pending connection
+ */
+async function createPendingConnection({ shopDomain, accessToken, refreshToken, expiresIn, refreshTokenExpiresIn, scopes, shopInfo, claimTokenHash }) {
+    const db = getDb();
+    const collection = db.collection(COLLECTION_NAME);
+    const now = new Date();
+    const setFields = {
+        ownerSub: null,
+        ownerEmail: null,
+        shopDomain,
+        accessTokenEnc: encryptToken(accessToken),
+        refreshTokenEnc: refreshToken ? encryptToken(refreshToken) : null,
+        tokenExpiresAt: expiryDate(expiresIn),
+        refreshTokenExpiresAt: expiryDate(refreshTokenExpiresIn),
+        scopes: scopes && scopes.length ? scopes : DEFAULT_SCOPES,
+        shopName: shopInfo?.name || null,
+        shopCurrency: shopInfo?.currency || null,
+        status: 'pending',
+        claimTokenHash,
+        createdAt: now,
+        updatedAt: now
+    };
+    await collection.updateOne(
+        { ownerSub: null, shopDomain },
+        { $set: setFields, $setOnInsert: { config: { ...DEFAULT_CONFIG }, shopifyLocationId: null, installedAt: now, lastSyncAt: null, lastSyncStatus: null } },
+        { upsert: true }
+    );
+    return toPublic(await collection.findOne({ ownerSub: null, shopDomain }));
+}
+
+/**
+ * Binds a pending connection to a signed-in (approved) portal user, making it active. Authorized
+ * by the one-time claim token (its hash). Idempotent — a double submit (RSC re-render / refresh)
+ * after the first claim returns the now-active connection instead of erroring. If the user already
+ * owns a row for this shop (a reconnect), the fresh token is moved onto it and the pending row is
+ * dropped, so the `(ownerSub, shopDomain)` unique index is never violated.
+ * @returns {Promise<Object>} the public-shaped active connection
+ */
+async function claimPendingConnection({ shopDomain, claimTokenHash, ownerSub, ownerEmail }) {
+    const db = getDb();
+    const collection = db.collection(COLLECTION_NAME);
+    const now = new Date();
+
+    const pending = await collection.findOne({ shopDomain, status: 'pending', claimTokenHash });
+    if (!pending) {
+        const already = await collection.findOne({ ownerSub, shopDomain });
+        if (already && already.status === 'active') return toPublic(already);
+        const error = new Error('No pending connection to claim for this store.');
+        error.code = 'NOT_FOUND';
+        throw error;
+    }
+
+    const existingOwned = await collection.findOne({ ownerSub, shopDomain });
+    if (existingOwned) {
+        await collection.updateOne(
+            { _id: existingOwned._id },
+            { $set: {
+                accessTokenEnc: pending.accessTokenEnc,
+                refreshTokenEnc: pending.refreshTokenEnc,
+                tokenExpiresAt: pending.tokenExpiresAt,
+                refreshTokenExpiresAt: pending.refreshTokenExpiresAt,
+                scopes: pending.scopes,
+                shopName: pending.shopName || existingOwned.shopName || null,
+                shopCurrency: pending.shopCurrency || existingOwned.shopCurrency || null,
+                ownerEmail: ownerEmail || existingOwned.ownerEmail || null,
+                status: 'active',
+                updatedAt: now
+            } }
+        );
+        await collection.deleteOne({ _id: pending._id });
+        return toPublic(await collection.findOne({ _id: existingOwned._id }));
+    }
+
+    await collection.updateOne(
+        { _id: pending._id },
+        { $set: { ownerSub, ownerEmail: ownerEmail || null, status: 'active', updatedAt: now }, $unset: { claimTokenHash: '' } }
+    );
+    return toPublic(await collection.findOne({ _id: pending._id }));
+}
+
+/**
+ * Returns the RAW pending connection (INCLUDING the encrypted token) matching a shop + claim-token
+ * hash, or null. For the decline handler, which needs the token to self-uninstall before deleting.
+ */
+async function getPendingByClaim({ shopDomain, claimTokenHash }) {
+    return getDb().collection(COLLECTION_NAME).findOne({ shopDomain, status: 'pending', claimTokenHash });
+}
+
+/**
+ * Returns RAW pending connections (INCLUDING tokens) created before `cutoff` — abandoned installs
+ * never claimed/declined (e.g. a merchant who only used the request-access form). The cleanup
+ * sweep uninstalls + deletes them so we never hold a Shopify token for an unbound store.
+ * @param {Date} cutoff
+ * @returns {Promise<Array<Object>>}
+ */
+async function findStalePending(cutoff) {
+    return getDb().collection(COLLECTION_NAME).find({ status: 'pending', createdAt: { $lt: cutoff } }).toArray();
+}
+
+/**
  * Returns the connection for a portal user (by Auth0 sub), public-shaped, or null.
  * Returns the most recently updated — used by the legacy single-store `status` endpoint.
  * Prefer {@link listConnectionsForUser} for the multi-store UI.
@@ -422,6 +528,10 @@ module.exports = {
     DEFAULT_CONFIG,
     canPublish,
     upsertConnection,
+    createPendingConnection,
+    claimPendingConnection,
+    getPendingByClaim,
+    findStalePending,
     getConnectionForUser,
     listConnectionsForUser,
     findByShopDomain,

@@ -1,4 +1,4 @@
-const { signState, verifyState, verifyOAuthHmac } = require('./crypto.service');
+const { signState, verifyState, verifyOAuthHmac, makeClaimToken, hashClaimToken } = require('./crypto.service');
 const shopifyApi = require('./shopifyApi.service');
 const shopifyGraphql = require('./shopifyGraphql.service');
 const connectionService = require('./shopifyConnection.service');
@@ -65,16 +65,15 @@ function buildInstallUrl({ shopInput, sub, email }) {
 
 /**
  * Handles the OAuth callback. Verifies hmac + state, then:
- *   • Anonymous install (no portal user in state — the Shopify-initiated App-URL path): returns
- *     `{ anonymous: true, shop }` WITHOUT exchanging the code. The controller routes the merchant
- *     into the portal, where the UI resumes OAuth as the signed-in user and the real connection is
- *     persisted. (Shopify silently re-grants the already-approved app, so the merchant isn't
- *     prompted again.) This keeps tokens bound to a known portal user — we never persist an
- *     ownerless connection.
+ *   • Shopify-initiated install (no portal user in state — the App-URL path): exchanges the code
+ *     and persists a PENDING connection (ownerSub=null) bound to a one-time claim token, returning
+ *     `{ pending: true, shop, claimToken }`. The controller routes the merchant to the welcome
+ *     page; after sign-in an approved partner claims it (→ active) and a non-approved one declines
+ *     it (uninstall + delete). The cleanup sweep removes any never-claimed pending.
  *   • Portal-initiated install (state carries the user's `sub`): exchanges the code, persists the
- *     connection, and registers the API webhooks.
+ *     owned connection, and registers the API webhooks.
  * @param {Object} query - parsed callback query (`code`, `shop`, `state`, `hmac`, ...)
- * @returns {Promise<{ anonymous: true, shop: string } | { connection: Object, webhooks: Object }>}
+ * @returns {Promise<{ pending: true, shop: string, claimToken: string } | { connection: Object, webhooks: Object }>}
  */
 async function handleCallback(query) {
     const { shop, code, state } = query;
@@ -107,10 +106,42 @@ async function handleCallback(query) {
         throw error;
     }
 
-    // Shopify-initiated install: no portal user yet. Don't exchange/persist — hand off to the
-    // portal, which re-runs OAuth as the signed-in user to create the owned connection.
+    // Shopify-initiated install: no portal user yet. Exchange the code and persist a PENDING
+    // connection so we HOLD the token — an approved partner who signs in claims it (→ active),
+    // and a non-approved user (or the cleanup sweep) can self-uninstall it. The plaintext claim
+    // token travels to the merchant's browser in the welcome redirect; only its hash is stored.
     if (!payload.sub) {
-        return { anonymous: true, shop: normalized };
+        const tokenResp = await shopifyApi.exchangeCodeForToken(normalized, code);
+        const accessToken = tokenResp.access_token;
+        const grantedScopes = (tokenResp.scope || '').split(',').map((s) => s.trim()).filter(Boolean);
+
+        let shopInfo = null;
+        try {
+            shopInfo = await shopifyGraphql.getShopInfo(normalized, accessToken);
+        } catch (err) {
+            console.error('[shopify] getShopInfo failed (pending install):', err.message);
+        }
+
+        const claimToken = makeClaimToken();
+        await connectionService.createPendingConnection({
+            shopDomain: normalized,
+            accessToken,
+            refreshToken: tokenResp.refresh_token,
+            expiresIn: tokenResp.expires_in,
+            refreshTokenExpiresIn: tokenResp.refresh_token_expires_in,
+            scopes: grantedScopes,
+            shopInfo,
+            claimTokenHash: hashClaimToken(claimToken)
+        });
+
+        // Register app/uninstalled now so a manual uninstall before the claim still cleans us up.
+        try {
+            await shopifyGraphql.registerWebhooks(normalized, accessToken);
+        } catch (err) {
+            console.error('[shopify] webhook registration failed (pending install):', err.message);
+        }
+
+        return { pending: true, shop: normalized, claimToken };
     }
 
     const tokenResp = await shopifyApi.exchangeCodeForToken(normalized, code);

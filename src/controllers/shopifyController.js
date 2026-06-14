@@ -7,7 +7,7 @@ const syncService = require('../services/shopify/shopifySync.service');
 const syncJobs = require('../services/shopify/shopifySyncJobs.service');
 const productMap = require('../services/shopify/shopifyProductMap.service');
 const { getDistinctPricelists } = require('../services/customExport.service');
-const { verifyOAuthHmac, verifyWebhookHmac } = require('../services/shopify/crypto.service');
+const { verifyOAuthHmac, verifyWebhookHmac, hashClaimToken } = require('../services/shopify/crypto.service');
 
 /**
  * Controller for the Shopify connection lifecycle (design §10).
@@ -123,6 +123,21 @@ function authUser(req) {
 }
 
 /**
+ * The absolute URL of the public post-install welcome page (`/shopify-welcome`). Explicit
+ * `SHOPIFY_PORTAL_WELCOME_URL` wins; otherwise it's derived from the portal origin of
+ * `SHOPIFY_PORTAL_RETURN_URL` (which points at `…/integrations/shopify`). The welcome page lives at
+ * the portal root, NOT under `/integrations`, so the portal's auth middleware leaves it public.
+ */
+function welcomeUrl(returnUrl) {
+    if (process.env.SHOPIFY_PORTAL_WELCOME_URL) return process.env.SHOPIFY_PORTAL_WELCOME_URL;
+    try {
+        return `${new URL(returnUrl).origin}/shopify-welcome`;
+    } catch {
+        return '/shopify-welcome';
+    }
+}
+
+/**
  * GET /shopify/connect?shop= — start OAuth. Returns the Shopify authorize URL for the
  * browser to redirect to (the UI does `window.location = url`).
  */
@@ -183,12 +198,14 @@ exports.callback = async (req, res) => {
         const result = await oauthService.handleCallback(req.query);
         const sep = returnUrl.includes('?') ? '&' : '?';
 
-        // Anonymous install (merchant came from the App URL, not the portal): we haven't persisted
-        // anything. Send them into the portal with the shop prefilled — the UI's ResumeConnect
-        // auto-relaunches OAuth as the signed-in user, which lands back here WITH a portal user and
-        // creates the owned connection. (App already approved → Shopify re-grants silently.)
-        if (result.anonymous) {
-            return res.redirect(`${returnUrl}${sep}shop=${encodeURIComponent(result.shop)}`);
+        // Shopify-initiated install (merchant came from the App URL, not the portal): a PENDING
+        // connection now holds the token. Send them to the public welcome page (explainer + sign-in
+        // + request-access) carrying the shop + one-time claim token. Signing in claims it (approved
+        // partner → active) or declines it (non-approved → uninstall + delete).
+        if (result.pending) {
+            const welcomeBase = welcomeUrl(returnUrl);
+            const wsep = welcomeBase.includes('?') ? '&' : '?';
+            return res.redirect(`${welcomeBase}${wsep}shop=${encodeURIComponent(result.shop)}&claim=${encodeURIComponent(result.claimToken)}`);
         }
 
         const { connection, webhooks } = result;
@@ -199,6 +216,68 @@ exports.callback = async (req, res) => {
         console.error('[shopify] callback failed:', error.code || '', error.message);
         const sep = returnUrl.includes('?') ? '&' : '?';
         res.redirect(`${returnUrl}${sep}shopify=error&reason=${encodeURIComponent(error.code || 'SERVER_ERROR')}`);
+    }
+};
+
+/**
+ * POST /shopify/connection/claim — bind a PENDING (Shopify-initiated) install to the signed-in
+ * approved partner, making it active. Authorized by the one-time claim token from the welcome URL;
+ * owner + alpha gated by the route middleware. Idempotent. Body: `{ shop, claimToken }`.
+ */
+exports.claim = async (req, res) => {
+    try {
+        const { sub, email } = authUser(req);
+        const shop = oauthService.normalizeShopDomain(req.body?.shop);
+        const claimToken = req.body?.claimToken;
+        if (!shop || !claimToken) {
+            const error = new Error('shop and claimToken are required');
+            error.code = 'BAD_REQUEST';
+            throw error;
+        }
+        const connection = await connectionService.claimPendingConnection({
+            shopDomain: shop,
+            claimTokenHash: hashClaimToken(claimToken),
+            ownerSub: sub,
+            ownerEmail: email
+        });
+        res.json({ success: true, connection });
+    } catch (error) {
+        handleError(res, error);
+    }
+};
+
+/**
+ * POST /shopify/connection/decline — clean break for a non-approved install: self-uninstall the app
+ * from the merchant's Shopify and delete the pending row. Authorized by the claim token (so a caller
+ * can only decline the store THEY installed) — intentionally NOT alpha-gated, so a signed-in user
+ * without the tier can still tidy up their own install. Idempotent. Body: `{ shop, claimToken }`.
+ */
+exports.decline = async (req, res) => {
+    try {
+        const shop = oauthService.normalizeShopDomain(req.body?.shop);
+        const claimToken = req.body?.claimToken;
+        if (!shop || !claimToken) {
+            const error = new Error('shop and claimToken are required');
+            error.code = 'BAD_REQUEST';
+            throw error;
+        }
+        const pending = await connectionService.getPendingByClaim({
+            shopDomain: shop,
+            claimTokenHash: hashClaimToken(claimToken)
+        });
+        if (pending) {
+            // Best-effort self-uninstall so the app is removed from the merchant's admin too.
+            try {
+                const token = await tokenService.getValidAccessToken(pending._id);
+                await shopifyApi.uninstallApp(pending.shopDomain, token);
+            } catch (err) {
+                console.warn('[shopify] decline self-uninstall failed (continuing):', err.code || err.message);
+            }
+            await connectionService.deleteConnection(pending._id.toString());
+        }
+        res.json({ success: true });
+    } catch (error) {
+        handleError(res, error);
     }
 };
 

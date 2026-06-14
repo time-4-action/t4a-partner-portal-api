@@ -20,6 +20,13 @@ router.get('/connect', jwtCheck, requireExportRole, requireAlpha, shopifyControl
 // the OAuth HMAC + the signed `state` nonce instead (see crypto.service).
 router.get('/callback', shopifyController.callback);
 
+// ─── Post-install claim / decline (Shopify-initiated pending connections) ───────
+// `claim` binds a pending install to the signed-in approved partner (alpha-gated). `decline` is
+// the clean break for a non-approved install — NOT alpha-gated (a signed-in user without the tier
+// must be able to tidy up their own install); the one-time claim token authorizes both.
+router.post('/connection/claim', jwtCheck, requireExportRole, requireAlpha, shopifyController.claim);
+router.post('/connection/decline', jwtCheck, requireExportRole, shopifyController.decline);
+
 // ─── Connection management (JWT + export role, owner-checked in controller) ─────
 router.get('/status', jwtCheck, requireExportRole, requireAlpha, shopifyController.status);
 router.get('/connections', jwtCheck, requireExportRole, requireAlpha, shopifyController.connections);

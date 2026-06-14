@@ -136,6 +136,27 @@ function verifyWebhookHmac(rawBody, hmacHeader) {
 }
 
 /**
+ * Mints a one-time claim token for a Shopify-initiated (anonymous) install. The plaintext is
+ * handed to the installing merchant's browser (in the welcome redirect URL); only its hash is
+ * stored on the pending connection, so possession of the token is what authorizes claiming or
+ * declining that specific pending store.
+ * @returns {string} 32 random bytes, hex-encoded
+ */
+function makeClaimToken() {
+    return crypto.randomBytes(32).toString('hex');
+}
+
+/**
+ * Hashes a claim token for at-rest storage / lookup (sha256 hex). Looking a pending connection up
+ * by this hash means the raw token is never persisted.
+ * @param {string} token
+ * @returns {string}
+ */
+function hashClaimToken(token) {
+    return crypto.createHash('sha256').update(String(token)).digest('hex');
+}
+
+/**
  * Constant-time string comparison that never throws on length mismatch.
  */
 function timingSafeEqualStr(a, b) {
@@ -151,5 +172,7 @@ module.exports = {
     signState,
     verifyState,
     verifyOAuthHmac,
-    verifyWebhookHmac
+    verifyWebhookHmac,
+    makeClaimToken,
+    hashClaimToken
 };
