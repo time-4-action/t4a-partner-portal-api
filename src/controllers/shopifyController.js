@@ -8,6 +8,7 @@ const syncJobs = require('../services/shopify/shopifySyncJobs.service');
 const productMap = require('../services/shopify/shopifyProductMap.service');
 const { getDistinctPricelists } = require('../services/customExport.service');
 const { verifyOAuthHmac, verifyWebhookHmac, hashClaimToken } = require('../services/shopify/crypto.service');
+const { recordActivity } = require('../services/activity.service');
 
 /**
  * Controller for the Shopify connection lifecycle (design §10).
@@ -240,6 +241,11 @@ exports.claim = async (req, res) => {
             ownerSub: sub,
             ownerEmail: email
         });
+        recordActivity('shopify_connect', {
+            ownerSub: sub, email,
+            resourceType: 'shopify_connection', resourceId: connection?._id,
+            metadata: { shopDomain: shop }
+        });
         res.json({ success: true, connection });
     } catch (error) {
         handleError(res, error);
@@ -438,6 +444,11 @@ exports.sync = async (req, res) => {
     try {
         const connection = await loadOwned(req);
         const job = await syncService.startStockSync(connection._id, { trigger: 'manual' });
+        recordActivity('shopify_sync_now', {
+            ownerSub: connection.ownerSub, email: connection.ownerEmail,
+            resourceType: 'shopify_connection', resourceId: connection._id,
+            metadata: { shopDomain: connection.shopDomain }
+        });
         res.status(202).json({ success: true, job: toActivityRow(job) });
     } catch (error) {
         handleError(res, error);

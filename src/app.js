@@ -20,8 +20,14 @@ app.use(express.static(path.join(__dirname, '..', 'public')));
 
 const healthRoutes = require('./routes/healthRoutes');
 const productRoutes = require('./routes/productRoutes');
+const internalAdminToken = require('./middleware/internalAdminToken');
+const adminPartnersRoutes = require('./routes/adminPartnersRoutes');
 app.use('/api/export/health', healthRoutes);
 app.use('/api/product', productRoutes);
 app.use('/api/export', exportRoutes);
+
+// Internal admin surface consumed by the t4a-admin "Partners" section. Bearer-token
+// gated (PARTNER_ADMIN_TOKEN); not part of the partner-facing /api/export tree.
+app.use('/api/admin/partners', internalAdminToken, adminPartnersRoutes);
 
 module.exports = { app };
