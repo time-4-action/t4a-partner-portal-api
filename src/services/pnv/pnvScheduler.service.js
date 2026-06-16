@@ -28,6 +28,9 @@ const { syncAllConnections } = require('../shopify/shopifySync.service');
 
 const STATE_COLLECTION = 'scheduler_state';
 const STATE_ID = 'pnv-products-sync';
+// Per-run history (mirrors external_import_runs / shopify_sync_jobs). The scheduler_state doc only
+// holds the LATEST run; this collection keeps the trail the admin "Catalogue Sync" page shows.
+const RUNS_COLLECTION = 'pnv_sync_runs';
 
 const TICK_MS = 30 * 1000;
 // PNV download + Metakocka enrichment + AI categorization can legitimately take a while —
@@ -244,15 +247,142 @@ async function tick() {
         try {
             const stats = await runScheduledRefresh();
             await finishSlot(schedule, { result: 'ok', stats, startedAt });
+            await recordRun({ trigger: 'schedule', startedAt, result: 'ok', stats });
             console.log('[pnv-scheduler] catalogue refresh finished.');
         } catch (err) {
             console.error('[pnv-scheduler] catalogue refresh failed:', err.message);
             await finishSlot(schedule, { result: 'error', error: err.message, startedAt });
+            await recordRun({ trigger: 'schedule', startedAt, result: 'error', error: err.message });
         }
     } catch (err) {
         console.error('[pnv-scheduler] tick error:', err.message);
     } finally {
         ticking = false;
+    }
+}
+
+/** Appends a run record to the history collection. Best-effort — never blocks/fails a run. */
+async function recordRun({ trigger, startedAt, result, error = null, stats = null, finishedAt = new Date() }) {
+    try {
+        await getDb().collection(RUNS_COLLECTION).insertOne({
+            trigger,
+            result,
+            error,
+            stats: stats || null,
+            startedAt: startedAt || null,
+            finishedAt,
+            durationMs: startedAt ? finishedAt - startedAt : null,
+            createdAt: new Date()
+        });
+    } catch (e) {
+        console.error('[pnv-scheduler] recordRun failed:', e.message);
+    }
+}
+
+/** Most recent runs, newest-first (for the admin Catalogue Sync page). */
+async function listRuns(limit = 20) {
+    return getDb().collection(RUNS_COLLECTION)
+        .find({}).sort({ startedAt: -1 }).limit(limit).toArray();
+}
+
+/**
+ * Unified status block for the admin surface: the persisted scheduler_state plus a computed
+ * `isRunning` (a held, unexpired lock) and the recent run history.
+ */
+async function getStatus() {
+    const now = Date.now();
+    const schedule = configuredSchedule();
+    const st = await getDb().collection(STATE_COLLECTION).findOne({ _id: STATE_ID });
+    const isRunning = !!(st?.runningBy && st?.lockedUntil && new Date(st.lockedUntil).getTime() > now);
+    const runs = await listRuns(20);
+    return {
+        enabled: !!schedule,
+        schedule: schedule || st?.schedule || null,
+        isRunning,
+        runningBy: isRunning ? st.runningBy : null,
+        nextRunAt: st?.nextRunAt || null,
+        lastStartedAt: st?.lastStartedAt || null,
+        lastFinishedAt: st?.lastFinishedAt || null,
+        lastDurationMs: st?.lastDurationMs ?? null,
+        lastResult: st?.lastResult || null,
+        lastError: st?.lastError || null,
+        lastStats: st?.lastStats || null,
+        runs
+    };
+}
+
+/**
+ * Atomically claims the shared run-lock for a MANUAL run. Shares the same lock the cron uses, so a
+ * manual run and a scheduled run can never overlap. Returns the claimed doc, or null when a run
+ * (scheduled or manual) is already in progress. Ensures the state doc exists first — a manual run
+ * must work even when the scheduler is disabled and has never created one.
+ */
+async function claimManualSlot(nowMs) {
+    const now = new Date(nowMs);
+    const col = getDb().collection(STATE_COLLECTION);
+    await col.updateOne(
+        { _id: STATE_ID },
+        { $setOnInsert: { schedule: null, nextRunAt: null, lockedUntil: null, runningBy: null } },
+        { upsert: true }
+    );
+    return col.findOneAndUpdate(
+        { _id: STATE_ID, $or: [{ lockedUntil: null }, { lockedUntil: { $lte: now } }] },
+        { $set: { lockedUntil: new Date(nowMs + LOCK_MS), runningBy: `manual_${INSTANCE_ID}`, lastStartedAt: now } },
+        { returnDocument: 'after' }
+    );
+}
+
+/** Records a manual run's outcome and frees the lock — WITHOUT advancing `nextRunAt` (a manual run must not disturb the cron cadence). */
+async function finishManual({ result, error = null, stats = null, startedAt }) {
+    const now = new Date();
+    await getDb().collection(STATE_COLLECTION).updateOne(
+        { _id: STATE_ID },
+        { $set: {
+            lockedUntil: null,
+            runningBy: null,
+            lastFinishedAt: now,
+            lastDurationMs: startedAt ? now - startedAt : null,
+            lastResult: result,
+            lastError: error,
+            lastStats: stats,
+            updatedAt: now
+        } }
+    );
+}
+
+/**
+ * "Run now" — runs the SAME full pipeline as the cron (PNV → AI → Shopify) on demand. Claims the
+ * shared lock (returns `{ started: false, reason: 'already_running' }` if a run is in flight), runs
+ * in the background, records history, and frees the lock without touching the schedule.
+ */
+async function runManualRefresh() {
+    const claimed = await claimManualSlot(Date.now());
+    if (!claimed) return { started: false, reason: 'already_running' };
+
+    const startedAt = new Date(claimed.lastStartedAt || Date.now());
+    console.log('[pnv-scheduler] manual catalogue refresh requested.');
+    (async () => {
+        try {
+            const stats = await runScheduledRefresh();
+            await finishManual({ result: 'ok', stats, startedAt });
+            await recordRun({ trigger: 'manual', startedAt, result: 'ok', stats });
+            console.log('[pnv-scheduler] manual catalogue refresh finished.');
+        } catch (err) {
+            console.error('[pnv-scheduler] manual catalogue refresh failed:', err.message);
+            await finishManual({ result: 'error', error: err.message, startedAt });
+            await recordRun({ trigger: 'manual', startedAt, result: 'error', error: err.message });
+        }
+    })();
+    return { started: true, startedAt: startedAt.toISOString() };
+}
+
+/** Index for the run-history collection. Called once at startup (works even when the cron is off). */
+async function ensureIndexes() {
+    try {
+        await getDb().collection(RUNS_COLLECTION).createIndex({ startedAt: -1 });
+        console.log('[pnv-scheduler] run-history index ensured.');
+    } catch (e) {
+        console.error('[pnv-scheduler] index creation error:', e.message);
     }
 }
 
@@ -286,4 +416,4 @@ function stop() {
     if (timer) { clearInterval(timer); timer = null; }
 }
 
-module.exports = { start, stop, tick, runScheduledRefresh, INSTANCE_ID };
+module.exports = { start, stop, tick, runScheduledRefresh, runManualRefresh, getStatus, listRuns, ensureIndexes, INSTANCE_ID };

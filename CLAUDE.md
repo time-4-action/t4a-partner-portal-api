@@ -37,6 +37,13 @@ All routes are under `/api/export`:
 | `/api/export/recharge` | `src/routes/rechargeRoutes.js` |
 | `/api/export/webhooks` | `src/routes/webhookRoutes.js` — n8n triggers |
 
+Internal admin surface (bearer-gated by `internalAdminToken` / `PARTNER_ADMIN_TOKEN`, consumed by the t4a-admin Partners section — NOT under `/api/export`):
+
+| Prefix | File |
+|---|---|
+| `/api/admin/partners` | `src/routes/adminPartnersRoutes.js` — per-partner insight |
+| `/api/admin/system` | `src/routes/adminSystemRoutes.js` — scheduler status + manual triggers (`GET /sync`, `POST /sync/pnv/run` full pipeline, `POST /sync/own-sources/:feedId/run`). Backed by `pnvScheduler.getStatus()` / `runManualRefresh()`. |
+
 ### Authentication
 
 Two middleware options are available:
@@ -51,7 +58,7 @@ Triggered by `POST /api/export/webhooks/sync/pnv`. Responds `202` immediately an
 
 1. `pnvProductsSync.service.js` — authenticates with PNV (SHA1-hashed password in cookie), triggers CSV export, downloads CSV to `DATA_PATH/pnv/products.csv`
 2. `processPnvProductExport.service.js` — parses the CSV, maps fields via `src/config/pnv/products.js`
-3. Enriches each product with warehouse stock and pricing from Metakocka (`src/services/metakocka/`)
+3. Enriches each product with warehouse stock and pricing from Metakocka (`src/services/metakocka/`). Stock stored as `stock_amount` is the **free** (available-to-sell) amount = `free_amount`, falling back to `amount - reserved_amount` when a company has no reservations. Rows are **summed per code** across a warehouse's microlocations (`warehouse.service.js`); never use raw `amount` (it includes reservations → overselling).
 4. Upserts products into the `products` MongoDB collection; products absent from CSV are soft-deleted (`active: false`)
 5. Optionally POSTs a callback to a `webhook` URL when done
 
@@ -77,6 +84,8 @@ The **inventory preset** uses a dedicated code path (`generateInventoryRows()`) 
 | `exports` | Export definitions (name, AI categorization enabled, roles/users) |
 | `export_configs` | Custom export configurations (fields, filters, presets) |
 | `analytics` | Function performance and API request logs |
+| `scheduler_state` | Per-scheduler state (`pnv-products-sync` last-run + lock; `shopify-pending-cleanup` last-sweep) |
+| `pnv_sync_runs` | PNV catalogue-refresh run history (one doc per run; `trigger`, `result`, `stats`, durations) |
 
 ### `products` document shape
 

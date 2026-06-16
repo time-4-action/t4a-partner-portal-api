@@ -32,6 +32,7 @@ const startServer = async () => {
   await ensureShopifyIndexes();
   await ensureExternalIndexes();
   await ensureActivityIndexes();
+  await pnvScheduler.ensureIndexes();
 
   app.listen(PORT, () => {
     console.log(`Server is running on http://localhost:${PORT}`);
