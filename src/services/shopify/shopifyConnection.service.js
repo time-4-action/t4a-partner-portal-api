@@ -10,6 +10,10 @@ const { encryptToken } = require('./crypto.service');
  */
 
 const COLLECTION_NAME = 'shopify_connections';
+// Short-lived pre-OAuth registrations for the "bring your own OAuth app" (custom_oauth) flow: the
+// portal user's app credentials are parked here between "Connect" (build install URL) and the OAuth
+// callback, keyed by an id carried in the signed `state`. TTL-swept an hour after creation.
+const REGISTRATION_COLLECTION = 'shopify_app_registrations';
 
 const DEFAULT_SCOPES = (process.env.SHOPIFY_SCOPES ||
     'read_products,write_products,read_inventory,write_inventory,read_locations,read_publications,write_publications')
@@ -47,7 +51,9 @@ const DEFAULT_CONFIG = {
  */
 function toPublic(conn) {
     if (!conn) return null;
-    const { accessTokenEnc, refreshTokenEnc, ...rest } = conn;
+    // Strip every at-rest secret before a connection leaves the service: the encrypted access +
+    // refresh tokens AND a custom_oauth app's encrypted client secret.
+    const { accessTokenEnc, refreshTokenEnc, appClientSecretEnc, ...rest } = conn;
     return { ...rest, _id: conn._id.toString(), connected: conn.status === 'active' };
 }
 
@@ -79,6 +85,9 @@ async function upsertConnection({ ownerSub, ownerEmail, shopDomain, accessToken,
         refreshTokenEnc: refreshToken ? encryptToken(refreshToken) : null,
         tokenExpiresAt: expiryDate(expiresIn),
         refreshTokenExpiresAt: expiryDate(refreshTokenExpiresIn),
+        // Explicitly OAuth — so reconnecting a store here clears any prior 'custom_app' marker
+        // (Prerelease flow) and the token service resumes refreshing instead of returning as-is.
+        authMethod: 'oauth',
         scopes: scopes && scopes.length ? scopes : DEFAULT_SCOPES,
         shopName: shopInfo?.name || existing?.shopName || null,
         shopCurrency: shopInfo?.currency || existing?.shopCurrency || null,
@@ -101,6 +110,154 @@ async function upsertConnection({ ownerSub, ownerEmail, shopDomain, accessToken,
     };
     const result = await collection.insertOne(doc);
     return toPublic({ ...doc, _id: result.insertedId });
+}
+
+/**
+ * Upserts a connection authenticated by a merchant-supplied **custom-app** Admin API token
+ * (Route B / "Shopify Prerelease"). Unlike the OAuth path there is no `code` exchange and no
+ * refresh token — a custom app created in the store admin issues a single long-lived,
+ * non-expiring Admin API access token. `authMethod: 'custom_app'` marks the row so the token
+ * service returns the stored token as-is instead of trying to refresh it (which would fail).
+ * Keyed by (ownerSub, shopDomain) like {@link upsertConnection}, so re-pasting a token for the
+ * same store refreshes it in place and preserves the existing sync `config`.
+ * @returns {Promise<Object>} the public-shaped connection
+ */
+async function upsertCustomAppConnection({ ownerSub, ownerEmail, shopDomain, accessToken, scopes, shopInfo }) {
+    const db = getDb();
+    const collection = db.collection(COLLECTION_NAME);
+    const now = new Date();
+
+    const existing = await collection.findOne({ ownerSub, shopDomain });
+
+    const setFields = {
+        ownerSub,
+        ownerEmail: ownerEmail || null,
+        shopDomain,
+        accessTokenEnc: encryptToken(accessToken),
+        // Custom-app tokens don't expire and can't be refreshed — clear the OAuth-only fields so
+        // the token service takes the custom-app fast path (return-as-is) rather than the refresh path.
+        refreshTokenEnc: null,
+        tokenExpiresAt: null,
+        refreshTokenExpiresAt: null,
+        authMethod: 'custom_app',
+        // A custom app's granted scopes aren't introspectable from the token, so we record the
+        // scopes we ASK the merchant to enable (DEFAULT_SCOPES). A call needing a scope they didn't
+        // grant simply 403s at request time and is surfaced then (best-effort, as elsewhere).
+        scopes: scopes && scopes.length ? scopes : DEFAULT_SCOPES,
+        shopName: shopInfo?.name || existing?.shopName || null,
+        shopCurrency: shopInfo?.currency || existing?.shopCurrency || null,
+        status: 'active',
+        updatedAt: now
+    };
+
+    if (existing) {
+        await collection.updateOne({ _id: existing._id }, { $set: setFields });
+        return toPublic({ ...existing, ...setFields });
+    }
+
+    const doc = {
+        ...setFields,
+        shopifyLocationId: null,
+        config: { ...DEFAULT_CONFIG },
+        installedAt: now,
+        lastSyncAt: null,
+        lastSyncStatus: null
+    };
+    const result = await collection.insertOne(doc);
+    return toPublic({ ...doc, _id: result.insertedId });
+}
+
+/**
+ * Parks a portal user's own OAuth-app credentials before the OAuth redirect (custom_oauth /
+ * "bring your own app" flow). Returns the inserted doc (incl. `_id`); the id is embedded in the
+ * signed OAuth `state` so {@link getAppRegistration} can recover the client secret in the callback.
+ * The client secret is encrypted at rest with the same key as tokens.
+ * @returns {Promise<{ _id: ObjectId, ownerSub: string, ownerEmail: string|null, shopDomain: string, appClientId: string }>}
+ */
+async function createAppRegistration({ ownerSub, ownerEmail, shopDomain, appClientId, appClientSecret }) {
+    const db = getDb();
+    const doc = {
+        ownerSub,
+        ownerEmail: ownerEmail || null,
+        shopDomain,
+        appClientId,
+        appClientSecretEnc: encryptToken(appClientSecret),
+        createdAt: new Date()
+    };
+    const result = await db.collection(REGISTRATION_COLLECTION).insertOne(doc);
+    return { ...doc, _id: result.insertedId };
+}
+
+/** Returns a raw app-registration doc (INCLUDING the encrypted client secret) by id, or null. */
+async function getAppRegistration(id) {
+    if (!ObjectId.isValid(id)) return null;
+    return getDb().collection(REGISTRATION_COLLECTION).findOne({ _id: new ObjectId(id) });
+}
+
+/** Deletes an app registration once its OAuth callback has completed (or on abandonment). */
+async function deleteAppRegistration(id) {
+    if (!ObjectId.isValid(id)) return;
+    await getDb().collection(REGISTRATION_COLLECTION).deleteOne({ _id: new ObjectId(id) });
+}
+
+/**
+ * Upserts a connection installed via the customer's OWN OAuth app (custom_oauth / "bring your own
+ * app"). Identical token model to the shared-app {@link upsertConnection} (expiring offline token
+ * + refresh token), but ALSO stores the app's `appClientId` and encrypted `appClientSecretEnc` so
+ * the token service can refresh with the RIGHT app's credentials and the webhook handler can verify
+ * that app's HMAC. Keyed by (ownerSub, shopDomain); preserves an existing `config` on reconnect.
+ * @returns {Promise<Object>} the public-shaped connection
+ */
+async function upsertCustomOAuthConnection({ ownerSub, ownerEmail, shopDomain, accessToken, refreshToken, expiresIn, refreshTokenExpiresIn, scopes, shopInfo, appClientId, appClientSecret }) {
+    const db = getDb();
+    const collection = db.collection(COLLECTION_NAME);
+    const now = new Date();
+
+    const existing = await collection.findOne({ ownerSub, shopDomain });
+
+    const setFields = {
+        ownerSub,
+        ownerEmail: ownerEmail || null,
+        shopDomain,
+        accessTokenEnc: encryptToken(accessToken),
+        refreshTokenEnc: refreshToken ? encryptToken(refreshToken) : null,
+        tokenExpiresAt: expiryDate(expiresIn),
+        refreshTokenExpiresAt: expiryDate(refreshTokenExpiresIn),
+        authMethod: 'custom_oauth',
+        appClientId,
+        appClientSecretEnc: encryptToken(appClientSecret),
+        scopes: scopes && scopes.length ? scopes : DEFAULT_SCOPES,
+        shopName: shopInfo?.name || existing?.shopName || null,
+        shopCurrency: shopInfo?.currency || existing?.shopCurrency || null,
+        status: 'active',
+        updatedAt: now
+    };
+
+    if (existing) {
+        await collection.updateOne({ _id: existing._id }, { $set: setFields });
+        return toPublic({ ...existing, ...setFields });
+    }
+
+    const doc = {
+        ...setFields,
+        shopifyLocationId: null,
+        config: { ...DEFAULT_CONFIG },
+        installedAt: now,
+        lastSyncAt: null,
+        lastSyncStatus: null
+    };
+    const result = await collection.insertOne(doc);
+    return toPublic({ ...doc, _id: result.insertedId });
+}
+
+/**
+ * Returns ALL raw connection docs (INCLUDING encrypted secrets) for a shop domain. Used by the
+ * webhook handler to find a custom_oauth app's client secret so it can verify a webhook signed
+ * with that app's secret rather than the shared one. Never expose the result over the API.
+ * @returns {Promise<Array<Object>>}
+ */
+async function findRawByShopDomain(shopDomain) {
+    return getDb().collection(COLLECTION_NAME).find({ shopDomain }).toArray();
 }
 
 /**
@@ -172,6 +329,9 @@ async function claimPendingConnection({ shopDomain, claimTokenHash, ownerSub, ow
                 tokenExpiresAt: pending.tokenExpiresAt,
                 refreshTokenExpiresAt: pending.refreshTokenExpiresAt,
                 scopes: pending.scopes,
+                // A pending row always comes from OAuth — stamp it so claiming onto a store that was
+                // previously connected via the custom-app (Prerelease) flow clears that marker.
+                authMethod: 'oauth',
                 shopName: pending.shopName || existingOwned.shopName || null,
                 shopCurrency: pending.shopCurrency || existingOwned.shopCurrency || null,
                 ownerEmail: ownerEmail || existingOwned.ownerEmail || null,
@@ -509,6 +669,10 @@ async function ensureIndexes() {
         await db.collection(COLLECTION_NAME).createIndex({ shopDomain: 1 });
         await db.collection(COLLECTION_NAME).createIndex({ status: 1 });
 
+        // Pre-OAuth app registrations (custom_oauth flow) self-expire an hour after creation so an
+        // abandoned "Connect" never leaves an app's client secret parked indefinitely.
+        await db.collection(REGISTRATION_COLLECTION).createIndex({ createdAt: 1 }, { expireAfterSeconds: 3600 });
+
         // Forward-declared collections for the sync engine (design §6) — index now so the
         // data plane can be added later without a migration.
         await db.collection('shopify_product_map').createIndex({ connectionId: 1, sku: 1 });
@@ -528,6 +692,12 @@ module.exports = {
     DEFAULT_CONFIG,
     canPublish,
     upsertConnection,
+    upsertCustomAppConnection,
+    upsertCustomOAuthConnection,
+    createAppRegistration,
+    getAppRegistration,
+    deleteAppRegistration,
+    findRawByShopDomain,
     createPendingConnection,
     claimPendingConnection,
     getPendingByClaim,

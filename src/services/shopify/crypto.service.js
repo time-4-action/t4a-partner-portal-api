@@ -79,6 +79,10 @@ function signState(data) {
         nonce: crypto.randomBytes(16).toString('hex'),
         ts: Date.now()
     };
+    // Per-customer (custom_oauth) installs carry the flow kind + the app-registration id, so the
+    // callback can find which app's secret to verify/exchange with (see shopifyOAuth.handleCustomCallback).
+    if (data.kind) payload.kind = data.kind;
+    if (data.reg) payload.reg = data.reg;
     const body = base64url(JSON.stringify(payload));
     const sig = base64url(crypto.createHmac('sha256', getStateSecret()).update(body).digest());
     return `${body}.${sig}`;
@@ -102,15 +106,16 @@ function verifyState(state, maxAgeMs = 10 * 60 * 1000) {
 }
 
 /**
- * Verifies the HMAC on an OAuth callback query string.
+ * Verifies the HMAC on an OAuth callback query string against a GIVEN app secret.
  * Shopify signs all params except `hmac`/`signature`, sorted, joined `k=v&k=v`,
- * HMAC-SHA256 with the app secret, hex-encoded.
+ * HMAC-SHA256 with the app secret, hex-encoded. Used for per-customer (custom_oauth) apps
+ * whose callback is signed with THEIR secret, not our shared one.
  * @param {Object} query - parsed query params
+ * @param {string} secret - the app's client secret
  * @returns {boolean}
  */
-function verifyOAuthHmac(query) {
-    const secret = process.env.SHOPIFY_API_SECRET;
-    if (!secret) throw new Error('SHOPIFY_API_SECRET must be set.');
+function verifyOAuthHmacWithSecret(query, secret) {
+    if (!secret) return false;
     const { hmac, signature, ...rest } = query;
     if (!hmac) return false;
     const message = Object.keys(rest)
@@ -122,7 +127,32 @@ function verifyOAuthHmac(query) {
 }
 
 /**
- * Verifies a Shopify webhook HMAC (`X-Shopify-Hmac-Sha256`) against the raw body.
+ * Verifies the OAuth callback HMAC using the shared app secret (SHOPIFY_API_SECRET).
+ * @param {Object} query - parsed query params
+ * @returns {boolean}
+ */
+function verifyOAuthHmac(query) {
+    const secret = process.env.SHOPIFY_API_SECRET;
+    if (!secret) throw new Error('SHOPIFY_API_SECRET must be set.');
+    return verifyOAuthHmacWithSecret(query, secret);
+}
+
+/**
+ * Verifies a Shopify webhook HMAC (`X-Shopify-Hmac-Sha256`) against the raw body using a GIVEN
+ * app secret. Used for per-customer (custom_oauth) apps whose webhooks are signed with THEIR secret.
+ * @param {Buffer|string} rawBody - the exact bytes Shopify sent (NOT re-serialized JSON)
+ * @param {string} hmacHeader - base64 HMAC from the request header
+ * @param {string} secret - the app's client secret
+ * @returns {boolean}
+ */
+function verifyWebhookHmacWithSecret(rawBody, hmacHeader, secret) {
+    if (!secret || !rawBody || !hmacHeader) return false;
+    const digest = crypto.createHmac('sha256', secret).update(rawBody).digest('base64');
+    return timingSafeEqualStr(digest, String(hmacHeader));
+}
+
+/**
+ * Verifies a Shopify webhook HMAC against the raw body using the shared app secret.
  * @param {Buffer|string} rawBody - the exact bytes Shopify sent (NOT re-serialized JSON)
  * @param {string} hmacHeader - base64 HMAC from the request header
  * @returns {boolean}
@@ -130,9 +160,7 @@ function verifyOAuthHmac(query) {
 function verifyWebhookHmac(rawBody, hmacHeader) {
     const secret = process.env.SHOPIFY_API_SECRET;
     if (!secret) throw new Error('SHOPIFY_API_SECRET must be set.');
-    if (!rawBody || !hmacHeader) return false;
-    const digest = crypto.createHmac('sha256', secret).update(rawBody).digest('base64');
-    return timingSafeEqualStr(digest, String(hmacHeader));
+    return verifyWebhookHmacWithSecret(rawBody, hmacHeader, secret);
 }
 
 /**
@@ -172,7 +200,9 @@ module.exports = {
     signState,
     verifyState,
     verifyOAuthHmac,
+    verifyOAuthHmacWithSecret,
     verifyWebhookHmac,
+    verifyWebhookHmacWithSecret,
     makeClaimToken,
     hashClaimToken
 };

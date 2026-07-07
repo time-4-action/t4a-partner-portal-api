@@ -16,9 +16,21 @@ router.get('/entry', shopifyController.entry);
 // `connect` is started by a logged-in portal user (JWT + export role).
 router.get('/connect', jwtCheck, requireExportRole, requireAlpha, shopifyController.connect);
 
+// `connect-custom` is the "Shopify Prerelease" (Route B) path — a logged-in portal user pastes a
+// custom-app Admin API token instead of running OAuth. Same gating as `connect`.
+router.post('/connect-custom', jwtCheck, requireExportRole, requireAlpha, shopifyController.connectCustom);
+
+// `connect-custom-oauth` is the "Shopify Prerelease" bring-your-own-OAuth-app path — a logged-in
+// portal user pastes their app's client_id + client_secret; we return their app's authorize URL.
+router.post('/connect-custom-oauth', jwtCheck, requireExportRole, requireAlpha, shopifyController.connectCustomOAuth);
+
 // `callback` is hit by the browser redirect from Shopify — NO JWT. It is secured by
 // the OAuth HMAC + the signed `state` nonce instead (see crypto.service).
 router.get('/callback', shopifyController.callback);
+
+// `callback-custom` is the redirect target for a bring-your-own-OAuth-app install — NO JWT.
+// Secured by the signed `state` (identifies the app) + that app's own HMAC (see shopifyOAuth).
+router.get('/callback-custom', shopifyController.callbackCustom);
 
 // ─── Post-install claim / decline (Shopify-initiated pending connections) ───────
 // `claim` binds a pending install to the signed-in approved partner (alpha-gated). `decline` is
@@ -32,6 +44,8 @@ router.get('/status', jwtCheck, requireExportRole, requireAlpha, shopifyControll
 router.get('/connections', jwtCheck, requireExportRole, requireAlpha, shopifyController.connections);
 router.get('/pricelists', jwtCheck, requireExportRole, requireAlpha, shopifyController.pricelists);
 router.get('/connection/:id/detail', jwtCheck, requireExportRole, requireAlpha, shopifyController.connectionDetail);
+// Reconnect a bring-your-own-app (custom_oauth) store using its stored app credentials.
+router.get('/connection/:id/reconnect-custom', jwtCheck, requireExportRole, requireAlpha, shopifyController.reconnectCustomOAuth);
 router.put('/connection/:id/config', jwtCheck, requireExportRole, requireAlpha, shopifyController.updateConfig);
 router.post('/connection/:id/sync', jwtCheck, requireExportRole, requireAlpha, shopifyController.sync);
 router.post('/connection/:id/recreate', jwtCheck, requireExportRole, requireAlpha, shopifyController.recreate);

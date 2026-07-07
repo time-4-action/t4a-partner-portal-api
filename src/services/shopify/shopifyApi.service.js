@@ -22,15 +22,17 @@ const API_VERSION = process.env.SHOPIFY_API_VERSION || '2026-04';
  *
  * @param {string} shop - full myshopify domain
  * @param {string} code - authorization code from the callback
+ * @param {{ clientId?: string, clientSecret?: string }} [creds] - per-app credentials for a
+ *   custom_oauth (bring-your-own) app; defaults to the shared app's env credentials.
  * @returns {Promise<{ access_token: string, scope: string, expires_in: number,
  *   refresh_token: string, refresh_token_expires_in: number }>}
  */
-async function exchangeCodeForToken(shop, code) {
+async function exchangeCodeForToken(shop, code, creds = {}) {
     const { data } = await axios.post(
         `https://${shop}/admin/oauth/access_token`,
         {
-            client_id: process.env.SHOPIFY_API_KEY,
-            client_secret: process.env.SHOPIFY_API_SECRET,
+            client_id: creds.clientId || process.env.SHOPIFY_API_KEY,
+            client_secret: creds.clientSecret || process.env.SHOPIFY_API_SECRET,
             code,
             expiring: '1'
         },
@@ -46,15 +48,17 @@ async function exchangeCodeForToken(shop, code) {
  *
  * @param {string} shop - full myshopify domain
  * @param {string} refreshToken
+ * @param {{ clientId?: string, clientSecret?: string }} [creds] - per-app credentials for a
+ *   custom_oauth (bring-your-own) app; defaults to the shared app's env credentials.
  * @returns {Promise<{ access_token: string, scope: string, expires_in: number,
  *   refresh_token: string, refresh_token_expires_in: number }>}
  */
-async function refreshAccessToken(shop, refreshToken) {
+async function refreshAccessToken(shop, refreshToken, creds = {}) {
     const { data } = await axios.post(
         `https://${shop}/admin/oauth/access_token`,
         {
-            client_id: process.env.SHOPIFY_API_KEY,
-            client_secret: process.env.SHOPIFY_API_SECRET,
+            client_id: creds.clientId || process.env.SHOPIFY_API_KEY,
+            client_secret: creds.clientSecret || process.env.SHOPIFY_API_SECRET,
             grant_type: 'refresh_token',
             refresh_token: refreshToken
         },

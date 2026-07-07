@@ -7,7 +7,7 @@ const syncService = require('../services/shopify/shopifySync.service');
 const syncJobs = require('../services/shopify/shopifySyncJobs.service');
 const productMap = require('../services/shopify/shopifyProductMap.service');
 const { getDistinctPricelists } = require('../services/customExport.service');
-const { verifyOAuthHmac, verifyWebhookHmac, hashClaimToken } = require('../services/shopify/crypto.service');
+const { verifyOAuthHmac, verifyWebhookHmac, verifyWebhookHmacWithSecret, decryptToken, hashClaimToken } = require('../services/shopify/crypto.service');
 const { recordActivity } = require('../services/activity.service');
 
 /**
@@ -139,6 +139,19 @@ function welcomeUrl(returnUrl) {
 }
 
 /**
+ * Where the browser is sent back after a CUSTOM_OAUTH (Prerelease) install completes. Explicit
+ * `SHOPIFY_PORTAL_PRERELEASE_RETURN_URL` wins; otherwise it's the normal return URL with the path
+ * swapped to the prerelease page, so a store connected from Prerelease lands back on Prerelease.
+ */
+function prereleaseReturnUrl() {
+    if (process.env.SHOPIFY_PORTAL_PRERELEASE_RETURN_URL) return process.env.SHOPIFY_PORTAL_PRERELEASE_RETURN_URL;
+    const base = process.env.SHOPIFY_PORTAL_RETURN_URL || '/';
+    return base.includes('/integrations/shopify')
+        ? base.replace('/integrations/shopify', '/integrations/shopify-prerelease')
+        : base;
+}
+
+/**
  * GET /shopify/connect?shop= — start OAuth. Returns the Shopify authorize URL for the
  * browser to redirect to (the UI does `window.location = url`).
  */
@@ -147,6 +160,139 @@ exports.connect = async (req, res) => {
         const { sub, email } = authUser(req);
         const { url, shop } = oauthService.buildInstallUrl({ shopInput: req.query.shop, sub, email });
         res.json({ success: true, url, shop });
+    } catch (error) {
+        handleError(res, error);
+    }
+};
+
+/**
+ * POST /shopify/connect-custom — "Shopify Prerelease" / Route B: bind a store using a
+ * merchant-supplied **custom-app** Admin API access token instead of OAuth. This lets pilot
+ * customers use the integration before the public app clears Shopify review — each creates a
+ * custom app in their own store admin, enables the Admin API scopes, and pastes the token here.
+ *
+ * Body: `{ shop, accessToken }`. We validate the token by fetching shop info (so a bad token or
+ * wrong store is rejected before anything is stored), then upsert an active, owner-bound
+ * connection with `authMethod: 'custom_app'`. Everything downstream (config, sync, activity,
+ * disconnect) is shared with the OAuth flow.
+ */
+exports.connectCustom = async (req, res) => {
+    try {
+        const { sub, email } = authUser(req);
+        const shop = oauthService.normalizeShopDomain(req.body?.shop);
+        const accessToken = String(req.body?.accessToken || '').trim();
+        if (!shop) {
+            const error = new Error('Enter a valid store domain (your-store.myshopify.com).');
+            error.code = 'VALIDATION_ERROR';
+            throw error;
+        }
+        if (!accessToken) {
+            const error = new Error('Paste the Admin API access token from your custom app.');
+            error.code = 'VALIDATION_ERROR';
+            throw error;
+        }
+
+        // Validate the token against the store BEFORE persisting anything. getShopInfo also returns
+        // the store's own myshopifyDomain, so we can catch a token pasted for the wrong store.
+        let shopInfo;
+        try {
+            shopInfo = await shopifyGraphql.getShopInfo(shop, accessToken);
+        } catch (err) {
+            const error = new Error(
+                err.code === 'SHOPIFY_AUTH'
+                    ? 'That token was rejected by the store. Check you pasted the Admin API access token (it starts with "shpat_") and that the custom app is installed with the required scopes.'
+                    : `Couldn't reach ${shop}. Check the store domain is correct and try again.`
+            );
+            error.code = 'VALIDATION_ERROR';
+            throw error;
+        }
+        if (shopInfo?.domain && shopInfo.domain !== shop) {
+            const error = new Error(`That token belongs to ${shopInfo.domain}, not ${shop}. Enter the matching store domain.`);
+            error.code = 'VALIDATION_ERROR';
+            throw error;
+        }
+
+        const connection = await connectionService.upsertCustomAppConnection({
+            ownerSub: sub,
+            ownerEmail: email,
+            shopDomain: shop,
+            accessToken,
+            shopInfo
+        });
+        recordActivity('shopify_connect', {
+            ownerSub: sub, email,
+            resourceType: 'shopify_connection', resourceId: connection?._id,
+            metadata: { shopDomain: shop, method: 'custom_app' }
+        });
+        res.json({ success: true, connection });
+    } catch (error) {
+        handleError(res, error);
+    }
+};
+
+/**
+ * POST /shopify/connect-custom-oauth — "Shopify Prerelease" via the customer's OWN OAuth app
+ * (bring-your-own-app). Body: `{ shop, clientId, clientSecret }`. Parks the app credentials in a
+ * one-time registration, then returns the Shopify authorize URL (built with the customer's
+ * client_id) for the browser to redirect to. The real install completes at `/callback-custom`.
+ */
+exports.connectCustomOAuth = async (req, res) => {
+    try {
+        const { sub, email } = authUser(req);
+        const shop = oauthService.normalizeShopDomain(req.body?.shop);
+        const clientId = String(req.body?.clientId || '').trim();
+        const clientSecret = String(req.body?.clientSecret || '').trim();
+        if (!shop) {
+            const error = new Error('Enter a valid store domain (your-store.myshopify.com).');
+            error.code = 'VALIDATION_ERROR';
+            throw error;
+        }
+        if (!clientId || !clientSecret) {
+            const error = new Error("Paste your app's API key (client ID) and API secret key.");
+            error.code = 'VALIDATION_ERROR';
+            throw error;
+        }
+        const registration = await connectionService.createAppRegistration({
+            ownerSub: sub, ownerEmail: email, shopDomain: shop, appClientId: clientId, appClientSecret: clientSecret
+        });
+        const { url } = oauthService.buildCustomInstallUrl({
+            shopInput: shop, sub, email, clientId, registrationId: registration._id.toString()
+        });
+        res.json({ success: true, url, shop });
+    } catch (error) {
+        handleError(res, error);
+    }
+};
+
+/**
+ * GET /shopify/connection/:id/reconnect-custom — re-run OAuth for a bring-your-own-app
+ * (custom_oauth) store using its ALREADY-STORED app credentials (no re-paste). Owner-checked.
+ * Returns the store's authorize URL. Used when the token can no longer be refreshed.
+ */
+exports.reconnectCustomOAuth = async (req, res) => {
+    try {
+        const connection = await loadOwned(req);
+        if (connection.authMethod !== 'custom_oauth') {
+            const error = new Error('This store was not connected with your own app.');
+            error.code = 'BAD_REQUEST';
+            throw error;
+        }
+        const raw = await connectionService.getConnectionWithToken(connection._id);
+        if (!raw?.appClientId || !raw?.appClientSecretEnc) {
+            const error = new Error('This connection is missing its app credentials — reconnect from the connect screen.');
+            error.code = 'BAD_REQUEST';
+            throw error;
+        }
+        const { sub, email } = authUser(req);
+        const clientId = raw.appClientId;
+        const clientSecret = decryptToken(raw.appClientSecretEnc);
+        const registration = await connectionService.createAppRegistration({
+            ownerSub: sub, ownerEmail: email, shopDomain: connection.shopDomain, appClientId: clientId, appClientSecret: clientSecret
+        });
+        const { url } = oauthService.buildCustomInstallUrl({
+            shopInput: connection.shopDomain, sub, email, clientId, registrationId: registration._id.toString()
+        });
+        res.json({ success: true, url });
     } catch (error) {
         handleError(res, error);
     }
@@ -217,6 +363,28 @@ exports.callback = async (req, res) => {
         console.error('[shopify] callback failed:', error.code || '', error.message);
         const sep = returnUrl.includes('?') ? '&' : '?';
         res.redirect(`${returnUrl}${sep}shopify=error&reason=${encodeURIComponent(error.code || 'SERVER_ERROR')}`);
+    }
+};
+
+/**
+ * GET /shopify/callback-custom — OAuth redirect target for a CUSTOM_OAUTH (Prerelease) install.
+ * Verifies + persists using the customer's own app credentials, then 302s the browser back to the
+ * Prerelease page. On error, redirects with `?shopify=error` rather than a raw 500.
+ */
+exports.callbackCustom = async (req, res) => {
+    const returnUrl = prereleaseReturnUrl();
+    const sep = returnUrl.includes('?') ? '&' : '?';
+    try {
+        const { connection, webhooks } = await oauthService.handleCustomCallback(req.query);
+        let target = `${returnUrl}${sep}shopify=connected&shop=${encodeURIComponent(connection.shopDomain)}`;
+        if (webhooks.failed.length) target += '&webhooks=partial';
+        res.redirect(target);
+    } catch (error) {
+        console.error('[shopify] custom callback failed:', error.code || '', error.reason || '', error.message);
+        // Surface the specific reason (e.g. state_expired, state_shop_mismatch) so the browser banner
+        // and the API log both say exactly what failed.
+        const reason = error.reason || error.code || 'SERVER_ERROR';
+        res.redirect(`${returnUrl}${sep}shopify=error&reason=${encodeURIComponent(reason)}`);
     }
 };
 
@@ -526,12 +694,16 @@ exports.disconnect = async (req, res) => {
         // Best-effort self-uninstall so the app is removed in Shopify too, not just in the portal.
         // If the token can't be obtained/used (already uninstalled, refresh dead), we still drop
         // our record — the merchant's app card may linger but it has no working access either way.
-        try {
-            const token = await tokenService.getValidAccessToken(connection._id);
-            await shopifyApi.uninstallApp(connection.shopDomain, token);
-        } catch (err) {
-            console.warn('[shopify] self-uninstall on disconnect failed (continuing):',
-                err.code || err.response?.status || err.message);
+        // Skipped for custom-app (Prerelease) connections: there is no OAuth app to uninstall — the
+        // merchant owns that custom app in their own admin — so we just drop our record and token.
+        if (connection.authMethod !== 'custom_app') {
+            try {
+                const token = await tokenService.getValidAccessToken(connection._id);
+                await shopifyApi.uninstallApp(connection.shopDomain, token);
+            } catch (err) {
+                console.warn('[shopify] self-uninstall on disconnect failed (continuing):',
+                    err.code || err.response?.status || err.message);
+            }
         }
         await connectionService.deleteConnection(req.params.id);
         // Drop the now-orphaned product map (so a later reinstall re-matches cleanly) and the
@@ -549,12 +721,37 @@ exports.disconnect = async (req, res) => {
  * `X-Shopify-Topic` header. Always responds 200 quickly (Shopify retries on non-2xx); the
  * GDPR topics are acknowledged even though this is a one-way push app holding no customer data.
  */
+/**
+ * Fallback webhook verification for custom_oauth (bring-your-own-app) connections: a webhook from
+ * such an app is signed with THAT app's secret, not our shared one. Look up the shop's connections
+ * and try each stored app secret. Best-effort — any lookup/decrypt error just means "not verified".
+ */
+async function verifyWebhookForShop(rawBody, hmac, shopDomain) {
+    if (!shopDomain || !hmac) return false;
+    let conns;
+    try {
+        conns = await connectionService.findRawByShopDomain(shopDomain);
+    } catch {
+        return false;
+    }
+    for (const c of conns) {
+        if (c.authMethod === 'custom_oauth' && c.appClientSecretEnc) {
+            try {
+                if (verifyWebhookHmacWithSecret(rawBody, hmac, decryptToken(c.appClientSecretEnc))) return true;
+            } catch {
+                // try the next connection
+            }
+        }
+    }
+    return false;
+}
+
 exports.webhook = async (req, res) => {
     const hmac = req.get('X-Shopify-Hmac-Sha256');
     const topic = req.get('X-Shopify-Topic');
     const shopDomain = req.get('X-Shopify-Shop-Domain');
 
-    if (!verifyWebhookHmac(req.rawBody, hmac)) {
+    if (!verifyWebhookHmac(req.rawBody, hmac) && !(await verifyWebhookForShop(req.rawBody, hmac, shopDomain))) {
         return res.status(401).json({ message: 'Invalid webhook HMAC' });
     }
 
