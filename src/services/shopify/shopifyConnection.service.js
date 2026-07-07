@@ -530,6 +530,12 @@ async function updateConnectionConfig(id, patch) {
         }
     }
     if ('shopifyLocationId' in patch) set.shopifyLocationId = patch.shopifyLocationId;
+    // Optional friendly label a partner gives a store (shown in the switcher pill + panel header).
+    // Trimmed; an empty string clears it so the UI falls back to the raw *.myshopify.com domain.
+    if ('displayName' in patch) {
+        const name = typeof patch.displayName === 'string' ? patch.displayName.trim() : '';
+        set.displayName = name ? name.slice(0, 60) : null;
+    }
 
     const result = await collection.findOneAndUpdate(
         { _id: new ObjectId(id) },

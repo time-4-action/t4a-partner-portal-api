@@ -100,10 +100,13 @@ async function handleCallback(query) {
         error.code = 'INVALID_STATE';
         throw error;
     }
+    // The callback's `shop` is the store's canonical *.myshopify.com domain, which can differ from
+    // what the user typed to START the flow — e.g. they entered a store alias or the (renamed)
+    // subdomain rather than the permanent one Shopify redirects back with. The HMAC above already
+    // proved Shopify sent THIS callback for `normalized`, so it's authoritative: log the divergence
+    // but proceed with the canonical domain instead of hard-failing with a confusing "invalid state".
     if (payload.shop !== normalized) {
-        const error = new Error('State/shop mismatch');
-        error.code = 'INVALID_STATE';
-        throw error;
+        console.warn(`[shopify] OAuth callback shop (${normalized}) differs from the requested domain (${payload.shop}); binding to the canonical callback domain.`);
     }
 
     // Shopify-initiated install: no portal user yet. Exchange the code and persist a PENDING
@@ -244,10 +247,9 @@ async function handleCustomCallback(query) {
     }
 
     const normalized = normalizeShopDomain(shop);
-    if (!normalized || payload.shop !== normalized) {
-        const error = new Error(`State/shop mismatch (state=${payload.shop}, callback=${normalized})`);
-        error.code = 'INVALID_STATE';
-        error.reason = 'state_shop_mismatch';
+    if (!normalized) {
+        const error = new Error('Invalid shop domain');
+        error.code = 'VALIDATION_ERROR';
         throw error;
     }
 
@@ -265,6 +267,13 @@ async function handleCustomCallback(query) {
         const error = new Error('HMAC validation failed');
         error.code = 'INVALID_HMAC';
         throw error;
+    }
+
+    // HMAC proved Shopify sent this callback for `normalized`. As in the shared-app flow, the
+    // canonical callback domain can differ from what the customer typed (an alias or renamed
+    // subdomain); trust the HMAC-verified domain and log rather than failing with an invalid-state.
+    if (payload.shop !== normalized) {
+        console.warn(`[shopify] Custom OAuth callback shop (${normalized}) differs from the requested domain (${payload.shop}); binding to the canonical callback domain.`);
     }
 
     // 3) Exchange the code with the customer's own app credentials.

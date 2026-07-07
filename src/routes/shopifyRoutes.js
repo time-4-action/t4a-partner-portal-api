@@ -4,8 +4,10 @@ const router = express.Router();
 const jwtCheck = require('../middleware/auth0');
 const requireExportRole = require('../middleware/requireExportRole');
 const requireTier = require('../middleware/requireTier');
-// Shopify + Own Sources are in the ALPHA program (design: early-access tiers) — flip or drop here.
-const requireAlpha = requireTier('alpha');
+// Shopify is now generally available — the shared public-app OAuth + all connection management are
+// gated only by the `export` role. The legacy "bring your own custom app" (Deprecated) connect
+// entry points stay behind the `beta` tier while that flow is wound down.
+const requireBeta = requireTier('beta');
 const shopifyController = require('../controllers/shopifyController');
 
 // ─── OAuth ────────────────────────────────────────────────────────────────────
@@ -14,15 +16,15 @@ const shopifyController = require('../controllers/shopifyController');
 router.get('/entry', shopifyController.entry);
 
 // `connect` is started by a logged-in portal user (JWT + export role).
-router.get('/connect', jwtCheck, requireExportRole, requireAlpha, shopifyController.connect);
+router.get('/connect', jwtCheck, requireExportRole, shopifyController.connect);
 
-// `connect-custom` is the "Shopify Prerelease" (Route B) path — a logged-in portal user pastes a
-// custom-app Admin API token instead of running OAuth. Same gating as `connect`.
-router.post('/connect-custom', jwtCheck, requireExportRole, requireAlpha, shopifyController.connectCustom);
+// `connect-custom` is the "Shopify Deprecated" (Route B) path — a logged-in portal user pastes a
+// custom-app Admin API token instead of running OAuth. Kept on the beta tier while it's deprecated.
+router.post('/connect-custom', jwtCheck, requireExportRole, requireBeta, shopifyController.connectCustom);
 
-// `connect-custom-oauth` is the "Shopify Prerelease" bring-your-own-OAuth-app path — a logged-in
+// `connect-custom-oauth` is the "Shopify Deprecated" bring-your-own-OAuth-app path — a logged-in
 // portal user pastes their app's client_id + client_secret; we return their app's authorize URL.
-router.post('/connect-custom-oauth', jwtCheck, requireExportRole, requireAlpha, shopifyController.connectCustomOAuth);
+router.post('/connect-custom-oauth', jwtCheck, requireExportRole, requireBeta, shopifyController.connectCustomOAuth);
 
 // `callback` is hit by the browser redirect from Shopify — NO JWT. It is secured by
 // the OAuth HMAC + the signed `state` nonce instead (see crypto.service).
@@ -33,24 +35,23 @@ router.get('/callback', shopifyController.callback);
 router.get('/callback-custom', shopifyController.callbackCustom);
 
 // ─── Post-install claim / decline (Shopify-initiated pending connections) ───────
-// `claim` binds a pending install to the signed-in approved partner (alpha-gated). `decline` is
-// the clean break for a non-approved install — NOT alpha-gated (a signed-in user without the tier
-// must be able to tidy up their own install); the one-time claim token authorizes both.
-router.post('/connection/claim', jwtCheck, requireExportRole, requireAlpha, shopifyController.claim);
+// `claim` binds a pending install to the signed-in partner. `decline` is the clean break for a
+// merchant who doesn't want to connect — both are authorized by the one-time claim token.
+router.post('/connection/claim', jwtCheck, requireExportRole, shopifyController.claim);
 router.post('/connection/decline', jwtCheck, requireExportRole, shopifyController.decline);
 
 // ─── Connection management (JWT + export role, owner-checked in controller) ─────
-router.get('/status', jwtCheck, requireExportRole, requireAlpha, shopifyController.status);
-router.get('/connections', jwtCheck, requireExportRole, requireAlpha, shopifyController.connections);
-router.get('/pricelists', jwtCheck, requireExportRole, requireAlpha, shopifyController.pricelists);
-router.get('/connection/:id/detail', jwtCheck, requireExportRole, requireAlpha, shopifyController.connectionDetail);
+router.get('/status', jwtCheck, requireExportRole, shopifyController.status);
+router.get('/connections', jwtCheck, requireExportRole, shopifyController.connections);
+router.get('/pricelists', jwtCheck, requireExportRole, shopifyController.pricelists);
+router.get('/connection/:id/detail', jwtCheck, requireExportRole, shopifyController.connectionDetail);
 // Reconnect a bring-your-own-app (custom_oauth) store using its stored app credentials.
-router.get('/connection/:id/reconnect-custom', jwtCheck, requireExportRole, requireAlpha, shopifyController.reconnectCustomOAuth);
-router.put('/connection/:id/config', jwtCheck, requireExportRole, requireAlpha, shopifyController.updateConfig);
-router.post('/connection/:id/sync', jwtCheck, requireExportRole, requireAlpha, shopifyController.sync);
-router.post('/connection/:id/recreate', jwtCheck, requireExportRole, requireAlpha, shopifyController.recreate);
-router.get('/connection/:id/activity', jwtCheck, requireExportRole, requireAlpha, shopifyController.activity);
-router.delete('/connection/:id', jwtCheck, requireExportRole, requireAlpha, shopifyController.disconnect);
+router.get('/connection/:id/reconnect-custom', jwtCheck, requireExportRole, shopifyController.reconnectCustomOAuth);
+router.put('/connection/:id/config', jwtCheck, requireExportRole, shopifyController.updateConfig);
+router.post('/connection/:id/sync', jwtCheck, requireExportRole, shopifyController.sync);
+router.post('/connection/:id/recreate', jwtCheck, requireExportRole, shopifyController.recreate);
+router.get('/connection/:id/activity', jwtCheck, requireExportRole, shopifyController.activity);
+router.delete('/connection/:id', jwtCheck, requireExportRole, shopifyController.disconnect);
 
 // ─── Webhooks ───────────────────────────────────────────────────────────────
 // HMAC-verified against the raw body (captured in app.js). No JWT — Shopify calls this.
