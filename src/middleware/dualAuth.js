@@ -1,5 +1,6 @@
 const jwtCheck = require('./auth0');
 const apiKeyService = require('../services/apiKey.service');
+const { touchLastActive } = require('../services/activity.service');
 
 /**
  * Dual-auth middleware: tries JWT first, falls back to API key.
@@ -19,6 +20,8 @@ async function dualAuth(req, res, next) {
                 sub: payload.sub,
                 email: payload.email
             };
+            // Fire-and-forget: record last-active + emit a login event on session start.
+            touchLastActive(payload.sub, payload.email);
             return next();
         });
     }
@@ -32,8 +35,15 @@ async function dualAuth(req, res, next) {
             req.authContext = {
                 type: 'apikey',
                 sub: `apikey:${result.keyId}`,
-                exportId: result.exportConfig._id.toString()
+                exportId: result.exportConfig._id.toString(),
+                // The Auth0 owner behind this key — used to attribute activity to a real partner.
+                ownerSub: result.exportConfig.owner?.sub || null,
+                email: result.exportConfig.owner?.email || null
             };
+            // Attribute api-key traffic to the export owner (a real partner), not the key id.
+            if (req.authContext.ownerSub) {
+                touchLastActive(req.authContext.ownerSub, req.authContext.email);
+            }
             return next();
         } catch (err) {
             return res.status(500).json({ message: 'Authentication error' });

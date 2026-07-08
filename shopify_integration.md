@@ -1,7 +1,23 @@
 # Shopify Integration — Design Document
 
-> Status: **Draft / proposal**
+> Status: **Draft / proposal** — design frozen; **front-end UI built (mock data), backend not started.**
 > Scope: Let each partner connect their own Shopify store to the T4A Partner Portal and receive automated, near-live syncs of stock, new products, prices, descriptions, and images — driven from the existing PNV → Metakocka → MongoDB pipeline.
+
+---
+
+## 0. Implementation Status (living checklist)
+
+| Layer | Status | Where |
+|---|---|---|
+| Design doc | ✅ Done | this file (in both `t4a-partner-portal-ui` and `t4a-partner-portal-api`) |
+| Partner-facing UI | ✅ Built — **UI-only, mock data** | UI repo: `src/components/ShopifyIntegrationPage.js`, route `src/app/(protected)/integrations/shopify/`, nav link in `Navbar.js` |
+| `nextapi` proxies (`/api/export/shopify/*`) | ⬜ Not started | UI repo: would live under `src/app/nextapi/...` |
+| OAuth connect/callback | ⬜ Not started | this repo (§5) |
+| Mongo collections (`shopify_connections`, `shopify_product_map`, `shopify_sync_jobs`) | ⬜ Not started | this repo (§6) |
+| Sync engine + rate-limited queue | ⬜ Not started | this repo (§8) |
+| Webhooks (uninstall, GDPR) | ⬜ Not started | this repo (§5.4) |
+
+**To continue:** the UI's `connect / disconnect / syncNow / saveConfig` handlers and its `MOCK_*` constants are the seams — replace them with calls to the proxies once the backend exists. Open questions in §11 still need answers (esp. pricing/VAT and ownership default) before backend work starts.
 
 ---
 

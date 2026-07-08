@@ -14,7 +14,7 @@ No test suite exists (`npm test` just exits with an error).
 
 ## Architecture
 
-Node.js/Express API that syncs product data from **PNV** (Partner.net Vision) into **MongoDB**, enriches it with stock and pricing from **Metakocka**, and exposes configurable product exports. Scheduling is handled externally by **n8n** — there is no internal cron scheduler.
+Node.js/Express API that syncs product data from **PNV** (Partner.net Vision) into **MongoDB**, enriches it with stock and pricing from **Metakocka**, and exposes configurable product exports. Recurring work is scheduled **in-app**: the PNV catalogue refresh runs on the `PRODUCTS_DOWNLOAD_SCHEDULE` cron (`pnvScheduler.service.js`: PNV sync → AI categorization → Shopify push), and Own Source feeds run on their per-feed schedules (`externalScheduler.service.js`). The `/webhooks/sync/*` endpoints remain as manual/back-fill triggers (n8n no longer required).
 
 ### Startup sequence (`index.js`)
 
@@ -37,6 +37,13 @@ All routes are under `/api/export`:
 | `/api/export/recharge` | `src/routes/rechargeRoutes.js` |
 | `/api/export/webhooks` | `src/routes/webhookRoutes.js` — n8n triggers |
 
+Internal admin surface (bearer-gated by `internalAdminToken` / `PARTNER_ADMIN_TOKEN`, consumed by the t4a-admin Partners section — NOT under `/api/export`):
+
+| Prefix | File |
+|---|---|
+| `/api/admin/partners` | `src/routes/adminPartnersRoutes.js` — per-partner insight |
+| `/api/admin/system` | `src/routes/adminSystemRoutes.js` — scheduler status + manual triggers (`GET /sync`, `POST /sync/pnv/run` full pipeline, `POST /sync/own-sources/:feedId/run`). Backed by `pnvScheduler.getStatus()` / `runManualRefresh()`. |
+
 ### Authentication
 
 Two middleware options are available:
@@ -51,13 +58,13 @@ Triggered by `POST /api/export/webhooks/sync/pnv`. Responds `202` immediately an
 
 1. `pnvProductsSync.service.js` — authenticates with PNV (SHA1-hashed password in cookie), triggers CSV export, downloads CSV to `DATA_PATH/pnv/products.csv`
 2. `processPnvProductExport.service.js` — parses the CSV, maps fields via `src/config/pnv/products.js`
-3. Enriches each product with warehouse stock and pricing from Metakocka (`src/services/metakocka/`)
+3. Enriches each product with warehouse stock and pricing from Metakocka (`src/services/metakocka/`). Stock stored as `stock_amount` is the **free** (available-to-sell) amount = `free_amount`, falling back to `amount - reserved_amount` when a company has no reservations. Rows are **summed per code** across a warehouse's microlocations (`warehouse.service.js`); never use raw `amount` (it includes reservations → overselling).
 4. Upserts products into the `products` MongoDB collection; products absent from CSV are soft-deleted (`active: false`)
 5. Optionally POSTs a callback to a `webhook` URL when done
 
 ### AI categorization
 
-Triggered by `POST /api/export/webhooks/sync/ai-categorization`. Uses Google Gemini (`@google/generative-ai`) to assign categories to uncategorized products. Categories are stored as an `ai_categories` array on each product document, keyed by `exportId`.
+Triggered by `POST /api/export/webhooks/sync/ai-categorization`. Uses Anthropic Claude (`@anthropic-ai/sdk`, model `claude-haiku-4-5`, structured outputs) to assign categories to uncategorized products. Categories are stored as an `ai_categories` array on each product document, keyed by `exportId`.
 
 ### Custom exports (`src/services/customExport.service.js`)
 
@@ -77,6 +84,8 @@ The **inventory preset** uses a dedicated code path (`generateInventoryRows()`) 
 | `exports` | Export definitions (name, AI categorization enabled, roles/users) |
 | `export_configs` | Custom export configurations (fields, filters, presets) |
 | `analytics` | Function performance and API request logs |
+| `scheduler_state` | Per-scheduler state (`pnv-products-sync` last-run + lock; `shopify-pending-cleanup` last-sweep) |
+| `pnv_sync_runs` | PNV catalogue-refresh run history (one doc per run; `trigger`, `result`, `stats`, durations) |
 
 ### `products` document shape
 
@@ -89,8 +98,18 @@ A product is a **parent** with an optional `child_products` array of **variants*
 - **Publishing:** parents and variants each have a `published` flag; a published parent may contain unpublished variants. Exports are **always published-only** — `applyFilters` drops unpublished parents and narrows `child_products` to published variants.
 - **No-variant products:** if `child_products` is empty, the parent is the sellable item (use its own `code`/`pricelist`/`stock_amount`).
 
+### Planned: Shopify integration (not yet started on the backend)
+
+A full design for letting partners connect their own Shopify store and receive an automated one-way product push lives in `shopify_integration.md` at this repo's root. **No backend code exists for it yet** — the partner-facing UI has been built in the `t4a-partner-portal-ui` repo against mock data, but none of the API pieces below are implemented:
+
+- New endpoints under `/api/export/shopify/*` — OAuth `connect`/`callback`, `status`, per-connection `config`, `sync`, `disconnect`, and HMAC-verified Shopify webhooks (design §10).
+- New Mongo collections `shopify_connections`, `shopify_product_map`, `shopify_sync_jobs` (design §6).
+- A rate-limited per-shop sync engine that turns the parent/`child_products` shape into Shopify Admin API calls, reusing `getPriceFromPriority` for price resolution and the existing published-only narrowing (design §8).
+
+When picking this up, start from `shopify_integration.md` — its §0 status checklist tracks what's done, and §11 lists open questions (pricing/VAT handling, ownership default, secrets location) to settle before coding.
+
 ## Environment variables
 
-See README.md for the full table. Key variables: `MONGO_URI`, `MONGO_DB_NAME`, `PNV_BASE_URL`, `PNV_EXPORT_PRODUCTS_URL`, `PNV_USER`, `PNV_PASS`, `PNV_GROUP`, `PNV_USER_ID`, `METAKOCKA_ID`, `METAKOCKA_KEY`, `GOOGLE_API_KEY`, `WEBHOOK_API_KEY`.
+See README.md for the full table. Key variables: `MONGO_URI`, `MONGO_DB_NAME`, `PNV_BASE_URL`, `PNV_EXPORT_PRODUCTS_URL`, `PNV_USER`, `PNV_PASS`, `PNV_GROUP`, `PNV_USER_ID`, `METAKOCKA_ID`, `METAKOCKA_KEY`, `ANTHROPIC_API_KEY`, `WEBHOOK_API_KEY`, `PRODUCTS_DOWNLOAD_SCHEDULE`.
 
 `.env` files are loaded from `DATA_PATH` if set (Docker mounts `/data`), otherwise from the project root.

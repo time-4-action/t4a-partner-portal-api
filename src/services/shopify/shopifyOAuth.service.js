@@ -1,0 +1,323 @@
+const { signState, verifyState, verifyOAuthHmac, verifyOAuthHmacWithSecret, decryptToken, makeClaimToken, hashClaimToken } = require('./crypto.service');
+const shopifyApi = require('./shopifyApi.service');
+const shopifyGraphql = require('./shopifyGraphql.service');
+const connectionService = require('./shopifyConnection.service');
+
+/**
+ * OAuth orchestration for the Shopify connection lifecycle (design §5).
+ *
+ * Flow:
+ *   buildInstallUrl()  — portal user starts OAuth; we hand back the Shopify authorize URL
+ *                        with a signed `state` bound to their Auth0 sub.
+ *   handleCallback()   — Shopify redirects the browser back; we verify hmac + state,
+ *                        exchange the code, persist the (encrypted) token, register webhooks.
+ */
+
+/**
+ * Normalizes a shop input to a full `*.myshopify.com` domain.
+ * Accepts a bare subdomain (`acme`) or a full domain (`acme.myshopify.com`).
+ * @param {string} input
+ * @returns {string|null} normalized domain, or null if invalid
+ */
+function normalizeShopDomain(input) {
+    if (!input) return null;
+    let shop = String(input).trim().toLowerCase();
+    shop = shop.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+    if (!shop.includes('.')) shop = `${shop}.myshopify.com`;
+    return /^[a-z0-9][a-z0-9-]*\.myshopify\.com$/.test(shop) ? shop : null;
+}
+
+/**
+ * Builds the Shopify OAuth authorize URL.
+ *
+ * Two callers:
+ *   • Portal-initiated (`/shopify/connect`, JWT) — passes `sub`/`email`; the install binds to
+ *     that portal user directly in {@link handleCallback}.
+ *   • Shopify-initiated (the App URL `/shopify/entry`, NO portal session) — passes no `sub`. This
+ *     is the App-Store "immediately authenticate after install" path: a merchant opening the app
+ *     on a fresh store is sent straight to the OAuth grant. The resulting callback is "anonymous"
+ *     (see {@link handleCallback}) and routes the merchant into the portal to finish connecting
+ *     (sign in → the UI auto-resumes OAuth, now authenticated → the connection binds to them).
+ *
+ * @param {{ shopInput: string, sub?: string, email?: string|null }} args
+ * @returns {{ url: string, shop: string }}
+ */
+function buildInstallUrl({ shopInput, sub, email }) {
+    const shop = normalizeShopDomain(shopInput);
+    if (!shop) {
+        const error = new Error('Invalid shop domain');
+        error.code = 'VALIDATION_ERROR';
+        throw error;
+    }
+    if (!process.env.SHOPIFY_API_KEY) throw new Error('SHOPIFY_API_KEY must be set.');
+
+    // `sub` is omitted for a Shopify-initiated install — the signed state still binds the flow to
+    // this shop + a nonce (anti-CSRF); the portal user is bound later when the UI resumes OAuth.
+    const state = signState({ sub: sub || null, email: email || null, shop });
+    const params = new URLSearchParams({
+        client_id: process.env.SHOPIFY_API_KEY,
+        scope: connectionService.DEFAULT_SCOPES.join(','),
+        redirect_uri: `${process.env.SHOPIFY_API_BASE_URL}/shopify/callback`,
+        state
+    });
+    return { url: `https://${shop}/admin/oauth/authorize?${params.toString()}`, shop };
+}
+
+/**
+ * Handles the OAuth callback. Verifies hmac + state, then:
+ *   • Shopify-initiated install (no portal user in state — the App-URL path): exchanges the code
+ *     and persists a PENDING connection (ownerSub=null) bound to a one-time claim token, returning
+ *     `{ pending: true, shop, claimToken }`. The controller routes the merchant to the welcome
+ *     page; after sign-in an approved partner claims it (→ active) and a non-approved one declines
+ *     it (uninstall + delete). The cleanup sweep removes any never-claimed pending.
+ *   • Portal-initiated install (state carries the user's `sub`): exchanges the code, persists the
+ *     owned connection, and registers the API webhooks.
+ * @param {Object} query - parsed callback query (`code`, `shop`, `state`, `hmac`, ...)
+ * @returns {Promise<{ pending: true, shop: string, claimToken: string } | { connection: Object, webhooks: Object }>}
+ */
+async function handleCallback(query) {
+    const { shop, code, state } = query;
+
+    if (!verifyOAuthHmac(query)) {
+        const error = new Error('HMAC validation failed');
+        error.code = 'INVALID_HMAC';
+        throw error;
+    }
+
+    const normalized = normalizeShopDomain(shop);
+    if (!normalized) {
+        const error = new Error('Invalid shop domain');
+        error.code = 'VALIDATION_ERROR';
+        throw error;
+    }
+
+    // State proves the caller started the flow and binds it to this shop (anti-CSRF).
+    let payload;
+    try {
+        payload = verifyState(state);
+    } catch (err) {
+        const error = new Error(`Invalid state: ${err.message}`);
+        error.code = 'INVALID_STATE';
+        throw error;
+    }
+    // The callback's `shop` is the store's canonical *.myshopify.com domain, which can differ from
+    // what the user typed to START the flow — e.g. they entered a store alias or the (renamed)
+    // subdomain rather than the permanent one Shopify redirects back with. The HMAC above already
+    // proved Shopify sent THIS callback for `normalized`, so it's authoritative: log the divergence
+    // but proceed with the canonical domain instead of hard-failing with a confusing "invalid state".
+    if (payload.shop !== normalized) {
+        console.warn(`[shopify] OAuth callback shop (${normalized}) differs from the requested domain (${payload.shop}); binding to the canonical callback domain.`);
+    }
+
+    // Shopify-initiated install: no portal user yet. Exchange the code and persist a PENDING
+    // connection so we HOLD the token — an approved partner who signs in claims it (→ active),
+    // and a non-approved user (or the cleanup sweep) can self-uninstall it. The plaintext claim
+    // token travels to the merchant's browser in the welcome redirect; only its hash is stored.
+    if (!payload.sub) {
+        const tokenResp = await shopifyApi.exchangeCodeForToken(normalized, code);
+        const accessToken = tokenResp.access_token;
+        const grantedScopes = (tokenResp.scope || '').split(',').map((s) => s.trim()).filter(Boolean);
+
+        let shopInfo = null;
+        try {
+            shopInfo = await shopifyGraphql.getShopInfo(normalized, accessToken);
+        } catch (err) {
+            console.error('[shopify] getShopInfo failed (pending install):', err.message);
+        }
+
+        const claimToken = makeClaimToken();
+        await connectionService.createPendingConnection({
+            shopDomain: normalized,
+            accessToken,
+            refreshToken: tokenResp.refresh_token,
+            expiresIn: tokenResp.expires_in,
+            refreshTokenExpiresIn: tokenResp.refresh_token_expires_in,
+            scopes: grantedScopes,
+            shopInfo,
+            claimTokenHash: hashClaimToken(claimToken)
+        });
+
+        // Register app/uninstalled now so a manual uninstall before the claim still cleans us up.
+        try {
+            await shopifyGraphql.registerWebhooks(normalized, accessToken);
+        } catch (err) {
+            console.error('[shopify] webhook registration failed (pending install):', err.message);
+        }
+
+        return { pending: true, shop: normalized, claimToken };
+    }
+
+    const tokenResp = await shopifyApi.exchangeCodeForToken(normalized, code);
+    const accessToken = tokenResp.access_token;
+    const grantedScopes = (tokenResp.scope || '').split(',').map((s) => s.trim()).filter(Boolean);
+
+    // Confirm the token works and capture shop metadata; non-fatal if it fails.
+    let shopInfo = null;
+    try {
+        shopInfo = await shopifyGraphql.getShopInfo(normalized, accessToken);
+    } catch (err) {
+        console.error('[shopify] getShopInfo failed after install:', err.message);
+    }
+
+    const connection = await connectionService.upsertConnection({
+        ownerSub: payload.sub,
+        ownerEmail: payload.email,
+        shopDomain: normalized,
+        accessToken,
+        refreshToken: tokenResp.refresh_token,
+        expiresIn: tokenResp.expires_in,
+        refreshTokenExpiresIn: tokenResp.refresh_token_expires_in,
+        scopes: grantedScopes,
+        shopInfo
+    });
+
+    let webhooks = { registered: [], failed: [] };
+    try {
+        webhooks = await shopifyGraphql.registerWebhooks(normalized, accessToken);
+    } catch (err) {
+        console.error('[shopify] webhook registration failed:', err.message);
+    }
+
+    return { connection, webhooks };
+}
+
+/**
+ * Builds the Shopify OAuth authorize URL for a CUSTOM_OAUTH ("bring your own app") install. Unlike
+ * {@link buildInstallUrl} the `client_id` is the customer's OWN app id, the redirect goes to the
+ * dedicated `/shopify/callback-custom` route, and the signed state carries `kind:'custom_oauth'` +
+ * the app-registration id so the callback can recover the matching client secret.
+ * @param {{ shopInput: string, sub?: string, email?: string|null, clientId: string, registrationId: string }} args
+ * @returns {{ url: string, shop: string }}
+ */
+function buildCustomInstallUrl({ shopInput, sub, email, clientId, registrationId }) {
+    const shop = normalizeShopDomain(shopInput);
+    if (!shop) {
+        const error = new Error('Invalid shop domain');
+        error.code = 'VALIDATION_ERROR';
+        throw error;
+    }
+    if (!clientId) {
+        const error = new Error('App API key (client_id) is required.');
+        error.code = 'VALIDATION_ERROR';
+        throw error;
+    }
+    const state = signState({ sub: sub || null, email: email || null, shop, kind: 'custom_oauth', reg: registrationId });
+    const params = new URLSearchParams({
+        client_id: clientId,
+        scope: connectionService.DEFAULT_SCOPES.join(','),
+        redirect_uri: `${process.env.SHOPIFY_API_BASE_URL}/shopify/callback-custom`,
+        state
+    });
+    return { url: `https://${shop}/admin/oauth/authorize?${params.toString()}`, shop };
+}
+
+/**
+ * Handles the OAuth callback for a CUSTOM_OAUTH install. State is verified FIRST (it identifies the
+ * app registration → its client secret); only then can we verify Shopify's HMAC and exchange the
+ * code, both with the customer's OWN app credentials. On success the connection is persisted with
+ * `authMethod:'custom_oauth'` (+ the app's id/secret for later refresh & webhook verification) and
+ * the one-time registration is deleted.
+ * @param {Object} query - parsed callback query (`code`, `shop`, `state`, `hmac`, ...)
+ * @returns {Promise<{ connection: Object, webhooks: Object }>}
+ */
+async function handleCustomCallback(query) {
+    const { shop, code, state } = query;
+
+    // 1) State first — it's signed by US and tells us WHICH app (and its secret) this install is for.
+    // Allow up to 1h (matches the app-registration TTL) so time spent finishing the Dev Dashboard
+    // setup between "Connect" and approving doesn't expire the state.
+    let payload;
+    try {
+        payload = verifyState(state, 60 * 60 * 1000);
+    } catch (err) {
+        const error = new Error(`Invalid state: ${err.message}`);
+        error.code = 'INVALID_STATE';
+        // Distinguish an expired state from a bad signature / missing state, so the browser banner
+        // and logs pinpoint the cause instead of a generic INVALID_STATE.
+        error.reason = !state ? 'state_missing'
+            : /expired/i.test(err.message) ? 'state_expired'
+            : 'state_bad_signature';
+        throw error;
+    }
+    if (payload.kind !== 'custom_oauth' || !payload.reg) {
+        const error = new Error('State is not a custom-app install (wrong callback URL?)');
+        error.code = 'INVALID_STATE';
+        error.reason = 'state_not_custom';
+        throw error;
+    }
+
+    const normalized = normalizeShopDomain(shop);
+    if (!normalized) {
+        const error = new Error('Invalid shop domain');
+        error.code = 'VALIDATION_ERROR';
+        throw error;
+    }
+
+    const reg = await connectionService.getAppRegistration(payload.reg);
+    if (!reg) {
+        const error = new Error('This connection attempt expired. Start again from the portal.');
+        error.code = 'NOT_FOUND';
+        throw error;
+    }
+    const clientId = reg.appClientId;
+    const clientSecret = decryptToken(reg.appClientSecretEnc);
+
+    // 2) Now verify Shopify's HMAC using THIS app's secret (proves Shopify sent it, untampered).
+    if (!verifyOAuthHmacWithSecret(query, clientSecret)) {
+        const error = new Error('HMAC validation failed');
+        error.code = 'INVALID_HMAC';
+        throw error;
+    }
+
+    // HMAC proved Shopify sent this callback for `normalized`. As in the shared-app flow, the
+    // canonical callback domain can differ from what the customer typed (an alias or renamed
+    // subdomain); trust the HMAC-verified domain and log rather than failing with an invalid-state.
+    if (payload.shop !== normalized) {
+        console.warn(`[shopify] Custom OAuth callback shop (${normalized}) differs from the requested domain (${payload.shop}); binding to the canonical callback domain.`);
+    }
+
+    // 3) Exchange the code with the customer's own app credentials.
+    const tokenResp = await shopifyApi.exchangeCodeForToken(normalized, code, { clientId, clientSecret });
+    const accessToken = tokenResp.access_token;
+    const grantedScopes = (tokenResp.scope || '').split(',').map((s) => s.trim()).filter(Boolean);
+
+    let shopInfo = null;
+    try {
+        shopInfo = await shopifyGraphql.getShopInfo(normalized, accessToken);
+    } catch (err) {
+        console.error('[shopify] getShopInfo failed after custom install:', err.message);
+    }
+
+    const connection = await connectionService.upsertCustomOAuthConnection({
+        ownerSub: reg.ownerSub,
+        ownerEmail: reg.ownerEmail,
+        shopDomain: normalized,
+        accessToken,
+        refreshToken: tokenResp.refresh_token,
+        expiresIn: tokenResp.expires_in,
+        refreshTokenExpiresIn: tokenResp.refresh_token_expires_in,
+        scopes: grantedScopes,
+        shopInfo,
+        appClientId: clientId,
+        appClientSecret: clientSecret
+    });
+
+    let webhooks = { registered: [], failed: [] };
+    try {
+        webhooks = await shopifyGraphql.registerWebhooks(normalized, accessToken);
+    } catch (err) {
+        console.error('[shopify] webhook registration failed (custom install):', err.message);
+    }
+
+    await connectionService.deleteAppRegistration(payload.reg);
+
+    return { connection, webhooks };
+}
+
+module.exports = {
+    normalizeShopDomain,
+    buildInstallUrl,
+    handleCallback,
+    buildCustomInstallUrl,
+    handleCustomCallback
+};

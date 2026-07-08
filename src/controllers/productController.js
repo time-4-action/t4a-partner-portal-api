@@ -51,7 +51,7 @@ exports.clearAiCategoriesForExport = async (req, res) => {
 
 exports.getAllProducts = async (req, res) => {
     try {
-        const data = await productService.getAllProducts();
+        const data = await productService.getAllProducts({ publishedOnly: true });
         res.json({ success: true, data });
     } catch (error) {
         res.status(500).json({ success: false, message: error.message });
@@ -61,7 +61,7 @@ exports.getAllProducts = async (req, res) => {
 exports.getProductByIdentifier = async (req, res) => {
     try {
         const { code } = req.params;
-        const product = await productService.getProductByIdentifier(code);
+        const product = await productService.getProductByIdentifier(code, { publishedOnly: true });
         if (!product) {
             return res.status(404).json({ success: false, message: `Product with code ${code} not found.` });
         }

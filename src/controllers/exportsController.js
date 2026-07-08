@@ -56,3 +56,15 @@ exports.getExportById = async (req, res) => {
         res.status(500).json({ success: false, message: error.message });
     }
 }
+// GET /exports/:id/ai-status — latest AI-categorization run for this category set.
+// The UI polls this while a run is going to render live progress (batches/products/errors).
+const { getRunStatus } = require("../services/ai/categoryIdentification.service");
+
+exports.getAiStatus = async (req, res) => {
+    try {
+        const run = await getRunStatus(req.params.id);
+        res.json({ success: true, run });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+}

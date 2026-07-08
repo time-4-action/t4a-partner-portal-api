@@ -3,13 +3,24 @@ const { ObjectId } = require('mongodb');
 
 /**
  * Fetches all products from the database.
+ * @param {Object} [options]
+ * @param {boolean} [options.publishedOnly=false] - When true, only published &
+ *   active parents are returned, and each parent's `child_products` is narrowed
+ *   to its published variants (mirrors `applyFilters` in customExport.service.js,
+ *   which always enforces published-only so unannounced products never leak).
  * @returns {Promise<Array<Object>>} A promise that resolves with an array of product documents.
  */
-const getAllProducts = async () => {
+const getAllProducts = async ({ publishedOnly = false } = {}) => {
     try {
         const db = getDb();
-        // Fetches all documents from the 'products' collection.
-        return await db.collection('products').find({}).toArray();
+        const query = publishedOnly ? { active: { $ne: false }, published: true } : {};
+        const products = await db.collection('products').find(query).toArray();
+        if (!publishedOnly) return products;
+        // Drop unpublished variants so a published parent never exposes them.
+        return products.map(p => ({
+            ...p,
+            child_products: (p.child_products || []).filter(v => v.published),
+        }));
     } catch (error) {
         console.error('Error fetching products from database:', error);
         throw new Error('Product data is not available.');
@@ -21,22 +32,36 @@ const getAllProducts = async () => {
  * This function searches for the identifier in the main product's `code` and `token` fields,
  * as well as in the `code` and `token` fields of any child products.
  * @param {string} identifier - The code or token of the product to find.
+ * @param {Object} [options]
+ * @param {boolean} [options.publishedOnly=false] - When true, only a published &
+ *   active parent is returned, and its `child_products` is narrowed to published
+ *   variants (mirrors `getAllProducts` so the detail view never exposes an
+ *   unpublished parent or unpublished sub-variants).
  * @returns {Promise<Object|null>} A promise that resolves with the product document or null if not found.
  */
-const getProductByIdentifier = async (identifier) => {
+const getProductByIdentifier = async (identifier, { publishedOnly = false } = {}) => {
     try {
         const db = getDb();
 
         // Use $or to find a match in any of the relevant fields
-        const product = await db.collection('products').findOne({
+        const match = {
             $or: [
                 { code: identifier },
                 { token: identifier },
                 { "child_products.code": identifier },
                 { "child_products.token": identifier }
             ]
-        });
-        return product;
+        };
+        const query = publishedOnly
+            ? { active: { $ne: false }, published: true, ...match }
+            : match;
+        const product = await db.collection('products').findOne(query);
+        if (!product || !publishedOnly) return product;
+        // Drop unpublished variants so a published parent never exposes them.
+        return {
+            ...product,
+            child_products: (product.child_products || []).filter(v => v.published),
+        };
     } catch (error) {
         console.error(`Error fetching product with identifier ${identifier} from database:`, error);
         throw new Error(`An error occurred while fetching product with identifier ${identifier}.`);

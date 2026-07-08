@@ -321,10 +321,13 @@ const createExportConfig = async (data, ownerContext = {}) => {
     const db = getDb();
     const collection = db.collection(COLLECTION_NAME);
 
-    // Check for duplicate name
+    // Check for a duplicate name — scoped to THIS owner. Names only need to be unique per account;
+    // two different partners may legitimately each have an export called "Shopify" (previously this
+    // check was global and rejected the second account's name).
     const existing = await collection.findOne({
         name: data.name.trim(),
-        isActive: true
+        isActive: true,
+        'owner.sub': ownerContext.sub || null
     });
 
     if (existing) {
@@ -475,12 +478,14 @@ const updateExportConfig = async (id, data) => {
         throw error;
     }
 
-    // Check for name conflict if name is being changed
+    // Check for name conflict if name is being changed — scoped to the SAME owner, so a rename only
+    // collides with the caller's own exports (not another account that happens to use that name).
     if (data.name && data.name !== existing.name) {
         const nameConflict = await collection.findOne({
             name: data.name.trim(),
             isActive: true,
-            _id: { $ne: new ObjectId(id) }
+            _id: { $ne: new ObjectId(id) },
+            'owner.sub': existing.owner?.sub ?? null
         });
         if (nameConflict) {
             const error = new Error('Export with this name already exists');
@@ -572,6 +577,50 @@ const deleteExportConfig = async (id, hard = false) => {
     }
 
     return true;
+};
+
+/**
+ * Returns the distinct named pricelists present across the active catalogue — the same set
+ * the /export builder derives client-side from product data, but resolved server-side so the
+ * Shopify pricing panel can seed its priority list from REAL pricelist names (not mock).
+ *
+ * Flattens parent `pricelist[]` + every `child_products[].pricelist[]`, de-dupes by name,
+ * keeps a representative `vat` and the latest `valid_from`, newest-first.
+ * @returns {Promise<Array<{ name: string, vat: number, valid_from: string|Date|null }>>}
+ */
+const getDistinctPricelists = async () => {
+    const db = getDb();
+    const rows = await db.collection(PRODUCTS_COLLECTION).aggregate([
+        { $match: { active: true } },
+        {
+            $project: {
+                pls: {
+                    $concatArrays: [
+                        { $ifNull: ['$pricelist', []] },
+                        {
+                            $reduce: {
+                                input: { $ifNull: ['$child_products', []] },
+                                initialValue: [],
+                                in: { $concatArrays: ['$$value', { $ifNull: ['$$this.pricelist', []] }] }
+                            }
+                        }
+                    ]
+                }
+            }
+        },
+        { $unwind: '$pls' },
+        { $match: { 'pls.name': { $ne: null } } },
+        {
+            $group: {
+                _id: '$pls.name',
+                vat: { $first: '$pls.vat' },
+                valid_from: { $max: '$pls.valid_from' }
+            }
+        },
+        { $project: { _id: 0, name: '$_id', vat: { $ifNull: ['$vat', 0] }, valid_from: 1 } },
+        { $sort: { valid_from: -1 } }
+    ]).toArray();
+    return rows;
 };
 
 /**
@@ -924,6 +973,10 @@ const resolveCategoryName = (product, config) => {
  * e.g. AI category "Electronics / Phones" → ["Electronics", "Electronics / Phones"]
  */
 const resolveTagsArray = (product, config) => {
+    // External-feed products carry pre-resolved tags (flat `tags` + expanded `categoryPaths`,
+    // resolved at ingest — see external importer §7). They have no ai_categories/exportId, so
+    // prefer their stored tags and leave Patrik's AI-category path below untouched.
+    if (Array.isArray(product.tags) && product.source) return product.tags;
     const aiExportId = config?.filters?.aiExportId;
     if (aiExportId && aiExportId !== 'all') {
         const filtered = (product.ai_categories || []).filter(c => c.exportId === aiExportId);
@@ -1145,6 +1198,15 @@ module.exports = {
     generateJsonExport,
     generateXmlExport,
     ensureIndexesAndMigrate,
+    // Reused by the Shopify sync engine to apply the same published-only narrowing +
+    // export-config filters, and to resolve a single price from pricelist[] later phases.
+    applyFilters,
+    getPriceFromPriority,
+    getDistinctPricelists,
+    resolveTagsArray,
+    // Reused by the external-feed importer to expand "A / B" category paths into the same
+    // hierarchical tag set Patrik's AI categories produce (one definition of the rule).
+    expandCategoryToTags,
     VALID_PRESETS,
     COLUMN_HEADERS,
     DEFAULT_FILTERS
