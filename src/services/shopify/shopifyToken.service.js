@@ -31,6 +31,13 @@ async function resolveToken(connectionId) {
     if (!conn) throw Object.assign(new Error('Connection not found'), { code: 'NOT_FOUND' });
     if (!conn.accessTokenEnc) throw Object.assign(new Error('Connection is not active'), { code: 'NOT_ACTIVE' });
 
+    // Custom-app (Prerelease / Route B) connections hold a merchant-supplied, non-expiring Admin
+    // API token — there is no refresh token and nothing to renew, so return it directly. (A dead
+    // custom token surfaces as a 401 at request time, handled by the caller like any revoked token.)
+    if (conn.authMethod === 'custom_app') {
+        return decryptToken(conn.accessTokenEnc);
+    }
+
     const expiresAt = conn.tokenExpiresAt ? new Date(conn.tokenExpiresAt).getTime() : null;
 
     // Legacy non-expiring token (pre-expiring-offline migration) — unrenewable and now
@@ -44,10 +51,14 @@ async function resolveToken(connectionId) {
         return decryptToken(conn.accessTokenEnc);
     }
 
-    // Near/past expiry — refresh, persist, and return the new access token.
+    // Near/past expiry — refresh, persist, and return the new access token. A custom_oauth
+    // (bring-your-own-app) connection must refresh with ITS OWN app credentials, not the shared ones.
+    const creds = conn.authMethod === 'custom_oauth' && conn.appClientId && conn.appClientSecretEnc
+        ? { clientId: conn.appClientId, clientSecret: decryptToken(conn.appClientSecretEnc) }
+        : undefined;
     let resp;
     try {
-        resp = await shopifyApi.refreshAccessToken(conn.shopDomain, decryptToken(conn.refreshTokenEnc));
+        resp = await shopifyApi.refreshAccessToken(conn.shopDomain, decryptToken(conn.refreshTokenEnc), creds);
     } catch (err) {
         // Refresh token expired/invalid → mark the connection and ask the user to reconnect.
         await connectionService.setStatus(conn._id, 'error');

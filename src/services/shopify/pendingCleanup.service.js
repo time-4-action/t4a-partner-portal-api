@@ -1,6 +1,25 @@
 const connectionService = require('./shopifyConnection.service');
 const tokenService = require('./shopifyToken.service');
 const shopifyApi = require('./shopifyApi.service');
+const { getDb } = require('../db/mongo.service');
+
+// Last-sweep metadata lives in the shared scheduler_state collection so the admin "Catalogue Sync"
+// page can show when this best-effort sweep last ran (it keeps no other state).
+const STATE_COLLECTION = 'scheduler_state';
+const STATE_ID = 'shopify-pending-cleanup';
+
+/** Records the latest sweep outcome (best-effort — a failed write never affects the sweep). */
+async function recordSweep(removed) {
+    try {
+        await getDb().collection(STATE_COLLECTION).updateOne(
+            { _id: STATE_ID },
+            { $set: { lastSweepAt: new Date(), lastRemoved: removed, intervalMs: SWEEP_INTERVAL_MS, pendingTtlMs: PENDING_TTL_MS } },
+            { upsert: true }
+        );
+    } catch (err) {
+        console.error('[shopify-cleanup] recordSweep failed:', err.message);
+    }
+}
 
 /**
  * Periodic cleanup of abandoned PENDING Shopify connections.
@@ -31,7 +50,10 @@ async function runSweep() {
         console.error('[shopify-cleanup] could not list stale pending connections:', err.message);
         return { swept: 0 };
     }
-    if (!stale.length) return { swept: 0 };
+    if (!stale.length) {
+        await recordSweep(0);
+        return { swept: 0 };
+    }
 
     let swept = 0;
     for (const conn of stale) {
@@ -51,6 +73,7 @@ async function runSweep() {
         }
     }
     if (swept) console.log(`[shopify-cleanup] swept ${swept} abandoned pending connection(s).`);
+    await recordSweep(swept);
     return { swept };
 }
 
@@ -71,4 +94,4 @@ function stop() {
     if (timer) { clearInterval(timer); timer = null; }
 }
 
-module.exports = { start, stop, runSweep };
+module.exports = { start, stop, runSweep, STATE_ID, SWEEP_INTERVAL_MS, PENDING_TTL_MS };

@@ -18,6 +18,7 @@ const { connectToDb } = require('./src/services/db/mongo.service');
 const { ensureIndexesAndMigrate } = require('./src/services/customExport.service');
 const { ensureIndexes: ensureShopifyIndexes } = require('./src/services/shopify/shopifyConnection.service');
 const { ensureIndexes: ensureExternalIndexes } = require('./src/services/external/ownSource.service');
+const { ensureIndexes: ensureActivityIndexes } = require('./src/services/activity.service');
 const externalScheduler = require('./src/services/external/externalScheduler.service');
 const pnvScheduler = require('./src/services/pnv/pnvScheduler.service');
 const shopifyPendingCleanup = require('./src/services/shopify/pendingCleanup.service');
@@ -30,6 +31,8 @@ const startServer = async () => {
   await ensureIndexesAndMigrate();
   await ensureShopifyIndexes();
   await ensureExternalIndexes();
+  await ensureActivityIndexes();
+  await pnvScheduler.ensureIndexes();
 
   app.listen(PORT, () => {
     console.log(`Server is running on http://localhost:${PORT}`);

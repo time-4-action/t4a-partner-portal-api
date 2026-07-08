@@ -321,10 +321,13 @@ const createExportConfig = async (data, ownerContext = {}) => {
     const db = getDb();
     const collection = db.collection(COLLECTION_NAME);
 
-    // Check for duplicate name
+    // Check for a duplicate name — scoped to THIS owner. Names only need to be unique per account;
+    // two different partners may legitimately each have an export called "Shopify" (previously this
+    // check was global and rejected the second account's name).
     const existing = await collection.findOne({
         name: data.name.trim(),
-        isActive: true
+        isActive: true,
+        'owner.sub': ownerContext.sub || null
     });
 
     if (existing) {
@@ -475,12 +478,14 @@ const updateExportConfig = async (id, data) => {
         throw error;
     }
 
-    // Check for name conflict if name is being changed
+    // Check for name conflict if name is being changed — scoped to the SAME owner, so a rename only
+    // collides with the caller's own exports (not another account that happens to use that name).
     if (data.name && data.name !== existing.name) {
         const nameConflict = await collection.findOne({
             name: data.name.trim(),
             isActive: true,
-            _id: { $ne: new ObjectId(id) }
+            _id: { $ne: new ObjectId(id) },
+            'owner.sub': existing.owner?.sub ?? null
         });
         if (nameConflict) {
             const error = new Error('Export with this name already exists');

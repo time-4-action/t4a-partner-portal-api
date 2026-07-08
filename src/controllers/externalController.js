@@ -2,6 +2,7 @@ const ownSource = require('../services/external/ownSource.service');
 const externalProducts = require('../services/external/externalProducts.service');
 const externalImport = require('../services/external/externalImport.service');
 const connectionService = require('../services/shopify/shopifyConnection.service');
+const { recordActivity } = require('../services/activity.service');
 
 /**
  * Controller for the "Own Sources" feed registry (design §8.1). Routes are JWT + export-role
@@ -62,6 +63,11 @@ exports.create = async (req, res) => {
         const created = await ownSource.createSource({
             ownerSub: sub, ownerEmail: email, brand: brand.trim(), url: url.trim(),
             authHeaderName, authToken, schedule, options
+        });
+        recordActivity('feed_add', {
+            ownerSub: sub, email,
+            resourceType: 'own_source', resourceId: created?.feedId,
+            metadata: { brand: created?.brand }
         });
         res.status(201).json({ success: true, source: created });
     } catch (error) {
@@ -124,6 +130,12 @@ exports.test = async (req, res) => {
             feed = { url, authHeaderName, authToken };
         }
         const result = await externalImport.testFeed(feed, { maxStalenessHours });
+        const { sub, email } = authUser(req);
+        recordActivity('feed_test', {
+            ownerSub: sub, email,
+            resourceType: 'own_source', resourceId: req.params.feedId || null,
+            metadata: { result: result?.lastResult || (result?.ok ? 'ok' : undefined) }
+        });
         res.json({ success: true, ...result });
     } catch (error) {
         handleError(res, error);
@@ -141,6 +153,11 @@ exports.importNow = async (req, res) => {
         // Fire-and-forget; the run records its own outcome on the feed's health + run history.
         externalImport.startImport(feedId, { trigger: 'manual' }).catch((err) => {
             console.error(`[external] import for ${feedId} failed:`, err.message);
+        });
+        const { sub, email } = authUser(req);
+        recordActivity('feed_import', {
+            ownerSub: sub, email,
+            resourceType: 'own_source', resourceId: feedId
         });
         res.status(202).json({ success: true, message: 'Import started' });
     } catch (error) {

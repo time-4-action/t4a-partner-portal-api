@@ -1,4 +1,22 @@
 const customExportService = require('../services/customExport.service');
+const { recordActivity } = require('../services/activity.service');
+
+/**
+ * Records an export-download event against the partner who triggered it.
+ * JWT callers carry their own sub; api-key callers are attributed to the
+ * export owner (set on req.authContext.ownerSub by dualAuth).
+ */
+function logExportDownload(req, format) {
+    const ownerSub = req.authContext?.ownerSub || req.authContext?.sub || req.auth?.payload?.sub;
+    const email = req.authContext?.email || req.auth?.payload?.email;
+    recordActivity('export_download', {
+        ownerSub,
+        email,
+        resourceType: 'export_config',
+        resourceId: req.params.id,
+        metadata: { format }
+    });
+}
 
 /**
  * Error code to HTTP status mapping
@@ -136,6 +154,7 @@ exports.generateCsv = async (req, res) => {
 
         // Add BOM for Excel UTF-8 compatibility
         res.send('\ufeff' + csv);
+        logExportDownload(req, 'csv');
     } catch (error) {
         handleError(res, error);
     }
@@ -148,6 +167,7 @@ exports.generateJson = async (req, res) => {
     try {
         const data = await customExportService.generateJsonExport(req.params.id);
         res.json(data);
+        logExportDownload(req, 'json');
     } catch (error) {
         handleError(res, error);
     }
@@ -164,6 +184,7 @@ exports.generateXml = async (req, res) => {
             res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
         }
         res.send(xml);
+        logExportDownload(req, 'xml');
     } catch (error) {
         handleError(res, error);
     }
