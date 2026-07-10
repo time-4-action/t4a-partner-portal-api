@@ -95,17 +95,23 @@ index.js
 
 ## Route Layout
 
-All routes are mounted under `/api/export`:
+Most routes are mounted under `/api/export`. Two surfaces sit outside it: the
+product router is *also* mounted directly at `/api/product`, and the internal
+admin surface lives under `/api/admin`.
 
-| Route prefix | File | Auth |
-|--------------|------|------|
-| `/api/export/health` | `src/routes/healthRoutes.js` | Public |
-| `/api/export/product` | `src/routes/productRoutes.js` | Dual Auth |
-| `/api/export/exports` | `src/routes/exportsRoutes.js` | Dual Auth |
-| `/api/export/categories` | `src/routes/categoriesRoutes.js` | Dual Auth |
-| `/api/export/custom-export` | `src/routes/customExportRoutes.js` | Dual Auth |
-| `/api/export/recharge` | `src/routes/rechargeRoutes.js` | Dual Auth |
-| `/api/export/webhooks` | `src/routes/webhookRoutes.js` | API Key |
+| Route prefix | File | Auth | Docs |
+|--------------|------|------|------|
+| `/api/export/health` | `src/routes/healthRoutes.js` | Public | [health](api/health.md) |
+| `/api/product`, `/api/export/product` | `src/routes/productRoutes.js` | Optional webhook key (full catalogue) | [products](api/products.md) |
+| `/api/export/exports` | `src/routes/exportsRoutes.js` | — | [exports](api/exports.md) |
+| `/api/export/categories` | `src/routes/categoriesRoutes.js` | — | [categories](api/categories.md) |
+| `/api/export/custom-export` | `src/routes/customExportRoutes.js` | JWT+role / Dual Auth (downloads) | [custom-exports](api/custom-exports.md) |
+| `/api/export/shopify` | `src/routes/shopifyRoutes.js` | JWT+role / OAuth HMAC | [shopify](api/shopify.md) |
+| `/api/export/external` | `src/routes/externalRoutes.js` | JWT+role | [own-sources](api/own-sources.md) |
+| `/api/export/recharge` | `src/routes/rechargeRoutes.js` | Public | [recharge](api/recharge.md) |
+| `/api/export/webhooks` | `src/routes/webhookRoutes.js` | Webhook API Key | [webhooks](api/webhooks.md) |
+| `/api/admin/partners` | `src/routes/adminPartnersRoutes.js` | Internal admin token | [admin](api/admin.md) |
+| `/api/admin/system` | `src/routes/adminSystemRoutes.js` | Internal admin token | [admin](api/admin.md) |
 
 ---
 
@@ -209,11 +215,14 @@ Export Config (from export_configs collection)
 | Middleware | File | Purpose |
 |------------|------|---------|
 | `dualAuth` | `src/middleware/dualAuth.js` | JWT bearer + API key fallback |
-| `webhookApiKey` | `src/middleware/webhookApiKey.js` | Static key check for webhooks |
+| `webhookApiKey` | `src/middleware/webhookApiKey.js` | Static key check for webhooks (hard gate) |
+| `detectApiKey` | `src/middleware/detectApiKey.js` | Non-blocking webhook-key detection → `req.hasFullAccess` (full product catalogue) |
+| `internalAdminToken` | `src/middleware/internalAdminToken.js` | Shared bearer gate for the `/api/admin` surface |
 | `analytics` | `src/middleware/analytics.js` | PostHog request logging |
 | `logger` | `src/middleware/logger.js` | Request logging |
-| `requireExportAccess` | `src/middleware/requireExportAccess.js` | Per-export authorization |
-| `requireExportRole` | `src/middleware/requireExportRole.js` | Role-based access control |
+| `requireExportAccess` | `src/middleware/requireExportAccess.js` | Per-export authorization (`requireExportAccess` + `requireOwner`) |
+| `requireExportRole` | `src/middleware/requireExportRole.js` | Auth0 `export` role check |
+| `requireTier` | `src/middleware/requireTier.js` | Early-access tier (`alpha`/`beta`) check |
 
 ---
 
