@@ -167,10 +167,20 @@ const _formatChild = (c, category) => ({
 
 const _allWordsMatch = (text, wordRegs) => wordRegs.every((r) => r.test(text || ''));
 
-const searchProducts = async (query, exportId = null) => {
+/**
+ * @param {string} query
+ * @param {string|null} [exportId]
+ * @param {Object} [options]
+ * @param {boolean} [options.includeUnpublished=false] - When true (trusted
+ *   x-api-key callers), search the full catalogue including unpublished /
+ *   inactive parents and variants. Default keeps the public published-only view.
+ */
+const searchProducts = async (query, exportId = null, { includeUnpublished = false } = {}) => {
     const db = getDb();
     const collection = db.collection('products');
-    const activeFilter = { active: { $ne: false }, published: true };
+    const activeFilter = includeUnpublished ? {} : { active: { $ne: false }, published: true };
+    // Trusted callers see every variant; public callers only published ones.
+    const childVisible = (c) => includeUnpublished || c.published;
 
     // Exact code/EAN match → single result
     const exactParent = await collection.findOne({ ...activeFilter, $or: [{ code: query }, { ean_code: query }] });
@@ -182,7 +192,7 @@ const searchProducts = async (query, exportId = null) => {
     });
     if (exactChildParent) {
         const child = exactChildParent.child_products.find(
-            (c) => (c.code === query || c.ean_code === query) && c.published,
+            (c) => (c.code === query || c.ean_code === query) && childVisible(c),
         );
         if (child) return [_formatChild(child, _resolveCategory(exactChildParent, exportId))];
     }
@@ -219,9 +229,9 @@ const searchProducts = async (query, exportId = null) => {
 
     for (const parent of parents) {
         const category = _resolveCategory(parent, exportId);
-        const publishedChildren = (parent.child_products || []).filter((c) => c.published);
+        const visibleChildren = (parent.child_products || []).filter(childVisible);
 
-        if (publishedChildren.length === 0) {
+        if (visibleChildren.length === 0) {
             results.push(_formatParent(parent, category));
             continue;
         }
@@ -230,13 +240,13 @@ const searchProducts = async (query, exportId = null) => {
         const parentNameMatch = _allWordsMatch(parent.product_name, wordRegs);
 
         if (parentCodeMatch || parentNameMatch) {
-            // Parent matched by code/name — return all published children as variants
-            for (const child of publishedChildren) {
+            // Parent matched by code/name — return all visible children as variants
+            for (const child of visibleChildren) {
                 results.push(_formatChild(child, category));
             }
         } else {
-            // Only specific children matched — return just those (published only)
-            for (const child of publishedChildren) {
+            // Only specific children matched — return just those (visible only)
+            for (const child of visibleChildren) {
                 if (
                     codeRegex.test(child.code || '') ||
                     codeRegex.test(child.ean_code || '') ||

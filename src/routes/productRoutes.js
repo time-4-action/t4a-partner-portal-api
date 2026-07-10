@@ -1,6 +1,12 @@
 const express = require('express');
 const router = express.Router();
 const productController = require('../controllers/productController');
+const detectApiKey = require('../middleware/detectApiKey');
+
+// Flag requests that carry a valid x-api-key so read handlers can widen
+// results to unpublished / inactive products (anonymous callers stay
+// published-only). Non-blocking — never rejects.
+router.use(detectApiKey);
 
 router.get('/search', productController.searchProducts);
 router.get('/', productController.getAllProducts);
