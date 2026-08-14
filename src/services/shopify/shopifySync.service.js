@@ -9,6 +9,7 @@ const syncJobs = require('./shopifySyncJobs.service');
 const queue = require('./shopifyQueue.service');
 const { graphqlRequest, publishToPublications, unpublishFromPublications, listPublications, findExistingIds } = require('./shopifyGraphql.service');
 const externalProducts = require('../external/externalProducts.service');
+const { normalizePriceFactor, toMoneyString } = require('./priceFactor.util');
 
 /**
  * Stock-only sync engine — Phase A (design §8, plan Phase A).
@@ -192,6 +193,23 @@ const chunk = (arr, size) => {
 const isStaleError = (msg) => /could not be found|does not exist|doesn'?t exist|not found|no longer exists|was deleted|been deleted|couldn'?t be stocked|could not be stocked/i.test(msg || '');
 
 /**
+ * Prepends a source's title prefix to a product title (design: per-source branding, e.g. a
+ * windsurf feed listed as "WINDSURF - Naish Foil"). The prefix is stored trimmed and joined with
+ * a single space, so what the partner typed can't hide a leading/trailing whitespace bug.
+ * Already-prefixed titles are left alone, so a re-push can never stack the prefix twice.
+ *
+ * Only the SHOPIFY title is affected — SKU, barcode and handle-matching are untouched, so
+ * turning a prefix on/off never re-identifies a product.
+ */
+function applyTitlePrefix(title, prefix) {
+    const p = typeof prefix === 'string' ? prefix.trim() : '';
+    const t = title || '';
+    if (!p) return t;
+    if (t.toLowerCase().startsWith(p.toLowerCase())) return t;
+    return `${p} ${t}`.trim();
+}
+
+/**
  * Resolves the connection's export config into the in-scope catalogue: the published-only,
  * filtered products ({@link applyFilters}) AND the flat list of sellable inventory items
  * derived from them (one per variant, or the parent for no-variant products — design §3.4;
@@ -273,9 +291,15 @@ async function buildExternalScope(feedId) {
  *   - `inclusive` → push the gross price  (net × (1 + vat/100))
  *   - `exclusive` → push the net price    (as stored)
  *
+ * Finally the source's price FACTOR is applied — a multiplier for stores that sell the catalogue
+ * in another currency or at a fixed uplift (e.g. 11.4). It keeps its full precision (up to 6 dp);
+ * only the resulting amount is rounded, once, to the 2 dp Shopify stores. A connection without a
+ * factor gets `1` → the exact price it pushed before.
+ *
+ * @param {number} [priceFactor=1] the source's multiplier (raw — normalized here)
  * @returns {string|null} price as a 2-dp string, or null when nothing resolvable
  */
-function resolvePushPrice(variant, pricelistPriority, vatMode, futureGuard, nowMs) {
+function resolvePushPrice(variant, pricelistPriority, vatMode, futureGuard, nowMs, priceFactor = 1) {
     let v = variant;
     if (futureGuard && Array.isArray(variant.pricelist)) {
         v = { ...variant, pricelist: variant.pricelist.filter((pl) => !pl.valid_from || new Date(pl.valid_from).getTime() <= nowMs) };
@@ -283,7 +307,7 @@ function resolvePushPrice(variant, pricelistPriority, vatMode, futureGuard, nowM
     const r = getPriceFromPriority(v, pricelistPriority);
     if (!r || !r.price) return null;
     const price = vatMode === 'inclusive' ? r.price * (1 + (r.vat || 0) / 100) : r.price;
-    return price.toFixed(2);
+    return toMoneyString(price * normalizePriceFactor(priceFactor));
 }
 
 /**
@@ -403,9 +427,14 @@ async function fetchLivePublications(shop, token, productIds) {
 }
 
 /**
- * Phase C — pushes variant prices and product content for MATCHED products, in
- * `portal_authoritative` mode only. Per the ownership contract (design §9) the portal
- * overwrites the fields it manages (price, title, description, tags) on every sync.
+ * Phase C — pushes variant prices and product content for MATCHED products. Per the ownership
+ * contract (design §9) the portal overwrites the fields it manages (price, title, description,
+ * tags) on every sync.
+ *
+ * Runs in `portal_authoritative` (everything it manages) and — with `pricesOnly` — in
+ * `create_then_handoff`, where PRICE is a live field like stock: a handed-off listing keeps
+ * getting the current price so the store can never sell at a stale one. Title, description, tags,
+ * option names and channels stay hands-off in that mode, which is what the handoff protects.
  *
  * Both prices and content are drift-gated against the LIVE store (not just a local source hash):
  * the current Shopify variant prices and title/description/tags are fetched and a push happens
@@ -416,18 +445,22 @@ async function fetchLivePublications(shop, token, productIds) {
  *
  * Mutates `counts` (pricesPushed / contentPushed / failed) and appends to `errors`.
  */
-async function pushPortalAuthoritative({ connection, token, scopedProducts, matchInfoBySku, existingMap, exportConfig, counts, errors, staleSkus, unmatched }) {
+async function pushPortalAuthoritative({ connection, token, scopedProducts, matchInfoBySku, existingMap, exportConfig, counts, errors, staleSkus, unmatched, pricesOnly = false }) {
     const cfg = connection.config || {};
     const wantPrices = !!cfg.syncPrices;
-    const wantContent = !!cfg.syncDescriptions;
+    const wantContent = !pricesOnly && !!cfg.syncDescriptions;
     // Tags are managed independently of the title/description (own toggle). `syncTags` defaults
     // ON for back-compat (tags used to ride along with content).
-    const wantTags = cfg.syncTags !== false;
+    const wantTags = !pricesOnly && cfg.syncTags !== false;
     if (!wantPrices && !wantContent && !wantTags) return;
 
     const vatMode = cfg.priceVatMode || 'inclusive';
     const futureGuard = cfg.futureDatedGuard !== false;
     const pricelistPriority = cfg.pricelistPriority || [];
+    const priceFactor = normalizePriceFactor(cfg.priceFactor);
+    // Per-source title prefix (e.g. "WINDSURF -"). It's part of the pushed title, so it also
+    // feeds the contentHash below — changing the prefix re-pushes every title on the next sync.
+    const titlePrefix = cfg.titlePrefix || '';
     const nowMs = Date.now();
     const shop = connection.shopDomain;
 
@@ -461,7 +494,7 @@ async function pushPortalAuthoritative({ connection, token, scopedProducts, matc
 
         if (wantPrices) {
             for (const { v, sku, info } of matched) {
-                const price = resolvePushPrice(v, pricelistPriority, vatMode, futureGuard, nowMs);
+                const price = resolvePushPrice(v, pricelistPriority, vatMode, futureGuard, nowMs, priceFactor);
                 if (price == null) continue; // nothing resolvable — leave the variant's price alone
                 priceCandidates.push({ parentCode: product.code, productId, variantId: info.shopifyVariantId, sku, price, priceHash: sha1(price) });
             }
@@ -473,7 +506,7 @@ async function pushPortalAuthoritative({ connection, token, scopedProducts, matc
             const productUpdate = { id: productId };
             const hashParts = {};
             if (wantContent) {
-                productUpdate.title = product.product_name || '';
+                productUpdate.title = applyTitlePrefix(product.product_name || '', titlePrefix);
                 productUpdate.descriptionHtml = product.detailed_description || product.short_description || '';
                 hashParts.title = productUpdate.title;
                 hashParts.descriptionHtml = productUpdate.descriptionHtml;
@@ -1070,9 +1103,9 @@ const optionValueFor = (plan, v) =>
  * (`inventoryQuantities` both activates the item at that location and sets the quantity, so
  * the freshly-created variant doesn't need a separate inventory push).
  */
-function buildCreateVariantInput(plan, v, locationId, pricelistPriority, vatMode, futureGuard, nowMs, variantOptionName = 'Size') {
+function buildCreateVariantInput(plan, v, locationId, pricelistPriority, vatMode, futureGuard, nowMs, variantOptionName = 'Size', priceFactor = 1) {
     const sku = plan.skuOf(v);
-    const price = resolvePushPrice(v, pricelistPriority, vatMode, futureGuard, nowMs) || '0.00';
+    const price = resolvePushPrice(v, pricelistPriority, vatMode, futureGuard, nowMs, priceFactor) || '0.00';
     const optionName = plan.isNoVariant ? 'Title' : variantOptionName;
     const optionValue = optionValueFor(plan, v);
     return {
@@ -1089,14 +1122,14 @@ function buildCreateVariantInput(plan, v, locationId, pricelistPriority, vatMode
  * images linked (design §3.5). Each variant's own image becomes its variant image; the parent
  * gallery + all variant images form the product files. price/barcode/sku/inventory set inline.
  */
-function buildProductSetInput(plan, exportConfig, locationId, pricelistPriority, vatMode, futureGuard, nowMs, wantTags = true, variantOptionName = 'Size') {
+function buildProductSetInput(plan, exportConfig, locationId, pricelistPriority, vatMode, futureGuard, nowMs, wantTags = true, variantOptionName = 'Size', priceFactor = 1, titlePrefix = '') {
     const product = plan.product;
     const parentImages = [...new Set(product.images || [])].filter(Boolean);
     const variantImageUrls = [];
 
     const variants = plan.toCreate.map((v) => {
         const sku = plan.skuOf(v);
-        const price = resolvePushPrice(v, pricelistPriority, vatMode, futureGuard, nowMs) || '0.00';
+        const price = resolvePushPrice(v, pricelistPriority, vatMode, futureGuard, nowMs, priceFactor) || '0.00';
         const optionName = plan.isNoVariant ? 'Title' : variantOptionName;
         const optionValue = optionValueFor(plan, v);
         const vImg = (v.images && v.images[0]) || null;
@@ -1119,7 +1152,7 @@ function buildProductSetInput(plan, exportConfig, locationId, pricelistPriority,
         .map((url) => ({ originalSource: url, contentType: 'IMAGE', alt: url }));
 
     const input = {
-        title: product.product_name || product.code || 'Untitled',
+        title: applyTitlePrefix(product.product_name || product.code || 'Untitled', titlePrefix),
         descriptionHtml: product.detailed_description || product.short_description || '',
         // Own-source products carry their own brand as `vendor`; Patrik products have none → default.
         vendor: product.vendor || 'Patrik International',
@@ -1177,6 +1210,7 @@ async function pushNewProducts({ connection, token, scopedProducts, unmatched, m
     const vatMode = cfg.priceVatMode || 'inclusive';
     const futureGuard = cfg.futureDatedGuard !== false;
     const pricelistPriority = cfg.pricelistPriority || [];
+    const priceFactor = normalizePriceFactor(cfg.priceFactor);
     const publicationIds = cfg.publicationIds || []; // sales channels to publish new products to
     const wantTags = cfg.syncTags !== false; // tags on newly-created products (own toggle)
     // Option1 name for created variants: per-source override → the export's own Variant Option
@@ -1185,6 +1219,8 @@ async function pushNewProducts({ connection, token, scopedProducts, unmatched, m
     const variantOptionName = (cfg.variantOptionName || '').trim()
         || (exportConfig?.option1Name || '').trim()
         || 'Size';
+    // Per-source title prefix (e.g. "WINDSURF -") applied to every product this source creates.
+    const titlePrefix = cfg.titlePrefix || '';
     const nowMs = Date.now();
 
     // Only create SKUs that truly aren't in the store — never duplicates / ambiguous / untracked.
@@ -1221,7 +1257,7 @@ async function pushNewProducts({ connection, token, scopedProducts, unmatched, m
 
             if (!plan.existingProductId) {
                 // New product → productSet (links each variant's own image to the variant).
-                const input = buildProductSetInput(plan, exportConfig, locationId, pricelistPriority, vatMode, futureGuard, nowMs, wantTags, variantOptionName);
+                const input = buildProductSetInput(plan, exportConfig, locationId, pricelistPriority, vatMode, futureGuard, nowMs, wantTags, variantOptionName, priceFactor, titlePrefix);
                 const data = await graphqlRequest(shop, token, PRODUCT_SET_MUTATION, { input, synchronous: true });
                 const ue = data?.productSet?.userErrors || [];
                 if (ue.length) throw new Error(ue.map((e) => e.message).join('; '));
@@ -1230,7 +1266,7 @@ async function pushNewProducts({ connection, token, scopedProducts, unmatched, m
             } else {
                 // Parent already exists → add only the missing variants (no whole-product reset).
                 const variantInputs = plan.toCreate.map((v) =>
-                    buildCreateVariantInput(plan, v, locationId, pricelistPriority, vatMode, futureGuard, nowMs, variantOptionName));
+                    buildCreateVariantInput(plan, v, locationId, pricelistPriority, vatMode, futureGuard, nowMs, variantOptionName, priceFactor));
                 const vData = await graphqlRequest(shop, token, VARIANTS_BULK_CREATE_MUTATION, { productId: plan.existingProductId, variants: variantInputs, strategy: 'DEFAULT' });
                 const vue = vData?.productVariantsBulkCreate?.userErrors || [];
                 if (vue.length) throw new Error(vue.map((e) => e.message).join('; '));
@@ -1295,8 +1331,8 @@ function scopeLabel(sc) {
 /** Per-source push settings (design: each source is configured independently). */
 const SCOPE_CONFIG_KEYS = [
     'ownership', 'syncStock', 'syncNewProducts', 'syncPrices', 'syncDescriptions', 'syncImages',
-    'syncTags', 'priceVatMode', 'futureDatedGuard', 'pricelistPriority', 'publicationIds',
-    'variantOptionName'
+    'syncTags', 'priceVatMode', 'futureDatedGuard', 'pricelistPriority', 'priceFactor',
+    'publicationIds', 'variantOptionName', 'titlePrefix'
 ];
 
 /**
@@ -1471,17 +1507,24 @@ async function runScopeTarget({ connection, token, job, scopedProducts, items, l
             if (stateUpdates.length) await productMap.bulkSetState(connection._id, stateUpdates);
         }
 
-        // ── Content + price push (Phase C) — only when the partner has opted up to the
-        //    `portal_authoritative` ownership mode (design §9). Operates on matched products. ──
+        // ── Content + price push (Phase C) — for every mode above `stock_only` (design §9).
+        //    Operates on matched products. ──
         // Don't re-hit SKUs the stock push already found deleted.
         for (const sku of staleSkus) matchInfoBySku.delete(sku);
 
-        // Price + description updates: portal_authoritative only (it overwrites managed fields
-        // every sync). create_then_handoff sets those once at creation and then leaves them.
-        if (connection.config?.ownership === 'portal_authoritative') {
+        // Price + description updates:
+        //   - portal_authoritative → prices AND content/tags (it overwrites managed fields every sync)
+        //   - create_then_handoff  → PRICES ONLY (`pricesOnly`), gated on the Prices toggle. A
+        //     handed-off listing must never sell at a stale price, so price is maintained like
+        //     stock; title/description/tags/option names/channels stay the merchant's.
+        const ownership = connection.config?.ownership;
+        if (ownership === 'portal_authoritative' || (ownership === 'create_then_handoff' && connection.config?.syncPrices)) {
             await pushPortalAuthoritative({
-                connection, token, scopedProducts, matchInfoBySku, existingMap, exportConfig, counts, errors, staleSkus, unmatched
+                connection, token, scopedProducts, matchInfoBySku, existingMap, exportConfig, counts, errors, staleSkus, unmatched,
+                pricesOnly: ownership === 'create_then_handoff'
             });
+        }
+        if (ownership === 'portal_authoritative') {
             // The variant option NAME is a managed field too: rename existing products' Option1
             // when a name is explicitly configured (scope override or the export's setting).
             await pushOptionRenames({

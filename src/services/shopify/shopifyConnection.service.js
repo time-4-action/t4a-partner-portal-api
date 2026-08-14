@@ -1,6 +1,7 @@
 const { getDb } = require('../db/mongo.service');
 const { ObjectId } = require('mongodb');
 const { encryptToken } = require('./crypto.service');
+const { normalizePriceFactor } = require('./priceFactor.util');
 
 /**
  * Data-access layer for the `shopify_connections` collection — one document per
@@ -30,19 +31,37 @@ function canPublish(conn) {
     return PUBLICATION_SCOPES.some((s) => granted.includes(s));
 }
 
+/** Longest accepted title prefix — a Shopify title caps at 255, so leave room for the title. */
+const TITLE_PREFIX_MAX = 40;
+
+/**
+ * Cleans a title prefix for storage: a trimmed, length-capped string ('' = no prefix). The sync
+ * engine joins it to the title with a single space, so storing it trimmed keeps what's saved
+ * identical to what the partner sees previewed.
+ */
+function normalizeTitlePrefix(value) {
+    if (typeof value !== 'string') return '';
+    return value.trim().slice(0, TITLE_PREFIX_MAX);
+}
+
 /** Default per-connection sync config — safe defaults: stock-only, no image push. */
 const DEFAULT_CONFIG = {
     exportConfigId: null,
     pricelistPriority: [],
     priceVatMode: 'inclusive', // 'inclusive' | 'exclusive'
+    // Multiplier applied to every pushed price (currency conversion / uplift). 1 = unchanged.
+    priceFactor: 1,
     futureDatedGuard: true,
     syncStock: true,
     syncNewProducts: false,
     syncPrices: false,
     syncDescriptions: false,
+    // Tags have their own toggle but default ON (they used to ride along with descriptions).
+    syncTags: true,
     syncImages: false,
     ownership: 'stock_only', // 'stock_only' | 'portal_authoritative' | 'create_then_handoff'
-    publicationIds: [] // sales channels (publications) to publish created products to
+    publicationIds: [], // sales channels (publications) to publish created products to
+    titlePrefix: '' // prepended to every pushed product title, per source (e.g. "WINDSURF -")
 };
 
 /**
@@ -510,12 +529,18 @@ async function updateConnectionConfig(id, patch) {
     const collection = db.collection(COLLECTION_NAME);
 
     const allowed = [
-        'exportConfigId', 'pricelistPriority', 'priceVatMode', 'futureDatedGuard',
-        'syncStock', 'syncNewProducts', 'syncPrices', 'syncDescriptions', 'syncImages', 'ownership',
+        'exportConfigId', 'pricelistPriority', 'priceVatMode', 'priceFactor', 'futureDatedGuard',
+        // `syncTags` is its own toggle (tags used to ride along with `syncDescriptions`); it must
+        // be writable at the connection level too, or a source that doesn't set its own falls back
+        // to the default-ON instead of what the partner chose.
+        'syncStock', 'syncNewProducts', 'syncPrices', 'syncDescriptions', 'syncTags', 'syncImages', 'ownership',
         'publicationIds',
         // Shopify Option1 name for variants of newly-created products (e.g. "Size", "Volume").
         // Per-source override lives on the scope; this is the connection-level fallback.
         'variantOptionName',
+        // Text prepended to every pushed product TITLE for a source (e.g. "WINDSURF -").
+        // Per-source value lives on the scope; this is the connection-level fallback.
+        'titlePrefix',
         // `scope` selects WHAT this connection pushes: { type:'export_config', exportConfigId }
         // (default/back-compat) or { type:'own_source', feedId } (an external brand feed).
         'scope',
@@ -527,6 +552,21 @@ async function updateConnectionConfig(id, patch) {
     if (patch.config) {
         for (const key of allowed) {
             if (key in patch.config) set[`config.${key}`] = patch.config[key];
+        }
+        // The price multiplier is stored already-clean (positive, ≤ 6 dp) at BOTH levels, so the
+        // sync engine and every read of the config see the same number the partner will be shown.
+        if ('config.priceFactor' in set) set['config.priceFactor'] = normalizePriceFactor(set['config.priceFactor']);
+        // Same for the title prefix: stored trimmed + length-capped at both levels, so the pushed
+        // title is exactly what the partner was shown and can't carry invisible whitespace.
+        if ('config.titlePrefix' in set) set['config.titlePrefix'] = normalizeTitlePrefix(set['config.titlePrefix']);
+        if (Array.isArray(set['config.scopes'])) {
+            set['config.scopes'] = set['config.scopes'].map((s) => {
+                if (!s) return s;
+                const out = { ...s };
+                if ('priceFactor' in s) out.priceFactor = normalizePriceFactor(s.priceFactor);
+                if ('titlePrefix' in s) out.titlePrefix = normalizeTitlePrefix(s.titlePrefix);
+                return out;
+            });
         }
     }
     if ('shopifyLocationId' in patch) set.shopifyLocationId = patch.shopifyLocationId;

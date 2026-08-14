@@ -204,6 +204,7 @@ One per connected store.
     exportConfigId: ObjectId | null,   // which products to sync (reuse export_configs filters)
     pricelistPriority: [ { name, enabled, priority } ], // resolve pricelist[] -> one price
     priceVatMode: "inclusive" | "exclusive", // how to treat pricelist vat (see §3.3)
+    priceFactor: 1,                    // multiplier on every pushed price (currency / uplift), up to 6 dp
     syncStock: true,
     syncNewProducts: true,
     syncPrices: true,
@@ -286,7 +287,7 @@ Edge cases to handle explicitly:
 
 ### 8.2 Building the per-variant payload
 For each parent, after the always-on published-only narrowing (drop unpublished parents, keep only published `child_products`):
-- Resolve each variant's price via `getPriceFromPriority(variant, connection.config.pricelistPriority)`, applying `priceVatMode`.
+- Resolve each variant's price via `getPriceFromPriority(variant, connection.config.pricelistPriority)`, applying `priceVatMode`, then the source's `priceFactor`. The factor keeps its full precision; the RESULT is rounded to 2 dp once.
 - Map fields per §3.1/§3.2. Reuse `customExport.service.js` mappers where possible — they already know how to turn this shape into Shopify fields.
 
 ### 8.3 What gets pushed
@@ -323,7 +324,7 @@ The central design question: **who owns the product once it's in the partner's s
 |---|---|---|
 | **`portal_authoritative`** | Portal overwrites the fields it manages on every sync. Partner edits to those fields are lost. | You guarantee correct catalog data; partners are resellers. |
 | **`stock_only`** (recommended default) | Portal only touches inventory quantities; never product content. | Partners curate their own listings, just want live stock. |
-| **`create_then_handoff`** | Portal creates the product once, then never updates content again (only stock). | Partners customize after import. |
+| **`create_then_handoff`** | Portal creates the product once, then maintains only stock **and price** (price is a live field — a handed-off listing must never sell at a stale one; gated on the Prices toggle). Title/description/tags/option names/channels are never touched again. | Partners customize after import. |
 
 Recommendation: support `stock_only` and `portal_authoritative`, default to `stock_only` for safety, let the partner opt up. Store on `shopify_connections.config.ownership`.
 
