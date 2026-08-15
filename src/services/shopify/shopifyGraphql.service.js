@@ -149,16 +149,20 @@ async function graphqlRequest(shop, accessToken, query, variables = {}) {
 
 const LOCATIONS_QUERY = `query Locations($first: Int!) {
   locations(first: $first, includeInactive: false) {
-    edges { node { id name isActive } }
+    edges { node { id name isActive fulfillmentService { id } } }
   }
 }`;
 
 /**
  * Lists the shop's **active** inventory locations via GraphQL (the supported, non-legacy
  * path — REST is being retired). Returns the shape the connection's location picker expects.
+ *
+ * `fulfillmentServiceId` is non-null for locations owned by a third-party fulfilment service (a
+ * 3PL, Shopify Fulfillment Network, …). Their inventory belongs to that service — an app can't
+ * activate items there — so the sync's multi-location spread skips them. The picker ignores it.
  * @param {string} shop
  * @param {string} accessToken
- * @returns {Promise<Array<{ id:string, legacyId:string, name:string, active:boolean }>>}
+ * @returns {Promise<Array<{ id:string, legacyId:string, name:string, active:boolean, fulfillmentServiceId:string|null }>>}
  */
 async function listLocations(shop, accessToken) {
     const data = await graphqlRequest(shop, accessToken, LOCATIONS_QUERY, { first: 50 });
@@ -166,7 +170,8 @@ async function listLocations(shop, accessToken) {
         id: node.id, // gid://shopify/Location/123 — what we store as shopifyLocationId
         legacyId: node.id.split('/').pop(),
         name: node.name,
-        active: node.isActive !== false
+        active: node.isActive !== false,
+        fulfillmentServiceId: node.fulfillmentService?.id || null
     }));
 }
 

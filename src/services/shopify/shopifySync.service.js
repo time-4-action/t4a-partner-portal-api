@@ -7,7 +7,7 @@ const { matchVariants } = require('./shopifyMatch.service');
 const productMap = require('./shopifyProductMap.service');
 const syncJobs = require('./shopifySyncJobs.service');
 const queue = require('./shopifyQueue.service');
-const { graphqlRequest, publishToPublications, unpublishFromPublications, listPublications, findExistingIds } = require('./shopifyGraphql.service');
+const { graphqlRequest, publishToPublications, unpublishFromPublications, listPublications, listLocations, findExistingIds } = require('./shopifyGraphql.service');
 const externalProducts = require('../external/externalProducts.service');
 const ownSource = require('../external/ownSource.service');
 const { ensureFeedCategorized } = require('../ai/categoryIdentification.service');
@@ -55,6 +55,48 @@ const INVENTORY_ACTIVATE_MUTATION = `mutation InventoryActivate($inventoryItemId
     userErrors { field message }
   }
 }`;
+
+// Multi-location fulfilment. Shopify only lets a location fulfil a variant whose inventory item
+// is ACTIVE there — an item stocked at one location alone makes every order routed elsewhere show
+// "Location doesn't fulfill this variant", and the merchant can't pick that location at all. So
+// after the stock push we activate each item at EVERY active location (quantity 0 there; the
+// source's own location keeps the real number). Activating a location the item already stocks is
+// a userError that rejects the whole call, so the current levels are read first and only the
+// missing locations are toggled.
+// `first` is sized to the shop's own location count rather than a fixed 50: the query's calculated
+// cost is ~(2 × first) per item, so a static 50 × a 50-item batch would blow Shopify's 1000-point
+// per-query ceiling. Built per run instead, with the batch size derived from it (see `levelsPlan`).
+const inventoryItemLocationsQuery = (first) => `query InventoryItemLocations($ids: [ID!]!) {
+  nodes(ids: $ids) { ... on InventoryItem { id inventoryLevels(first: ${first}) { nodes { location { id } } } } }
+}`;
+
+const INVENTORY_BULK_ACTIVATE_MUTATION = `mutation InventoryBulkToggleActivation($inventoryItemId: ID!, $inventoryItemUpdates: [InventoryBulkToggleActivationInput!]!) {
+  inventoryBulkToggleActivation(inventoryItemId: $inventoryItemId, inventoryItemUpdates: $inventoryItemUpdates) {
+    inventoryLevels { id }
+    userErrors { field message code }
+  }
+}`;
+
+/**
+ * Sizes the levels lookup for a shop with `locationCount` locations: how many levels to ask for
+ * per item, and how many items fit in one `nodes` call while staying under Shopify's query-cost
+ * ceiling. A small headroom on `first` means a location added mid-run is still seen.
+ *
+ * `locationCount` must be the shop's TOTAL location count, not just the ones we activate at — an
+ * item can already be stocked at a location we skip (a 3PL), and a truncated level list would make
+ * a stocked location look un-stocked.
+ */
+function levelsPlan(locationCount) {
+    const first = Math.min(250, locationCount + 5);
+    return { first, itemsPerQuery: Math.max(1, Math.floor(400 / (first * 2 + 3))) };
+}
+
+/**
+ * Cap on how many items one run spreads across locations. Only bites on the FIRST run after this
+ * was introduced (every existing item needs one mutation); anything left over is picked up by the
+ * next run, and newly-created items are spread first so a fresh listing is never the one deferred.
+ */
+const MAX_SPREAD_PER_RUN = 1000;
 
 // Phase C — content/price push (only in `portal_authoritative` ownership).
 const VARIANTS_PRICE_MUTATION = `mutation VariantsPrice($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
@@ -1013,6 +1055,104 @@ async function activateInventory(shop, token, item, locationId) {
     }
 }
 
+/**
+ * Makes every item this run touched fulfillable from EVERY active location in the store.
+ *
+ * Without this an item is stocked only at its source's location, and Shopify refuses to fulfil it
+ * anywhere else — "Location doesn't fulfill this variant" on the order, with no way to pick that
+ * location. Activating the inventory item elsewhere at quantity 0 fixes fulfilment WITHOUT
+ * spreading stock: the real number is still only ever written at the source's own location.
+ *
+ * Cost control — a map row remembers the location set it was last spread over
+ * (`allLocationsKey`), so a steady-state run makes no calls at all. Adding a location in Shopify
+ * changes the key and the next run picks it up. Rows with a stale key get ONE batched levels
+ * lookup, and only genuinely missing locations are toggled (activating an already-active one is a
+ * userError that would reject the whole call). Never throws — failures are reported and retried
+ * next run, since the key is only written on success.
+ */
+async function stockAtAllLocations({ shop, token, connectionId, items, allLocationIds, locationCount, existingMap, counts, errors }) {
+    // Nothing to spread in a single-location store (the common case) — skip entirely.
+    if (allLocationIds.length < 2 || !items.length) return;
+    const key = sha1([...allLocationIds].sort().join('|'));
+
+    // Skip items already spread over exactly this location set; dedupe by inventory item.
+    const byItemId = new Map();
+    for (const it of items) {
+        if (!it.shopifyInventoryItemId) continue;
+        if (existingMap.get(it.sku)?.allLocationsKey === key) continue;
+        if (!byItemId.has(it.shopifyInventoryItemId)) byItemId.set(it.shopifyInventoryItemId, it);
+    }
+    if (!byItemId.size) return;
+
+    const backlog = [...byItemId.values()];
+    const pending = backlog.slice(0, MAX_SPREAD_PER_RUN);
+    if (backlog.length > pending.length) {
+        console.log(`[shopify] ${backlog.length - pending.length} item(s) still to spread across locations — continuing next run (${shop})`);
+    }
+
+    // Which locations each item already stocks (batched, sized to stay under the query-cost cap).
+    const { first, itemsPerQuery } = levelsPlan(Math.max(locationCount || 0, allLocationIds.length));
+    const LOCATIONS_QUERY = inventoryItemLocationsQuery(first);
+    const activeByItemId = new Map();
+    const lookups = chunk(pending, itemsPerQuery);
+    let lookupError = null; // reported once, not once per batch
+    await queue.mapWithConcurrency(lookups, async (batch) => {
+        try {
+            const data = await graphqlRequest(shop, token, LOCATIONS_QUERY, {
+                ids: batch.map((it) => it.shopifyInventoryItemId)
+            });
+            for (const node of data?.nodes || []) {
+                if (!node?.id) continue;
+                const locs = (node.inventoryLevels?.nodes || []).map((l) => l.location?.id).filter(Boolean);
+                activeByItemId.set(node.id, new Set(locs));
+            }
+        } catch (e) {
+            lookupError = lookupError || e.message;
+        }
+    });
+    if (lookupError) errors.push({ error: `stock locations lookup: ${lookupError}` });
+
+    const done = [];
+    // A location that simply refuses activation would otherwise report once per SKU, every run —
+    // enough to bury the run's real errors. Report a sample, then one summary line.
+    const MAX_REPORTED = 10;
+    let failed = 0;
+    const report = (it, msg) => {
+        failed += 1;
+        if (failed <= MAX_REPORTED) errors.push({ sku: it.sku, parentCode: it.parentCode, error: `stock at all locations: ${msg}` });
+    };
+    await queue.mapWithConcurrency(pending, async (it) => {
+        // No entry → the lookup failed or the item is gone. Leave the key stale so the next run
+        // retries rather than recording a spread that never happened.
+        const active = activeByItemId.get(it.shopifyInventoryItemId);
+        if (!active) return;
+        const missing = allLocationIds.filter((id) => !active.has(id));
+        if (!missing.length) { done.push({ sku: it.sku, allLocationsKey: key }); return; }
+        try {
+            const data = await graphqlRequest(shop, token, INVENTORY_BULK_ACTIVATE_MUTATION, {
+                inventoryItemId: it.shopifyInventoryItemId,
+                inventoryItemUpdates: missing.map((locationId) => ({ locationId, activate: true }))
+            });
+            const ue = data?.inventoryBulkToggleActivation?.userErrors || [];
+            if (ue.length) {
+                const msg = ue.map((e) => e.message).join('; ');
+                // The product was deleted in the store — the stale handler elsewhere cleans it up.
+                if (!isStaleError(msg)) report(it, msg);
+                return;
+            }
+            counts.locationsActivated += missing.length;
+            done.push({ sku: it.sku, allLocationsKey: key });
+        } catch (e) {
+            report(it, e.message);
+        }
+    });
+    if (failed > MAX_REPORTED) {
+        errors.push({ error: `stock at all locations: ${failed - MAX_REPORTED} further item(s) failed the same way` });
+    }
+
+    if (done.length) await productMap.bulkSetHashes(connectionId, done);
+}
+
 /** Option1 value for a variant: prefer `size`, fall back to the (unique) SKU for sizeless ones. */
 const deriveOptionValue = (v) => {
     const size = v.size != null ? String(v.size).trim() : '';
@@ -1358,7 +1498,7 @@ function resolveScopeConfig(connection, scope) {
  * one run share one map read, one job, and one set of counts. SKUs are disjoint across scopes
  * (Patrik SKUs vs feed SKUs), so each scope only touches its own rows.
  */
-async function runScopeTarget({ connection, token, job, scopedProducts, items, locationId, exportConfig, existingMap, counts, errors, unmatched, staleSkus }) {
+async function runScopeTarget({ connection, token, job, scopedProducts, items, locationId, exportConfig, existingMap, counts, errors, unmatched, staleSkus, allLocationIds = [], locationCount = 0 }) {
         const unmapped = items.filter((it) => !existingMap.has(it.sku));
 
         const newMatches = [];
@@ -1431,6 +1571,9 @@ async function runScopeTarget({ connection, token, job, scopedProducts, items, l
         // Parent codes created in THIS run — in create_then_handoff, images are pushed only for
         // these (creation-time), never for products that already existed.
         const createdParentCodes = new Set();
+        // Variants created this run — not in `pushable` (they were unmapped when it was built),
+        // but they still need spreading across the store's locations.
+        const createdItems = [];
 
         // ── Product create (Phase B) — turn unmatched products into listings. Runs before the
         //    stock push; created variants get their inventory set during creation, so they're
@@ -1454,6 +1597,7 @@ async function runScopeTarget({ connection, token, job, scopedProducts, items, l
                 for (const r of createdRows) {
                     matchInfoBySku.set(r.sku, { shopifyVariantId: r.shopifyVariantId, shopifyProductId: r.shopifyProductId });
                     createdParentCodes.add(r.parentCode);
+                    if (r.shopifyInventoryItemId) createdItems.push(r);
                 }
             }
         }
@@ -1507,6 +1651,20 @@ async function runScopeTarget({ connection, token, job, scopedProducts, items, l
             needActivate.forEach((it, i) => recordOutcome(it, actOutcomes[i], true));
 
             if (stateUpdates.length) await productMap.bulkSetState(connection._id, stateUpdates);
+        }
+
+        // ── Multi-location fulfilment — activate every synced item at every active location so
+        //    Shopify can fulfil it from any of them ("Location doesn't fulfill this variant"
+        //    otherwise). Quantities are untouched: only THIS scope's location carries stock.
+        //    Covers both freshly-created variants and existing mapped ones, and is skipped for
+        //    items whose Shopify target we already know is dead. ────────────────────────────────
+        if (connection.config?.stockAllLocations !== false) {
+            // Created first — they're the ones a merchant is about to try to fulfil.
+            const spreadItems = [...createdItems, ...pushable].filter((it) => !staleSkus.has(it.sku));
+            await stockAtAllLocations({
+                shop: connection.shopDomain, token, connectionId: connection._id,
+                items: spreadItems, allLocationIds, locationCount, existingMap, counts, errors
+            });
         }
 
         // ── Content + price push (Phase C) — for every mode above `stock_only` (design §9).
@@ -1742,6 +1900,24 @@ async function executeRun(connection, job, token) {
             }
         }
 
+        // Every ACTIVE location in the store, read once per run. Synced items are activated at all
+        // of them so any location can fulfil them (stock still only lands at the scope's own
+        // location). Non-fatal: if the lookup fails the spread is skipped for this run.
+        // Third-party fulfilment locations (3PL / Shopify Fulfillment Network) are excluded: their
+        // inventory is owned by that service and an app can't activate items there.
+        let allLocationIds = [];
+        let locationCount = 0; // TOTAL, including the ones we skip — sizes the levels lookup
+        try {
+            const locations = await listLocations(connection.shopDomain, token);
+            locationCount = locations.length;
+            allLocationIds = locations
+                .filter((l) => l.active && !l.fulfillmentServiceId)
+                .map((l) => l.id)
+                .filter(Boolean);
+        } catch (err) {
+            console.error('[shopify] location list failed:', err.message);
+        }
+
         // Run each scope target at its own location AND its own push config, accumulating into the
         // shared run state. Each source gets an "effective connection" — the real connection with
         // its config swapped for the scope's effective config and the scope's location — so every
@@ -1760,7 +1936,7 @@ async function executeRun(connection, job, token) {
             await runScopeTarget({
                 connection: scopeConn, token, job,
                 scopedProducts: t.scopedProducts, items: t.items, locationId: t.locationId, exportConfig: tagExportConfig,
-                existingMap, counts, errors, unmatched, staleSkus
+                existingMap, counts, errors, unmatched, staleSkus, allLocationIds, locationCount
             });
         }
 

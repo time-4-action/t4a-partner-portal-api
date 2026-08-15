@@ -103,7 +103,7 @@ async function bulkSetState(connectionId, updates) {
  * push (Phase C). Kept separate from {@link bulkSetState} so a price/content update doesn't
  * disturb the row's stock sync state.
  * @param {ObjectId|string} connectionId
- * @param {Array<{sku:string, priceHash?:string, contentHash?:string, imageHash?:string}>} updates
+ * @param {Array<{sku:string, priceHash?:string, contentHash?:string, imageHash?:string, allLocationsKey?:string}>} updates
  */
 async function bulkSetHashes(connectionId, updates) {
     if (!updates.length) return;
@@ -116,6 +116,9 @@ async function bulkSetHashes(connectionId, updates) {
         if (u.imageHash !== undefined) set.imageHash = u.imageHash;
         if (u.imageMedia !== undefined) set.imageMedia = u.imageMedia; // [{url, mediaId}] — tracks our pushed images
         if (u.publishHash !== undefined) set.publishHash = u.publishHash;
+        // Location set the item's inventory has been activated across (so every location can
+        // fulfil it). Stale/absent → the next sync re-spreads it. See `stockAtAllLocations`.
+        if (u.allLocationsKey !== undefined) set.allLocationsKey = u.allLocationsKey;
         return { updateOne: { filter: { connectionId: cid, sku: u.sku }, update: { $set: set } } };
     });
     await getDb().collection(COLLECTION_NAME).bulkWrite(ops, { ordered: false });
