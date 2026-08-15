@@ -57,12 +57,12 @@ exports.list = async (req, res) => {
 exports.create = async (req, res) => {
     try {
         const { sub, email } = authUser(req);
-        const { brand, url, authHeaderName, authToken, schedule, options } = req.body || {};
+        const { brand, url, authHeaderName, authToken, schedule, options, aiCategorization } = req.body || {};
         if (!brand || typeof brand !== 'string') throw validationError('brand is required');
         if (!url || !/^https?:\/\//i.test(url)) throw validationError('a valid feed url is required');
         const created = await ownSource.createSource({
             ownerSub: sub, ownerEmail: email, brand: brand.trim(), url: url.trim(),
-            authHeaderName, authToken, schedule, options
+            authHeaderName, authToken, schedule, options, aiCategorization
         });
         recordActivity('feed_add', {
             ownerSub: sub, email,

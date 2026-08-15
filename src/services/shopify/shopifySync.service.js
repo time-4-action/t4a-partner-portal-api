@@ -9,6 +9,8 @@ const syncJobs = require('./shopifySyncJobs.service');
 const queue = require('./shopifyQueue.service');
 const { graphqlRequest, publishToPublications, unpublishFromPublications, listPublications, findExistingIds } = require('./shopifyGraphql.service');
 const externalProducts = require('../external/externalProducts.service');
+const ownSource = require('../external/ownSource.service');
+const { ensureFeedCategorized } = require('../ai/categoryIdentification.service');
 const { normalizePriceFactor, toMoneyString } = require('./priceFactor.util');
 
 /**
@@ -1602,7 +1604,33 @@ async function executeRun(connection, job, token) {
                 // Own-source products carry pre-resolved tags + vendor, so it stays null for feeds.
                 let exportConfig = null;
                 let built;
+                // Which category set supplies this source's tags. For a Patrik export the scope
+                // carries it; for a feed it comes off the feed itself (resolved just below).
+                let aiExportId = sc.aiExportId || null;
                 if (sc.type === 'own_source') {
+                    // WHICH category sets a feed is categorized against is owned by the FEED (it
+                    // can maintain several); WHICH ONE of them supplies THIS store's tags is the
+                    // scope's choice — see external_integration.md §7.1. Categorize every set the
+                    // feed maintains HERE, before the rows are read, since the tags resolved
+                    // further down come off them. This is the single choke point every trigger
+                    // passes through (manual sync, post-import push, PNV fan-out), and it is
+                    // incremental: a feed with nothing new or changed makes no AI call at all.
+                    const feed = await ownSource.getSourceByFeedId(sc.feedId);
+                    const ai = feed?.aiCategorization;
+                    const feedSets = ai?.enabled ? (ai.exportIds || []) : [];
+                    for (const setId of feedSets) {
+                        const res = await ensureFeedCategorized(sc.feedId, setId);
+                        // A categorization failure doesn't abort the sync (stock/prices still go
+                        // out), but it MUST be reported: otherwise the run finishes "done" and the
+                        // partner just sees tags that never changed, with nothing to explain it.
+                        if (res?.error) {
+                            errors.push({ error: `AI categorization for ${feed?.brand || sc.feedId}: ${res.error} — tags fall back to the feed's own until this is fixed.` });
+                        }
+                    }
+                    // Honour the scope's pick when the feed still maintains it; otherwise fall back
+                    // to the feed's first set (so a source works without extra configuration, and a
+                    // set removed on the feed can't leave the store tagging from stale data).
+                    aiExportId = feedSets.includes(sc.aiExportId) ? sc.aiExportId : (feedSets[0] || null);
                     built = await buildExternalScope(sc.feedId);
                 } else {
                     exportConfig = await getExportConfigById(sc.exportConfigId);
@@ -1612,7 +1640,7 @@ async function executeRun(connection, job, token) {
                     }
                     built = await buildScope(exportConfig);
                 }
-                targets.push({ ...sc, exportConfig, scopedProducts: built.products, items: built.items });
+                targets.push({ ...sc, aiExportId, exportConfig, scopedProducts: built.products, items: built.items });
             } catch (e) {
                 errors.push({ error: `Could not build ${scopeLabel(sc)}: ${e.message}` });
             }
@@ -1722,9 +1750,12 @@ async function executeRun(connection, job, token) {
             if (!t.items.length) continue;
             const scopeConn = { ...connection, config: resolveScopeConfig(connection, t), shopifyLocationId: t.locationId };
             // Per-source AI-categorization for tags: override the export config's aiExportId when
-            // the scope sets one (Patrik sources). Own-source feeds carry pre-resolved tags.
-            const tagExportConfig = (t.exportConfig && t.aiExportId)
-                ? { ...t.exportConfig, filters: { ...(t.exportConfig.filters || {}), aiExportId: t.aiExportId } }
+            // the scope sets one. An own-source scope has no export config at all, so it gets a
+            // synthetic one carrying just the filter — `resolveTagsArray` then merges the feed's
+            // ingest-time tags with the AI categories (the only other reader, `option1Name`,
+            // correctly falls back to the connection-level variant option name).
+            const tagExportConfig = t.aiExportId
+                ? { ...(t.exportConfig || {}), filters: { ...(t.exportConfig?.filters || {}), aiExportId: t.aiExportId } }
                 : t.exportConfig;
             await runScopeTarget({
                 connection: scopeConn, token, job,

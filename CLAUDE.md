@@ -66,6 +66,23 @@ Triggered by `POST /api/export/webhooks/sync/pnv`. Responds `202` immediately an
 
 Triggered by `POST /api/export/webhooks/sync/ai-categorization`. Uses Anthropic Claude (`@anthropic-ai/sdk`, model `claude-haiku-4-5`, structured outputs) to assign categories to uncategorized products. Categories are stored as an `ai_categories` array on each product document, keyed by `exportId`.
 
+It runs over **two catalogues**:
+
+- **Patrik (`products`)** — `identifyProductCategories(exportId)`. Gated by the export's `aiCategorizationEnabled` flag; run by the PNV scheduler. Categorizes every product with no entry for the set.
+- **Own Source feeds (`external_products`)** — `identifyFeedProductCategories(feedId, exportId)`. Configured **per feed**, on the feed itself: `own_sources.aiCategorization = { enabled, exportIds[] }`. A feed can maintain **several** category sets at once; `executeRun` categorizes every one of them right before reading the feed's products, so every trigger (manual sync, post-import push, PNV fan-out) gets fresh categories. **Incremental** — a row is re-sent only when it has no entry for that set or its `contentHash` changed since the entry was written, so re-importing an unchanged feed makes no AI call. An entry with `manual: true` (a partner's override from the Categories page) is never re-categorized. Feed rows are sent as a compact view (name, vendor, supplier type/tags, de-HTML'd description, variant codes/sizes) rather than the whole document.
+
+A categorization failure (empty category set, bad API key, provider outage) **never aborts the sync** — stock and prices still go out and tags fall back to the feed's own — but `ensureFeedCategorized` returns an `error` that `executeRun` records on the run's `errors[]`. Don't make it silent again: a swallowed failure is indistinguishable from "the sync worked but my tags never updated".
+
+**Who decides what:** the feed decides *which sets exist*; the Shopify scope's `aiExportId` decides *which one of them supplies that store's tags*. If the scope names a set the feed no longer maintains (or names none), the engine falls back to the feed's first set — a store can never tag from a set the feed isn't categorizing.
+
+A feed appears on `/categories` under each set it maintains (`ownSource.listFeedIdsForAiExport`); switching the feed off, or dropping a set, removes its products from that list and stops categorization, but keeps the stored categories so re-enabling costs nothing.
+
+Run progress lives in `ai_categorization_runs`, keyed by `exportId` for the catalogue and `<exportId>:<feedId>` for a feed. **The `exportId` field on that doc IS the key** — a progress patch must never set it (feed runs carry the plain set id as `setId`).
+
+Tags: `resolveTagsArray` gives a categorized product its **AI categories alone** — they replace whatever taxonomy the source shipped (PNV's `categories` for Patrik, the supplier's `tags` + expanded `categoryPaths` for a feed), so a store carries one taxonomy rather than two merged. A product with no category for the selected set falls back to its source's own tags rather than being stripped bare.
+
+**Whether tags reach products already in the store is decided by the ownership mode, not by categorization** (`shopifySync.service.js:456`): `portal_authoritative` maintains them every sync; `create_then_handoff` sets them only at creation (`pricesOnly` forces `wantTags = false`); `stock_only` never touches content at all. `syncTags: false` also stops maintenance. The Shopify source panel warns about all three next to the category picker — if "tags aren't updating", check the mode before suspecting the categorizer.
+
 ### Custom exports (`src/services/customExport.service.js`)
 
 Export configurations are stored in the `export_configs` MongoDB collection. Each config defines field selection, filters, and pricelist priority. Supports presets: `shopify`, `simple`, `detailed`, `inventory`. Generates CSV/JSON/XML on demand.
@@ -81,6 +98,8 @@ The **inventory preset** uses a dedicated code path (`generateInventoryRows()`) 
 | Collection | Purpose |
 |---|---|
 | `products` | Synced PNV products with Metakocka enrichment and AI categories |
+| `external_products` | Own Source feed catalogues (internal product shape); carries `ai_categories` when a Shopify source enables categorization |
+| `ai_categorization_runs` | Latest AI run per key (`exportId`, or `<exportId>:<feedId>` for a feed) |
 | `exports` | Export definitions (name, AI categorization enabled, roles/users) |
 | `export_configs` | Custom export configurations (fields, filters, presets) |
 | `analytics` | Function performance and API request logs |

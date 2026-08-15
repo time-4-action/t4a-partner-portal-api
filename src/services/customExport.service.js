@@ -973,17 +973,22 @@ const resolveCategoryName = (product, config) => {
  * e.g. AI category "Electronics / Phones" → ["Electronics", "Electronics / Phones"]
  */
 const resolveTagsArray = (product, config) => {
-    // External-feed products carry pre-resolved tags (flat `tags` + expanded `categoryPaths`,
-    // resolved at ingest — see external importer §7). They have no ai_categories/exportId, so
-    // prefer their stored tags and leave Patrik's AI-category path below untouched.
-    if (Array.isArray(product.tags) && product.source) return product.tags;
     const aiExportId = config?.filters?.aiExportId;
-    if (aiExportId && aiExportId !== 'all') {
-        const filtered = (product.ai_categories || []).filter(c => c.exportId === aiExportId);
-        if (filtered.length > 0) {
-            return [...new Set(filtered.flatMap(c => expandCategoryToTags(c.categoryName)))];
-        }
-    }
+    const aiTags = aiExportId && aiExportId !== 'all'
+        ? [...new Set((product.ai_categories || [])
+            .filter(c => c.exportId === aiExportId)
+            .flatMap(c => expandCategoryToTags(c.categoryName)))]
+        : [];
+
+    // A categorized product is tagged with its AI categories ALONE — they REPLACE whatever
+    // taxonomy the source shipped (PNV's `categories` for Patrik, the supplier's `tags` +
+    // expanded `categoryPaths` for an external feed). One taxonomy per store, not two merged.
+    if (aiTags.length > 0) return aiTags;
+
+    // Not categorized (no set selected, or this product has no category for it yet): fall back to
+    // the source's own taxonomy rather than stripping the product bare. For an external feed those
+    // tags were pre-resolved at ingest (see external importer §7).
+    if (Array.isArray(product.tags) && product.source) return product.tags;
     return product.categories || [];
 };
 

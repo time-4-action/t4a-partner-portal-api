@@ -58,12 +58,23 @@ exports.getExportById = async (req, res) => {
 }
 // GET /exports/:id/ai-status — latest AI-categorization run for this category set.
 // The UI polls this while a run is going to render live progress (batches/products/errors).
-const { getRunStatus } = require("../services/ai/categoryIdentification.service");
+const { getRunStatus, feedRunKey } = require("../services/ai/categoryIdentification.service");
+const { listFeedIdsForAiExport } = require("../services/external/ownSource.service");
 
 exports.getAiStatus = async (req, res) => {
     try {
-        const run = await getRunStatus(req.params.id);
-        res.json({ success: true, run });
+        const exportId = req.params.id;
+        // A category set can also govern Own Source feeds that switched categorization on (each
+        // categorized under its own run key), so the page shows the catalogue run AND each feed's.
+        const feedIds = await listFeedIdsForAiExport(exportId);
+        const [run, feedRuns] = await Promise.all([
+            getRunStatus(exportId),
+            Promise.all(feedIds.map(async (feedId) => ({
+                feedId,
+                run: await getRunStatus(feedRunKey(exportId, feedId))
+            })))
+        ]);
+        res.json({ success: true, run, feeds: feedRuns.filter((f) => f.run) });
     } catch (error) {
         res.status(500).json({ success: false, message: error.message });
     }

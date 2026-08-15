@@ -87,47 +87,97 @@ const generateProductsTsv = async (exportId) => {
     return header + tsvRows.join('\n');
 };
 
+/**
+ * Products governed by a category set, for the Categories page review table. This spans BOTH
+ * catalogues: Patrik's shared `products` and the `external_products` rows of every Own Source
+ * feed that has AI categorization switched ON for this set (plus any feed row still carrying a
+ * category for it, so a feed you just switched off stays reviewable until its categories are
+ * cleared). Switching a feed on in its settings is what makes its products appear here.
+ *
+ * Each row carries `sourceType`/`sourceName` so the UI can label where a product came from.
+ */
 const getProductsWithAiCategoriesForExport = async (exportId) => {
     const db = getDb();
-    const products = await db.collection('products')
-        .find(
-            { active: { $ne: false } },
-            { projection: { _id: 1, code: 1, token: 1, product_name: 1, ai_categories: 1 } }
-        )
-        .sort({ product_name: 1 })
-        .toArray();
+    const projection = { _id: 1, code: 1, token: 1, product_name: 1, ai_categories: 1 };
 
-    return products.map(p => {
-        const match = p.ai_categories?.find(c => c.exportId === exportId) ?? null;
-        return {
-            _id: p._id,
-            code: p.code,
-            token: p.token,
-            product_name: p.product_name,
-            aiCategory: match,
-        };
+    const { listFeedIdsForAiExport } = require('./external/ownSource.service');
+    const feedIds = await listFeedIdsForAiExport(exportId);
+
+    const [products, externals] = await Promise.all([
+        db.collection('products')
+            .find({ active: { $ne: false } }, { projection })
+            .sort({ product_name: 1 })
+            .toArray(),
+        db.collection('external_products')
+            .find(
+                {
+                    active: { $ne: false },
+                    $or: [
+                        ...(feedIds.length ? [{ feedId: { $in: feedIds } }] : []),
+                        { 'ai_categories.exportId': exportId }
+                    ]
+                },
+                { projection: { ...projection, feedId: 1, vendor: 1 } }
+            )
+            .sort({ product_name: 1 })
+            .toArray()
+    ]);
+
+    const shape = (p, sourceType, sourceName) => ({
+        _id: p._id,
+        code: p.code,
+        token: p.token,
+        product_name: p.product_name,
+        sourceType,
+        sourceName,
+        aiCategory: p.ai_categories?.find(c => c.exportId === exportId) ?? null,
     });
+
+    return [
+        ...products.map(p => shape(p, 'patrik', 'Patrik')),
+        ...externals.map(p => shape(p, 'own_source', p.vendor || p.feedId)),
+    ];
+};
+
+/**
+ * Resolves which collection an AI-category product id lives in. Ids are ObjectIds unique to their
+ * collection, so "look in `products`, else `external_products`" is unambiguous and keeps the
+ * Categories page from having to know where a row came from.
+ */
+const _aiCategoryCollection = async (productId) => {
+    const db = getDb();
+    const _id = new ObjectId(productId);
+    if (await db.collection('products').countDocuments({ _id }, { limit: 1 })) {
+        return db.collection('products');
+    }
+    if (await db.collection('external_products').countDocuments({ _id }, { limit: 1 })) {
+        return db.collection('external_products');
+    }
+    return null;
 };
 
 const setProductAiCategory = async (productId, exportId, categoryId, categoryName) => {
-    const db = getDb();
     if (!ObjectId.isValid(productId)) return null;
-    const col = db.collection('products');
+    const col = await _aiCategoryCollection(productId);
+    if (!col) return null;
     await col.updateOne(
         { _id: new ObjectId(productId) },
         { $pull: { ai_categories: { exportId } } }
     );
     return col.findOneAndUpdate(
         { _id: new ObjectId(productId) },
-        { $push: { ai_categories: { exportId, categoryId, categoryName } } },
+        // `manual: true` marks the partner's own choice — the feed categorizer treats such an
+        // entry as final and never re-categorizes over it, even when the supplier's content changes.
+        { $push: { ai_categories: { exportId, categoryId, categoryName, manual: true, at: new Date() } } },
         { returnDocument: 'after', projection: { _id: 1, code: 1, ai_categories: 1 } }
     );
 };
 
 const removeProductAiCategory = async (productId, exportId) => {
-    const db = getDb();
     if (!ObjectId.isValid(productId)) return null;
-    return db.collection('products').findOneAndUpdate(
+    const col = await _aiCategoryCollection(productId);
+    if (!col) return null;
+    return col.findOneAndUpdate(
         { _id: new ObjectId(productId) },
         { $pull: { ai_categories: { exportId } } },
         { returnDocument: 'after', projection: { _id: 1, code: 1, ai_categories: 1 } }
@@ -136,11 +186,13 @@ const removeProductAiCategory = async (productId, exportId) => {
 
 const clearAllAiCategoriesForExport = async (exportId) => {
     const db = getDb();
-    const result = await db.collection('products').updateMany(
-        { 'ai_categories.exportId': exportId },
-        { $pull: { ai_categories: { exportId } } }
-    );
-    return result.modifiedCount;
+    const filter = { 'ai_categories.exportId': exportId };
+    const update = { $pull: { ai_categories: { exportId } } };
+    const [patrik, external] = await Promise.all([
+        db.collection('products').updateMany(filter, update),
+        db.collection('external_products').updateMany(filter, update),
+    ]);
+    return (patrik.modifiedCount || 0) + (external.modifiedCount || 0);
 };
 
 const _resolveCategory = (parent, exportId) => {
