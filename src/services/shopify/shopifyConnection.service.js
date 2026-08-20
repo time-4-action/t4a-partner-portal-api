@@ -2,6 +2,7 @@ const { getDb } = require('../db/mongo.service');
 const { ObjectId } = require('mongodb');
 const { encryptToken } = require('./crypto.service');
 const { normalizePriceFactor } = require('./priceFactor.util');
+const { normalizePriceRounding, DEFAULT_PRICE_ROUNDING } = require('./priceRounding.util');
 
 /**
  * Data-access layer for the `shopify_connections` collection — one document per
@@ -51,6 +52,8 @@ const DEFAULT_CONFIG = {
     priceVatMode: 'inclusive', // 'inclusive' | 'exclusive'
     // Multiplier applied to every pushed price (currency conversion / uplift). 1 = unchanged.
     priceFactor: 1,
+    // Shelf-price rounding applied AFTER the factor (e.g. "always end in 9"). Off by default.
+    priceRounding: { ...DEFAULT_PRICE_ROUNDING },
     futureDatedGuard: true,
     syncStock: true,
     syncNewProducts: false,
@@ -529,7 +532,7 @@ async function updateConnectionConfig(id, patch) {
     const collection = db.collection(COLLECTION_NAME);
 
     const allowed = [
-        'exportConfigId', 'pricelistPriority', 'priceVatMode', 'priceFactor', 'futureDatedGuard',
+        'exportConfigId', 'pricelistPriority', 'priceVatMode', 'priceFactor', 'priceRounding', 'futureDatedGuard',
         // `syncTags` is its own toggle (tags used to ride along with `syncDescriptions`); it must
         // be writable at the connection level too, or a source that doesn't set its own falls back
         // to the default-ON instead of what the partner chose.
@@ -556,6 +559,9 @@ async function updateConnectionConfig(id, patch) {
         // The price multiplier is stored already-clean (positive, ≤ 6 dp) at BOTH levels, so the
         // sync engine and every read of the config see the same number the partner will be shown.
         if ('config.priceFactor' in set) set['config.priceFactor'] = normalizePriceFactor(set['config.priceFactor']);
+        // Same for the rounding rule — stored complete and key-ordered, so the engine, the portal's
+        // unsaved-changes check and a hand-read of the document all see the identical object.
+        if ('config.priceRounding' in set) set['config.priceRounding'] = normalizePriceRounding(set['config.priceRounding']);
         // Same for the title prefix: stored trimmed + length-capped at both levels, so the pushed
         // title is exactly what the partner was shown and can't carry invisible whitespace.
         if ('config.titlePrefix' in set) set['config.titlePrefix'] = normalizeTitlePrefix(set['config.titlePrefix']);
@@ -564,6 +570,7 @@ async function updateConnectionConfig(id, patch) {
                 if (!s) return s;
                 const out = { ...s };
                 if ('priceFactor' in s) out.priceFactor = normalizePriceFactor(s.priceFactor);
+                if ('priceRounding' in s) out.priceRounding = normalizePriceRounding(s.priceRounding);
                 if ('titlePrefix' in s) out.titlePrefix = normalizeTitlePrefix(s.titlePrefix);
                 return out;
             });

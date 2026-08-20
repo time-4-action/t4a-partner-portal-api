@@ -12,6 +12,7 @@ const externalProducts = require('../external/externalProducts.service');
 const ownSource = require('../external/ownSource.service');
 const { ensureFeedCategorized } = require('../ai/categoryIdentification.service');
 const { normalizePriceFactor, toMoneyString } = require('./priceFactor.util');
+const { normalizePriceRounding, applyPriceRounding } = require('./priceRounding.util');
 
 /**
  * Stock-only sync engine — Phase A (design §8, plan Phase A).
@@ -139,6 +140,21 @@ const PRODUCT_OPTIONS_QUERY = `query ProductOptions($ids: [ID!]!) {
 
 const PRODUCT_OPTION_UPDATE_MUTATION = `mutation ProductOptionUpdate($productId: ID!, $option: OptionUpdateInput!) {
   productOptionUpdate(productId: $productId, option: $option) {
+    product { id }
+    userErrors { field message }
+  }
+}`;
+
+// Phase C addendum — variant option VALUE repair. Same read shape as above plus each option's
+// values, so a value left as a bare SKU by an older sync can be renamed to a real label.
+const PRODUCT_OPTION_VALUES_QUERY = `query ProductOptionValues($ids: [ID!]!) {
+  nodes(ids: $ids) { ... on Product { id options { id name position optionValues { id name } } } }
+}`;
+
+// Renames option VALUES in place. `variantStrategy: LEAVE_AS_IS` keeps every variant attached to
+// the value it already uses — only the label changes, no variant is created or dropped.
+const PRODUCT_OPTION_VALUES_UPDATE_MUTATION = `mutation ProductOptionValuesUpdate($productId: ID!, $option: OptionUpdateInput!, $optionValuesToUpdate: [OptionValueUpdateInput!]) {
+  productOptionUpdate(productId: $productId, option: $option, optionValuesToUpdate: $optionValuesToUpdate, variantStrategy: LEAVE_AS_IS) {
     product { id }
     userErrors { field message }
   }
@@ -326,6 +342,23 @@ async function buildExternalScope(feedId) {
 }
 
 /**
+ * Reads a source's pricing settings once, already sanitized, into the bundle every price-producing
+ * function takes. Keeping them together is what stops each new price transform from adding another
+ * positional argument to three call sites — and it's the single place a source's pricing is read.
+ *
+ * @param {object} cfg a scope-resolved config (see {@link resolveScopeConfig})
+ */
+function resolvePriceOpts(cfg) {
+    return {
+        pricelistPriority: cfg.pricelistPriority || [],
+        vatMode: cfg.priceVatMode || 'inclusive',
+        futureGuard: cfg.futureDatedGuard !== false,
+        factor: normalizePriceFactor(cfg.priceFactor),
+        rounding: normalizePriceRounding(cfg.priceRounding)
+    };
+}
+
+/**
  * Resolves the single price to push for a variant: picks the winning pricelist via the
  * connection's priority (reusing {@link getPriceFromPriority}), optionally dropping
  * future-dated lists first (Q5 guard), then applies the VAT mode (Q4).
@@ -335,15 +368,23 @@ async function buildExternalScope(feedId) {
  *   - `inclusive` → push the gross price  (net × (1 + vat/100))
  *   - `exclusive` → push the net price    (as stored)
  *
- * Finally the source's price FACTOR is applied — a multiplier for stores that sell the catalogue
- * in another currency or at a fixed uplift (e.g. 11.4). It keeps its full precision (up to 6 dp);
- * only the resulting amount is rounded, once, to the 2 dp Shopify stores. A connection without a
- * factor gets `1` → the exact price it pushed before.
+ * Then the source's price FACTOR — a multiplier for stores that sell the catalogue in another
+ * currency or at a fixed uplift (e.g. 11.4). It keeps its full precision (up to 6 dp).
  *
- * @param {number} [priceFactor=1] the source's multiplier (raw — normalized here)
+ * Then the source's ROUNDING rule snaps that amount to a shelf price ("always end in 9", "nearest
+ * 0.05"). Factor before rounding, never the reverse: a factor is a unit conversion, so rounding
+ * first and converting after would destroy the ending the partner asked for (2039 × 11.4).
+ *
+ * Only the final amount is turned into the 2-dp string Shopify stores, once. A source with neither
+ * setting gets factor `1` and a disabled rule → the exact price it pushed before.
+ *
+ * @param {object} variant
+ * @param {object} priceOpts from {@link resolvePriceOpts}
+ * @param {number} nowMs
  * @returns {string|null} price as a 2-dp string, or null when nothing resolvable
  */
-function resolvePushPrice(variant, pricelistPriority, vatMode, futureGuard, nowMs, priceFactor = 1) {
+function resolvePushPrice(variant, priceOpts, nowMs) {
+    const { pricelistPriority, vatMode, futureGuard, factor, rounding } = priceOpts;
     let v = variant;
     if (futureGuard && Array.isArray(variant.pricelist)) {
         v = { ...variant, pricelist: variant.pricelist.filter((pl) => !pl.valid_from || new Date(pl.valid_from).getTime() <= nowMs) };
@@ -351,7 +392,7 @@ function resolvePushPrice(variant, pricelistPriority, vatMode, futureGuard, nowM
     const r = getPriceFromPriority(v, pricelistPriority);
     if (!r || !r.price) return null;
     const price = vatMode === 'inclusive' ? r.price * (1 + (r.vat || 0) / 100) : r.price;
-    return toMoneyString(price * normalizePriceFactor(priceFactor));
+    return toMoneyString(applyPriceRounding(price * factor, rounding));
 }
 
 /**
@@ -498,10 +539,7 @@ async function pushPortalAuthoritative({ connection, token, scopedProducts, matc
     const wantTags = !pricesOnly && cfg.syncTags !== false;
     if (!wantPrices && !wantContent && !wantTags) return;
 
-    const vatMode = cfg.priceVatMode || 'inclusive';
-    const futureGuard = cfg.futureDatedGuard !== false;
-    const pricelistPriority = cfg.pricelistPriority || [];
-    const priceFactor = normalizePriceFactor(cfg.priceFactor);
+    const priceOpts = resolvePriceOpts(cfg);
     // Per-source title prefix (e.g. "WINDSURF -"). It's part of the pushed title, so it also
     // feeds the contentHash below — changing the prefix re-pushes every title on the next sync.
     const titlePrefix = cfg.titlePrefix || '';
@@ -538,7 +576,7 @@ async function pushPortalAuthoritative({ connection, token, scopedProducts, matc
 
         if (wantPrices) {
             for (const { v, sku, info } of matched) {
-                const price = resolvePushPrice(v, pricelistPriority, vatMode, futureGuard, nowMs, priceFactor);
+                const price = resolvePushPrice(v, priceOpts, nowMs);
                 if (price == null) continue; // nothing resolvable — leave the variant's price alone
                 priceCandidates.push({ parentCode: product.code, productId, variantId: info.shopifyVariantId, sku, price, priceHash: sha1(price) });
             }
@@ -746,6 +784,115 @@ async function pushOptionRenames({ connection, token, scopedProducts, matchInfoB
     });
 }
 
+/**
+ * Plans the option-value repair for ONE product, or null when there's nothing to do.
+ *
+ * A value is only touched when it is EXACTLY one of this product's catalogue SKUs — that is
+ * unmistakably the old sizeless fallback we wrote ourselves; a label a merchant typed is never
+ * overwritten. The replacement comes from the same resolver the create path uses, so a repaired
+ * product ends up named exactly like a freshly-created one.
+ */
+function planOptionValueRepair(node, product) {
+    if (!node?.id || !product || !Array.isArray(node.options)) return null;
+    const opt = node.options.find((o) => o.position === 1) || node.options[0];
+    // 'Title' is Shopify's no-real-options placeholder (Default Title) — never a size.
+    if (!opt || opt.name === 'Title' || !Array.isArray(opt.optionValues)) return null;
+
+    const variants = product.child_products || [];
+    if (!variants.length) return null;
+    const skus = new Set(variants.map((v) => v.code || '').filter(Boolean));
+    const desiredBySku = resolveOptionValues(variants, (v) => v.code || '', variants, product.product_name);
+
+    const updates = [];
+    const targets = []; // every value's resulting name — used to catch duplicates before mutating
+    for (const val of opt.optionValues) {
+        const name = val.name || '';
+        const desired = skus.has(name) ? (desiredBySku.get(name) || '') : '';
+        const target = desired && desired !== name ? desired : name;
+        targets.push(target);
+        if (target !== name) updates.push({ id: val.id, name: target });
+    }
+    if (!updates.length) return null;
+    // Two values renaming onto the same label would be rejected outright — leave the product alone
+    // rather than half-renaming it (the next catalogue fix makes it resolvable).
+    if (new Set(targets).size !== targets.length) return null;
+    return { productId: node.id, optionId: opt.id, parentCode: product.code, updates };
+}
+
+/**
+ * Phase C addendum — repairs variant option VALUES on EXISTING products that an older sync named
+ * after the SKU because the variant carried no `size` (the store showed "P06210004050" where
+ * "500 cm2" belongs). portal_authoritative only — option values are a managed structural field
+ * there, and merchant-typed labels are left untouched by construction (see
+ * {@link planOptionValueRepair}).
+ *
+ * Cost: one bulk options read per 250 matched products per run; a mutation only for products that
+ * still carry a SKU-named value, so a repaired store is read-only here from the next run on.
+ */
+async function pushOptionValueRepairs({ connection, token, scopedProducts, matchInfoBySku, counts, errors }) {
+    const shop = connection.shopDomain;
+
+    // shopifyProductId → catalogue parent. Only products with REAL variants (no-variant products
+    // use Shopify's reserved Title / Default Title and are skipped).
+    const productById = new Map();
+    for (const product of scopedProducts) {
+        for (const v of product.child_products || []) {
+            const info = matchInfoBySku.get(v.code || '');
+            if (info?.shopifyProductId) { productById.set(info.shopifyProductId, product); break; }
+        }
+    }
+    if (!productById.size) return;
+
+    const ids = [...productById.keys()];
+    const ops = [];
+    for (let i = 0; i < ids.length; i += 250) {
+        const batch = ids.slice(i, i + 250);
+        let data;
+        try {
+            data = await graphqlRequest(shop, token, PRODUCT_OPTION_VALUES_QUERY, { ids: batch });
+        } catch (e) {
+            errors.push({ error: `option value: could not read product options: ${e.message}` });
+            continue;
+        }
+        for (const node of data?.nodes || []) {
+            const op = planOptionValueRepair(node, productById.get(node?.id));
+            if (op) ops.push(op);
+        }
+    }
+    if (!ops.length) return;
+
+    await queue.mapWithConcurrency(ops, async (op) => {
+        try {
+            const data = await graphqlRequest(shop, token, PRODUCT_OPTION_VALUES_UPDATE_MUTATION, {
+                productId: op.productId,
+                option: { id: op.optionId },
+                optionValuesToUpdate: op.updates
+            });
+            const ue = data?.productOptionUpdate?.userErrors || [];
+            if (ue.length) errors.push({ parentCode: op.parentCode, error: `option value: ${ue.map((e) => e.message).join('; ')}` });
+            else counts.optionValuesFixed += op.updates.length;
+        } catch (e) {
+            errors.push({ parentCode: op.parentCode, error: `option value: ${e.message}` });
+        }
+    });
+}
+
+/**
+ * The address Shopify should FETCH an image from.
+ *
+ * Catalogue image URLs sometimes carry raw non-ASCII characters or spaces in their path — most
+ * often "∅" (U+2205, the empty-set sign typists reach for instead of the diameter sign Ø), as in
+ * `…/mast-∅-1114-mm.png`. Shopify requests `originalSource` verbatim and such a URL comes back as
+ * FAILED media, so the path is percent-encoded here (`WHATWG URL` encodes on parse: `∅` →
+ * `%E2%88%85`, and an already-encoded path is left alone rather than double-encoded).
+ *
+ * The RAW catalogue URL stays the media `alt` — that's the identity every reconcile matches media
+ * by, and re-keying it would make every image already in the store look missing.
+ */
+const toFetchableUrl = (url) => {
+    try { return new URL(url).toString(); } catch { return url; }
+};
+
 /** First non-FAILED media node per alt URL (the alts we stamp are the source URLs). */
 const mediaIndexByAlt = (prod) => {
     const byAlt = new Map();
@@ -912,7 +1059,7 @@ async function pushImages({ connection, token, scopedProducts, matchInfoBySku, e
             }
 
             if (toAdd.length) {
-                const media = toAdd.map((url) => ({ originalSource: url, alt: url, mediaContentType: 'IMAGE' }));
+                const media = toAdd.map((url) => ({ originalSource: toFetchableUrl(url), alt: url, mediaContentType: 'IMAGE' }));
                 const data = await graphqlRequest(shop, token, PRODUCT_UPDATE_MEDIA_MUTATION, { product: { id: op.productId }, media });
                 const ue = data?.productUpdate?.userErrors || [];
                 const msg = ue.map((e) => e.message).join('; ');
@@ -1153,11 +1300,14 @@ async function stockAtAllLocations({ shop, token, connectionId, items, allLocati
     if (done.length) await productMap.bulkSetHashes(connectionId, done);
 }
 
-/** Option1 value for a variant: prefer `size`, fall back to the (unique) SKU for sizeless ones. */
-const deriveOptionValue = (v) => {
-    const size = v.size != null ? String(v.size).trim() : '';
-    return size || v.code || '';
-};
+/** The variant's own `size`, trimmed — '' when it carries none. */
+const deriveSize = (v) => (v.size != null ? String(v.size).trim() : '');
+
+/**
+ * Option1 value for a variant with no sibling context: `size`, else the SKU. Only a last resort —
+ * {@link resolveOptionValues} derives a proper label from the variant NAME first (see there).
+ */
+const deriveOptionValue = (v) => deriveSize(v) || v.code || '';
 
 /** Longest common prefix of a list of strings. */
 const _lcp = (arr) => {
@@ -1189,6 +1339,40 @@ const _lcs = (arr) => {
 const _cleanLabel = (s) =>
     s.replace(/\s+/g, ' ').trim().replace(/^[\s\-–—:|/(),.]+/, '').replace(/[\s\-–—:|/(),.]+$/, '').trim();
 
+/** Characters that mark a word boundary inside a product name. */
+const SEP_RE = /[\s\-–—:|/(),._]/;
+
+/**
+ * Shrinks a common prefix back to the nearest word boundary so it never cuts a token in half:
+ * for "…T-Wave 72 l" / "…T-Wave 75 l" the raw prefix ends at "7" → trimmed to "…T-Wave ", so the
+ * labels come out "72 l" / "75 l" rather than "2 l" / "5 l". A prefix that already ends on a
+ * boundary — or that every name continues with one — is kept as is.
+ */
+function trimPrefixToBoundary(pre, names) {
+    if (!pre) return '';
+    if (SEP_RE.test(pre[pre.length - 1])) return pre;
+    if (names.every((n) => n.length <= pre.length || SEP_RE.test(n[pre.length]))) return pre;
+    for (let i = pre.length - 1; i >= 0; i--) if (SEP_RE.test(pre[i])) return pre.slice(0, i + 1);
+    return '';
+}
+
+/**
+ * Human label for each variant, taken from what its NAME adds to the family: the parent name and
+ * the siblings' shared prefix are stripped, so "Patrik Foil Front Wing 500 cm2" → "500 cm2".
+ * Used as the Option1 value for variants that carry no `size` (foil wings, parts, accessories) —
+ * without it they'd be listed under their SKU. Only the PREFIX is stripped: the tail usually
+ * carries the unit ("cm2", "l"), which belongs in the option value.
+ *
+ * The parent name joins the prefix computation so a product with a SINGLE sizeless variant still
+ * sheds the family name (nothing differs between siblings there).
+ */
+function variantLabelsFromNames(names, parentName = '') {
+    const clean = names.map((n) => (n || '').trim());
+    const parent = (parentName || '').trim();
+    const pre = trimPrefixToBoundary(_lcp(parent ? [...clean, parent] : clean), clean);
+    return clean.map((n) => _cleanLabel(n.slice(pre.length)));
+}
+
 /**
  * For a group of variant names that share a size, returns the part of each name that
  * actually differs — i.e. each name with the group's common prefix and suffix removed.
@@ -1202,20 +1386,35 @@ function diffLabels(names) {
 }
 
 /**
- * Shopify rejects two variants of the same product that share an Option1 value
- * ("The variant '68' already exists"). When several PNV variants resolve to the same size,
- * this disambiguates them from the PRODUCT NAME: it appends whatever part of the name
- * differs across the colliding variants — `72` / `72 GBM` for "Patrik T-Wave 72 l" vs
- * "…72 l - GBM". When the names are identical too (nothing meaningful to a customer), it
- * falls back to a plain positional counter — `68`, `68 (2)`.
+ * Resolves the Option1 value of every variant of one product.
  *
- * Returns a Map<sku, optionValue>. Non-colliding sizes are returned unchanged. Callers skip
- * no-variant products (their single 'Default Title' can't collide).
+ * Value per variant: its `size` → the part its NAME adds to the family
+ * ({@link variantLabelsFromNames}, e.g. "500 cm2") → its SKU. The name step matters for whole
+ * families that carry no size at all (foil wings, masts, spare parts): without it the store's
+ * size dropdown lists raw SKUs ("P06210004050").
+ *
+ * Then the collision pass: Shopify rejects two variants of the same product that share an
+ * Option1 value ("The variant '68' already exists"). When several variants resolve to the same
+ * value, it appends whatever part of the name differs across the colliding ones — `72` /
+ * `72 GBM` for "Patrik T-Wave 72 l" vs "…72 l - GBM". When the names are identical too (nothing
+ * meaningful to a customer), it falls back to a plain positional counter — `68`, `68 (2)`.
+ *
+ * @param {Array} toCreate - the variants that need a value (a subset of `allVariants`)
+ * @param {Function} skuOf - variant → SKU
+ * @param {Array} [allVariants] - the parent's FULL variant list; labels are derived across it so a
+ *   variant added to an existing product is named like the siblings already in the store
+ * @param {string} [parentName] - the parent's product name, stripped from the labels
+ * @returns {Map<string,string>} sku → Option1 value. Callers skip no-variant products (their
+ *   single 'Default Title' can't collide).
  */
-function resolveOptionValues(toCreate, skuOf) {
-    const groups = new Map(); // size -> [{ sku, name }]
+function resolveOptionValues(toCreate, skuOf, allVariants = toCreate, parentName = '') {
+    const labels = variantLabelsFromNames(allVariants.map((v) => v.product_name), parentName);
+    const labelBySku = new Map(allVariants.map((v, i) => [skuOf(v), labels[i]]));
+    const valueOf = (v) => deriveSize(v) || labelBySku.get(skuOf(v)) || v.code || '';
+
+    const groups = new Map(); // value -> [{ sku, name }]
     for (const v of toCreate) {
-        const value = deriveOptionValue(v);
+        const value = valueOf(v);
         if (!groups.has(value)) groups.set(value, []);
         groups.get(value).push({ sku: skuOf(v), name: (v.product_name || '').trim() });
     }
@@ -1245,9 +1444,9 @@ const optionValueFor = (plan, v) =>
  * (`inventoryQuantities` both activates the item at that location and sets the quantity, so
  * the freshly-created variant doesn't need a separate inventory push).
  */
-function buildCreateVariantInput(plan, v, locationId, pricelistPriority, vatMode, futureGuard, nowMs, variantOptionName = 'Size', priceFactor = 1) {
+function buildCreateVariantInput(plan, v, locationId, priceOpts, nowMs, variantOptionName = 'Size') {
     const sku = plan.skuOf(v);
-    const price = resolvePushPrice(v, pricelistPriority, vatMode, futureGuard, nowMs, priceFactor) || '0.00';
+    const price = resolvePushPrice(v, priceOpts, nowMs) || '0.00';
     const optionName = plan.isNoVariant ? 'Title' : variantOptionName;
     const optionValue = optionValueFor(plan, v);
     return {
@@ -1264,14 +1463,14 @@ function buildCreateVariantInput(plan, v, locationId, pricelistPriority, vatMode
  * images linked (design §3.5). Each variant's own image becomes its variant image; the parent
  * gallery + all variant images form the product files. price/barcode/sku/inventory set inline.
  */
-function buildProductSetInput(plan, exportConfig, locationId, pricelistPriority, vatMode, futureGuard, nowMs, wantTags = true, variantOptionName = 'Size', priceFactor = 1, titlePrefix = '') {
+function buildProductSetInput(plan, exportConfig, locationId, priceOpts, nowMs, wantTags = true, variantOptionName = 'Size', titlePrefix = '') {
     const product = plan.product;
     const parentImages = [...new Set(product.images || [])].filter(Boolean);
     const variantImageUrls = [];
 
     const variants = plan.toCreate.map((v) => {
         const sku = plan.skuOf(v);
-        const price = resolvePushPrice(v, pricelistPriority, vatMode, futureGuard, nowMs, priceFactor) || '0.00';
+        const price = resolvePushPrice(v, priceOpts, nowMs) || '0.00';
         const optionName = plan.isNoVariant ? 'Title' : variantOptionName;
         const optionValue = optionValueFor(plan, v);
         const vImg = (v.images && v.images[0]) || null;
@@ -1286,12 +1485,12 @@ function buildProductSetInput(plan, exportConfig, locationId, pricelistPriority,
         // A variant file must ALSO appear in the product files list (Shopify requirement).
         // alt = the source URL so we can reliably tell later which media is which (Shopify
         // rehosts images on its CDN, so the URL is otherwise unrecoverable).
-        if (vImg) vin.file = { originalSource: vImg, contentType: 'IMAGE', alt: vImg };
+        if (vImg) vin.file = { originalSource: toFetchableUrl(vImg), contentType: 'IMAGE', alt: vImg };
         return vin;
     });
 
     const allFiles = [...new Set([...parentImages, ...variantImageUrls])].filter(Boolean)
-        .map((url) => ({ originalSource: url, contentType: 'IMAGE', alt: url }));
+        .map((url) => ({ originalSource: toFetchableUrl(url), contentType: 'IMAGE', alt: url }));
 
     const input = {
         title: applyTitlePrefix(product.product_name || product.code || 'Untitled', titlePrefix),
@@ -1349,10 +1548,7 @@ function createdRowsFromNodes(plan, productId, nodes) {
 async function pushNewProducts({ connection, token, scopedProducts, unmatched, matchInfoBySku, exportConfig, locationId, counts, errors }) {
     const cfg = connection.config || {};
     const shop = connection.shopDomain;
-    const vatMode = cfg.priceVatMode || 'inclusive';
-    const futureGuard = cfg.futureDatedGuard !== false;
-    const pricelistPriority = cfg.pricelistPriority || [];
-    const priceFactor = normalizePriceFactor(cfg.priceFactor);
+    const priceOpts = resolvePriceOpts(cfg);
     const publicationIds = cfg.publicationIds || []; // sales channels to publish new products to
     const wantTags = cfg.syncTags !== false; // tags on newly-created products (own toggle)
     // Option1 name for created variants: per-source override → the export's own Variant Option
@@ -1383,8 +1579,11 @@ async function pushNewProducts({ connection, token, scopedProducts, unmatched, m
             const info = matchInfoBySku.get(skuOf(v));
             if (info?.shopifyProductId) { existingProductId = info.shopifyProductId; break; }
         }
-        // Disambiguate variants that would share an Option1 value (Shopify rejects duplicates).
-        const optionValueBySku = isNoVariant ? new Map() : resolveOptionValues(toCreate, skuOf);
+        // Option1 values (size → name label → SKU), disambiguated across the parent's FULL variant
+        // list so a variant added to an existing product matches its siblings' naming.
+        const optionValueBySku = isNoVariant
+            ? new Map()
+            : resolveOptionValues(toCreate, skuOf, variantList, product.product_name);
         plans.push({ product, isNoVariant, variantList, toCreate, existingProductId, skuOf, optionValueBySku });
     }
     if (!plans.length) return [];
@@ -1399,7 +1598,7 @@ async function pushNewProducts({ connection, token, scopedProducts, unmatched, m
 
             if (!plan.existingProductId) {
                 // New product → productSet (links each variant's own image to the variant).
-                const input = buildProductSetInput(plan, exportConfig, locationId, pricelistPriority, vatMode, futureGuard, nowMs, wantTags, variantOptionName, priceFactor, titlePrefix);
+                const input = buildProductSetInput(plan, exportConfig, locationId, priceOpts, nowMs, wantTags, variantOptionName, titlePrefix);
                 const data = await graphqlRequest(shop, token, PRODUCT_SET_MUTATION, { input, synchronous: true });
                 const ue = data?.productSet?.userErrors || [];
                 if (ue.length) throw new Error(ue.map((e) => e.message).join('; '));
@@ -1408,7 +1607,7 @@ async function pushNewProducts({ connection, token, scopedProducts, unmatched, m
             } else {
                 // Parent already exists → add only the missing variants (no whole-product reset).
                 const variantInputs = plan.toCreate.map((v) =>
-                    buildCreateVariantInput(plan, v, locationId, pricelistPriority, vatMode, futureGuard, nowMs, variantOptionName, priceFactor));
+                    buildCreateVariantInput(plan, v, locationId, priceOpts, nowMs, variantOptionName));
                 const vData = await graphqlRequest(shop, token, VARIANTS_BULK_CREATE_MUTATION, { productId: plan.existingProductId, variants: variantInputs, strategy: 'DEFAULT' });
                 const vue = vData?.productVariantsBulkCreate?.userErrors || [];
                 if (vue.length) throw new Error(vue.map((e) => e.message).join('; '));
@@ -1473,7 +1672,7 @@ function scopeLabel(sc) {
 /** Per-source push settings (design: each source is configured independently). */
 const SCOPE_CONFIG_KEYS = [
     'ownership', 'syncStock', 'syncNewProducts', 'syncPrices', 'syncDescriptions', 'syncImages',
-    'syncTags', 'priceVatMode', 'futureDatedGuard', 'pricelistPriority', 'priceFactor',
+    'syncTags', 'priceVatMode', 'futureDatedGuard', 'pricelistPriority', 'priceFactor', 'priceRounding',
     'publicationIds', 'variantOptionName', 'titlePrefix'
 ];
 
@@ -1689,6 +1888,11 @@ async function runScopeTarget({ connection, token, job, scopedProducts, items, l
             // when a name is explicitly configured (scope override or the export's setting).
             await pushOptionRenames({
                 connection, token, scopedProducts, matchInfoBySku, exportConfig, counts, errors
+            });
+            // …and so are the option VALUES: variants an older sync named after their SKU (no
+            // `size` in the catalogue) get the proper label from the variant name.
+            await pushOptionValueRepairs({
+                connection, token, scopedProducts, matchInfoBySku, counts, errors
             });
             // Sales channels are a managed field here too: keep existing products in sync with
             // the selected channels (publish/unpublish), not just newly-created ones.
@@ -2058,7 +2262,11 @@ module.exports = {
     resolveScopeConfig,
     buildScope,
     buildExternalScope,
+    resolvePriceOpts,
     resolvePushPrice,
     pushNewProducts,
-    pushImages
+    pushImages,
+    resolveOptionValues,
+    planOptionValueRepair,
+    toFetchableUrl
 };

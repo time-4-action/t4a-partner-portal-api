@@ -83,7 +83,7 @@ A product in the `products` collection is a **parent** that usually holds a `chi
 | `code` | **SKU** (primary match key) | variant **sku** |
 | `ean_code` | **Barcode** (fallback match key) | variant **barcode** |
 | `size` | Variant option value, e.g. `"77"` | **Option1 value** (name `"Size"`) |
-| `product_name` | Variant name | — / fallback option value |
+| `product_name` | Variant name | fallback **Option1 value** when `size` is empty — the part the name adds to the family ("Patrik Foil Front Wing 500 cm2" → `500 cm2`); the SKU is only the last resort |
 | `stock_amount` | Per-variant quantity | inventory level |
 | `images[]` | Variant-specific image(s) | variant image |
 | `pricelist[]` | Named price lists (see §3.3) | variant **price** (resolved) |
@@ -205,6 +205,11 @@ One per connected store.
     pricelistPriority: [ { name, enabled, priority } ], // resolve pricelist[] -> one price
     priceVatMode: "inclusive" | "exclusive", // how to treat pricelist vat (see §3.3)
     priceFactor: 1,                    // multiplier on every pushed price (currency / uplift), up to 6 dp
+    priceRounding: {                   // shelf-price rule applied AFTER the factor; off by default
+      enabled: false, mode: 'up',      // 'up' | 'down' | 'nearest'
+      step: 10, offset: 9,             // multiple of `step`, landing on `offset` -> "always end in 9"
+      alwaysAdvance: false             // a price already on the ending moves one step further
+    },
     syncStock: true,
     syncNewProducts: true,
     syncPrices: true,
@@ -287,7 +292,7 @@ Edge cases to handle explicitly:
 
 ### 8.2 Building the per-variant payload
 For each parent, after the always-on published-only narrowing (drop unpublished parents, keep only published `child_products`):
-- Resolve each variant's price via `getPriceFromPriority(variant, connection.config.pricelistPriority)`, applying `priceVatMode`, then the source's `priceFactor`. The factor keeps its full precision; the RESULT is rounded to 2 dp once.
+- Resolve each variant's price via `getPriceFromPriority(variant, connection.config.pricelistPriority)`, applying `priceVatMode`, then the source's `priceFactor`, then its `priceRounding` rule. The factor keeps its full precision; rounding is done in INTEGER CENTS (never `x / step` -- the post-factor amount can be 2039.0000000000002, which one float division turns into a spurious whole-step jump); the RESULT is turned into a 2 dp string once. Factor before rounding, never the reverse -- a factor is a unit conversion, so rounding first would destroy the ending.
 - Map fields per §3.1/§3.2. Reuse `customExport.service.js` mappers where possible — they already know how to turn this shape into Shopify fields.
 
 ### 8.3 What gets pushed
