@@ -3,6 +3,10 @@ const { ObjectId } = require('mongodb');
 const { encryptToken } = require('./crypto.service');
 const { normalizePriceFactor } = require('./priceFactor.util');
 const { normalizePriceRounding, DEFAULT_PRICE_ROUNDING } = require('./priceRounding.util');
+const {
+    normalizeCompareAtPricelist, normalizePriceFields, normalizeExistingSalePolicy,
+    DEFAULT_PRICE_FIELDS, DEFAULT_EXISTING_SALE_POLICY
+} = require('./comparePrice.util');
 
 /**
  * Data-access layer for the `shopify_connections` collection — one document per
@@ -55,6 +59,14 @@ const DEFAULT_CONFIG = {
     // Shelf-price rounding applied AFTER the factor (e.g. "always end in 9"). Off by default.
     priceRounding: { ...DEFAULT_PRICE_ROUNDING },
     futureDatedGuard: true,
+    // Pricelist whose price is pushed as Shopify `compareAtPrice` (the struck-through "was"
+    // price). null = off: `compareAtPrice` is never sent and the payload is exactly the old one.
+    compareAtPricelist: null,
+    // With a compare-at list: which of `price` / `compareAtPrice` the portal maintains.
+    priceFields: DEFAULT_PRICE_FIELDS, // 'price_and_compare_at' | 'price_only' | 'compare_at_only'
+    // What to do with a variant the merchant has put on sale in Shopify themselves (live
+    // compare-at the portal did not set). 'overwrite' = today's behaviour, portal wins.
+    existingSalePolicy: DEFAULT_EXISTING_SALE_POLICY, // 'overwrite' | 'leave' | 'price_only' | 'compare_at_only'
     syncStock: true,
     syncNewProducts: false,
     syncPrices: false,
@@ -533,6 +545,8 @@ async function updateConnectionConfig(id, patch) {
 
     const allowed = [
         'exportConfigId', 'pricelistPriority', 'priceVatMode', 'priceFactor', 'priceRounding', 'futureDatedGuard',
+        // Compare-at price source + which price fields the portal owns + merchant-sale policy.
+        'compareAtPricelist', 'priceFields', 'existingSalePolicy',
         // `syncTags` is its own toggle (tags used to ride along with `syncDescriptions`); it must
         // be writable at the connection level too, or a source that doesn't set its own falls back
         // to the default-ON instead of what the partner chose.
@@ -565,6 +579,11 @@ async function updateConnectionConfig(id, patch) {
         // Same for the title prefix: stored trimmed + length-capped at both levels, so the pushed
         // title is exactly what the partner was shown and can't carry invisible whitespace.
         if ('config.titlePrefix' in set) set['config.titlePrefix'] = normalizeTitlePrefix(set['config.titlePrefix']);
+        // Compare-at settings: stored as the exact enum / trimmed name the engine will read, so a
+        // junk value can't sit in the document and be interpreted differently by each reader.
+        if ('config.compareAtPricelist' in set) set['config.compareAtPricelist'] = normalizeCompareAtPricelist(set['config.compareAtPricelist']);
+        if ('config.priceFields' in set) set['config.priceFields'] = normalizePriceFields(set['config.priceFields']);
+        if ('config.existingSalePolicy' in set) set['config.existingSalePolicy'] = normalizeExistingSalePolicy(set['config.existingSalePolicy']);
         if (Array.isArray(set['config.scopes'])) {
             set['config.scopes'] = set['config.scopes'].map((s) => {
                 if (!s) return s;
@@ -572,6 +591,9 @@ async function updateConnectionConfig(id, patch) {
                 if ('priceFactor' in s) out.priceFactor = normalizePriceFactor(s.priceFactor);
                 if ('priceRounding' in s) out.priceRounding = normalizePriceRounding(s.priceRounding);
                 if ('titlePrefix' in s) out.titlePrefix = normalizeTitlePrefix(s.titlePrefix);
+                if ('compareAtPricelist' in s) out.compareAtPricelist = normalizeCompareAtPricelist(s.compareAtPricelist);
+                if ('priceFields' in s) out.priceFields = normalizePriceFields(s.priceFields);
+                if ('existingSalePolicy' in s) out.existingSalePolicy = normalizeExistingSalePolicy(s.existingSalePolicy);
                 return out;
             });
         }

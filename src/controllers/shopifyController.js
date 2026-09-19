@@ -64,6 +64,8 @@ function toActivityRow(job) {
     if (job.error) bits.push(job.error);
     if (c.createdProducts) bits.push(`${c.createdProducts} created`);
     if (c.pricesPushed) bits.push(`${c.pricesPushed} prices`);
+    if (c.compareAtPushed) bits.push(`${c.compareAtPushed} compare-at`);
+    if (c.salesLeft) bits.push(`${c.salesLeft} sales left alone`);
     if (c.contentPushed) bits.push(`${c.contentPushed} content`);
     if (c.imagesPushed) bits.push(`${c.imagesPushed} images`);
     if (c.variantImagesLinked) bits.push(`${c.variantImagesLinked} variant images`);

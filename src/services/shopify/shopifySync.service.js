@@ -13,6 +13,10 @@ const ownSource = require('../external/ownSource.service');
 const { ensureFeedCategorized } = require('../ai/categoryIdentification.service');
 const { normalizePriceFactor, toMoneyString } = require('./priceFactor.util');
 const { normalizePriceRounding, applyPriceRounding } = require('./priceRounding.util');
+const {
+    normalizeCompareAtPricelist, normalizePriceFields, normalizeExistingSalePolicy,
+    wantedFields, applySalePolicy, priceHashInput
+} = require('./comparePrice.util');
 
 /**
  * Stock-only sync engine — Phase A (design §8, plan Phase A).
@@ -120,10 +124,11 @@ const PRODUCT_CONTENT_QUERY = `query ProductContent($ids: [ID!]!) {
   nodes(ids: $ids) { ... on Product { id title descriptionHtml tags } }
 }`;
 
-// Authoritative price drift check — current Shopify variant prices, to catch a merchant editing a
-// price in-store. Batched via `nodes`.
+// Authoritative price drift check — current Shopify variant price + compare-at, to catch a
+// merchant editing a price in-store (and to see a merchant-made sale, for the existing-sale
+// policy). Batched via `nodes`.
 const VARIANT_PRICE_QUERY = `query VariantPrices($ids: [ID!]!) {
-  nodes(ids: $ids) { ... on ProductVariant { id price } }
+  nodes(ids: $ids) { ... on ProductVariant { id price compareAtPrice } }
 }`;
 
 // Authoritative publication drift check — which channels each product is CURRENTLY published on,
@@ -354,7 +359,11 @@ function resolvePriceOpts(cfg) {
         vatMode: cfg.priceVatMode || 'inclusive',
         futureGuard: cfg.futureDatedGuard !== false,
         factor: normalizePriceFactor(cfg.priceFactor),
-        rounding: normalizePriceRounding(cfg.priceRounding)
+        rounding: normalizePriceRounding(cfg.priceRounding),
+        // Compare-at ("was") price source + which fields the portal owns + merchant-sale policy.
+        compareAtPricelist: normalizeCompareAtPricelist(cfg.compareAtPricelist),
+        priceFields: normalizePriceFields(cfg.priceFields),
+        existingSalePolicy: normalizeExistingSalePolicy(cfg.existingSalePolicy)
     };
 }
 
@@ -394,6 +403,49 @@ function resolvePushPrice(variant, priceOpts, nowMs) {
     const price = vatMode === 'inclusive' ? r.price * (1 + (r.vat || 0) / 100) : r.price;
     return toMoneyString(applyPriceRounding(price * factor, rounding));
 }
+
+/**
+ * Resolves the compare-at ("was") price for a variant from the ONE pricelist the source named
+ * (`compareAtPricelist`), through the same pipeline as the sell price — future-dated guard,
+ * VAT mode, factor, rounding — so the two numbers are always in the same units.
+ *
+ * Looks the list up by name directly rather than via {@link getPriceFromPriority}: that helper
+ * falls back to `pricelist[0]` when nothing matches, which here would silently strike through
+ * the wrong list's price.
+ *
+ * Returns the RAW amount. Whether it is worth sending (it must be HIGHER than the price the
+ * store will sell at, or Shopify shows no sale) is the caller's call — the floor is the pushed
+ * price on most paths but the LIVE price when the source doesn't manage `price` at all.
+ *
+ * @returns {string|null} 2-dp string, or null when the list is absent/unstarted/empty
+ */
+function resolvePushCompareAt(variant, priceOpts, nowMs) {
+    const { compareAtPricelist, vatMode, futureGuard, factor, rounding } = priceOpts;
+    if (!compareAtPricelist || !Array.isArray(variant.pricelist)) return null;
+    const pl = variant.pricelist.find((p) => p && p.name === compareAtPricelist);
+    if (!pl || !pl.price) return null;
+    if (futureGuard && pl.valid_from && new Date(pl.valid_from).getTime() > nowMs) return null;
+    const gross = vatMode === 'inclusive' ? pl.price * (1 + (pl.vat || 0) / 100) : pl.price;
+    return toMoneyString(applyPriceRounding(gross * factor, rounding));
+}
+
+/** A compare-at only counts when it is strictly above the sell price; otherwise it is cleared. */
+function compareAtAbove(compareAt, floor) {
+    return compareAt != null && floor != null && Number(compareAt) > Number(floor) ? compareAt : null;
+}
+
+/** Both prices a to-be-created variant is born with. `compareAtPrice` null = don't send. */
+function resolveCreatePrices(v, priceOpts, nowMs) {
+    const price = resolvePushPrice(v, priceOpts, nowMs);
+    const { wantC } = wantedFields(priceOpts);
+    // A created variant is a fresh listing, so it gets the compare-at even under
+    // `compare_at_only` — but never without a real price to sit next to (no floor → no sale).
+    const compareAtPrice = wantC && price != null ? compareAtAbove(resolvePushCompareAt(v, priceOpts, nowMs), price) : null;
+    return { price: price || '0.00', compareAtPrice };
+}
+
+const money = (v) => Number(v).toFixed(2);
+const moneyOrNull = (v) => (v == null ? null : money(v));
 
 /**
  * Pushes one batch of inventory quantities. Returns a per-SKU outcome map so the caller can
@@ -478,7 +530,8 @@ async function fetchLiveContent(shop, token, productIds) {
     return out;
 }
 
-// Batched fetch of current variant prices (variantId → price string), for price drift detection.
+// Batched fetch of current variant prices (variantId → { price, compareAtPrice|null }), for price
+// drift detection and merchant-sale detection.
 async function fetchLivePrices(shop, token, variantIds) {
     const out = new Map();
     const ids = [...new Set(variantIds.filter(Boolean))];
@@ -486,7 +539,7 @@ async function fetchLivePrices(shop, token, variantIds) {
     for (let i = 0; i < ids.length; i += CHUNK) {
         const data = await graphqlRequest(shop, token, VARIANT_PRICE_QUERY, { ids: ids.slice(i, i + CHUNK) });
         for (const n of data?.nodes || []) {
-            if (n && n.id) out.set(n.id, n.price);
+            if (n && n.id) out.set(n.id, { price: n.price, compareAtPrice: n.compareAtPrice ?? null });
         }
     }
     return out;
@@ -556,9 +609,11 @@ async function pushPortalAuthoritative({ connection, token, scopedProducts, matc
         }
     };
 
-    const priceOps = []; // { parentCode, productId, variants:[{id,price}], hashes:[{sku,priceHash}] }
+    const priceOps = []; // { parentCode, productId, variants:[{id,price?,compareAtPrice?}], hashes:[{sku,priceHash,lastCompareAt?}] }
     const contentOps = []; // { parentCode, product:{id,title,descriptionHtml,tags}, skus:[], contentHash }
     const priceCandidates = []; // every price-managed variant; filtered to priceOps by live drift
+    const cfgWant = wantedFields(priceOpts); // which of price / compareAtPrice this source owns
+    const salePolicy = priceOpts.existingSalePolicy;
     const contentCandidates = []; // every content-managed product; filtered to contentOps by live drift
 
     for (const product of scopedProducts) {
@@ -574,11 +629,14 @@ async function pushPortalAuthoritative({ connection, token, scopedProducts, matc
         const productId = matched[0].info.shopifyProductId;
         if (!productId) continue;
 
-        if (wantPrices) {
+        if (wantPrices && (cfgWant.wantP || cfgWant.wantC)) {
             for (const { v, sku, info } of matched) {
                 const price = resolvePushPrice(v, priceOpts, nowMs);
                 if (price == null) continue; // nothing resolvable — leave the variant's price alone
-                priceCandidates.push({ parentCode: product.code, productId, variantId: info.shopifyVariantId, sku, price, priceHash: sha1(price) });
+                // Raw compare-at; the "not above the sell price → clear" floor is applied per
+                // variant below, because the floor is the LIVE price when `price` isn't pushed.
+                const compareAtRaw = cfgWant.wantC ? resolvePushCompareAt(v, priceOpts, nowMs) : null;
+                priceCandidates.push({ parentCode: product.code, productId, variantId: info.shopifyVariantId, sku, price, compareAtRaw });
             }
         }
 
@@ -608,28 +666,60 @@ async function pushPortalAuthoritative({ connection, token, scopedProducts, matc
     // Prices, like content, are drift-corrected against the LIVE store so a merchant editing a
     // variant price in Shopify is overwritten. Drifted variants are re-grouped into per-product ops
     // (the bulk price mutation is keyed by product). Live-fetch failure falls back to the old
-    // per-variant source-hash gate.
+    // per-variant source-hash gate — but ONLY under the `overwrite` policy: every other policy
+    // exists to protect a merchant-made sale, which is only visible in the live data, so guessing
+    // there would overwrite exactly what the partner asked to keep. Those skip the run instead.
     if (priceCandidates.length) {
         let livePriceById = null;
         try {
             livePriceById = await fetchLivePrices(shop, token, priceCandidates.map((c) => c.variantId));
         } catch (e) {
-            console.error(`[shopify] price drift fetch failed, falling back to source-hash gate (${shop}):`, e.message);
+            console.error(`[shopify] price drift fetch failed (${shop}):`, e.message);
+            if (salePolicy !== 'overwrite') {
+                errors.push({ parentCode: '*', error: `price: live price fetch failed — prices skipped this run (sale policy "${salePolicy}" needs the live store)` });
+                priceCandidates.length = 0;
+            }
         }
         const byProduct = new Map();
         for (const c of priceCandidates) {
+            const row = existingMap.get(c.sku);
+            let wantP = cfgWant.wantP;
+            let wantC = cfgWant.wantC;
+            let compareAt = wantC ? compareAtAbove(c.compareAtRaw, c.price) : undefined;
             let drifted;
             if (livePriceById) {
-                if (!livePriceById.has(c.variantId)) continue; // variant gone — stale path handles it
-                drifted = Number(livePriceById.get(c.variantId)).toFixed(2) !== Number(c.price).toFixed(2);
+                const live = livePriceById.get(c.variantId);
+                if (!live) continue; // variant gone — stale path handles it
+                // A merchant-made sale = a live compare-at that ISN'T the one the portal last
+                // pushed (or, for rows from before compare-at tracking, isn't what it would push
+                // now). The portal's own compare-at must never count as "the merchant's sale",
+                // or `leave` would freeze every variant after its first push.
+                const ours = row?.lastCompareAt !== undefined ? row.lastCompareAt : compareAt;
+                const hasSale = live.compareAtPrice != null && moneyOrNull(live.compareAtPrice) !== moneyOrNull(ours);
+                const decided = applySalePolicy({ wantP, wantC }, salePolicy, hasSale);
+                if (decided.skipped) { counts.salesLeft += 1; continue; }
+                ({ wantP, wantC } = decided);
+                // Not pushing `price` → the store keeps selling at the LIVE price, so that is the
+                // floor the compare-at has to clear.
+                compareAt = wantC ? compareAtAbove(c.compareAtRaw, wantP ? c.price : live.price) : undefined;
+                const pDrift = wantP && money(live.price) !== money(c.price);
+                const cDrift = wantC && moneyOrNull(live.compareAtPrice) !== moneyOrNull(compareAt);
+                drifted = pDrift || cDrift;
             } else {
-                drifted = existingMap.get(c.sku)?.priceHash !== c.priceHash;
+                drifted = row?.priceHash !== sha1(priceHashInput({ price: wantP ? c.price : undefined, compareAt }));
             }
             if (!drifted) continue;
             let g = byProduct.get(c.productId);
             if (!g) { g = { parentCode: c.parentCode, productId: c.productId, variants: [], hashes: [] }; byProduct.set(c.productId, g); }
-            g.variants.push({ id: c.variantId, price: c.price });
-            g.hashes.push({ sku: c.sku, priceHash: c.priceHash });
+            const input = { id: c.variantId };
+            if (wantP) input.price = c.price;
+            if (wantC) input.compareAtPrice = compareAt; // null CLEARS a stale compare-at — the portal owns the field
+            g.variants.push(input);
+            g.hashes.push({
+                sku: c.sku,
+                priceHash: sha1(priceHashInput({ price: wantP ? c.price : undefined, compareAt })),
+                lastCompareAt: wantC ? compareAt : undefined
+            });
         }
         for (const g of byProduct.values()) priceOps.push(g);
     }
@@ -671,7 +761,8 @@ async function pushPortalAuthoritative({ connection, token, scopedProducts, matc
                 errors.push({ parentCode: op.parentCode, error: `price: ${msg}` });
             } else {
                 counts.pricesPushed += op.variants.length;
-                for (const h of op.hashes) hashUpdates.push({ sku: h.sku, priceHash: h.priceHash });
+                counts.compareAtPushed += op.variants.filter((v) => 'compareAtPrice' in v).length;
+                for (const h of op.hashes) hashUpdates.push({ sku: h.sku, priceHash: h.priceHash, lastCompareAt: h.lastCompareAt });
             }
         } catch (e) {
             if (isStaleError(e.message)) markStale(op.parentCode, op.hashes.map((h) => h.sku));
@@ -705,6 +796,7 @@ async function pushPortalAuthoritative({ connection, token, scopedProducts, matc
         for (const h of hashUpdates) {
             const cur = bySku.get(h.sku) || { sku: h.sku };
             if (h.priceHash !== undefined) cur.priceHash = h.priceHash;
+            if (h.lastCompareAt !== undefined) cur.lastCompareAt = h.lastCompareAt;
             if (h.contentHash !== undefined) cur.contentHash = h.contentHash;
             bySku.set(h.sku, cur);
         }
@@ -1446,16 +1538,18 @@ const optionValueFor = (plan, v) =>
  */
 function buildCreateVariantInput(plan, v, locationId, priceOpts, nowMs, variantOptionName = 'Size') {
     const sku = plan.skuOf(v);
-    const price = resolvePushPrice(v, priceOpts, nowMs) || '0.00';
+    const { price, compareAtPrice } = resolveCreatePrices(v, priceOpts, nowMs);
     const optionName = plan.isNoVariant ? 'Title' : variantOptionName;
     const optionValue = optionValueFor(plan, v);
-    return {
+    const vin = {
         optionValues: [{ name: optionValue, optionName }],
         price,
         barcode: v.ean_code || null,
         inventoryItem: { sku, tracked: true },
         inventoryQuantities: [{ locationId, availableQuantity: v.stock_amount || 0 }]
     };
+    if (compareAtPrice) vin.compareAtPrice = compareAtPrice;
+    return vin;
 }
 
 /**
@@ -1470,7 +1564,7 @@ function buildProductSetInput(plan, exportConfig, locationId, priceOpts, nowMs, 
 
     const variants = plan.toCreate.map((v) => {
         const sku = plan.skuOf(v);
-        const price = resolvePushPrice(v, priceOpts, nowMs) || '0.00';
+        const { price, compareAtPrice } = resolveCreatePrices(v, priceOpts, nowMs);
         const optionName = plan.isNoVariant ? 'Title' : variantOptionName;
         const optionValue = optionValueFor(plan, v);
         const vImg = (v.images && v.images[0]) || null;
@@ -1482,6 +1576,7 @@ function buildProductSetInput(plan, exportConfig, locationId, priceOpts, nowMs, 
             inventoryItem: { sku, tracked: true },
             inventoryQuantities: [{ locationId, name: 'available', quantity: v.stock_amount || 0 }]
         };
+        if (compareAtPrice) vin.compareAtPrice = compareAtPrice;
         // A variant file must ALSO appear in the product files list (Shopify requirement).
         // alt = the source URL so we can reliably tell later which media is which (Shopify
         // rehosts images on its CDN, so the URL is otherwise unrecoverable).
@@ -1513,8 +1608,9 @@ function buildProductSetInput(plan, exportConfig, locationId, priceOpts, nowMs, 
 }
 
 /** Maps the variants returned by a bulk-create back to `shopify_product_map` rows (by SKU). */
-function createdRowsFromNodes(plan, productId, nodes) {
+function createdRowsFromNodes(plan, productId, nodes, priceOpts, nowMs) {
     const bySku = new Map((nodes || []).map((n) => [n.sku, n]));
+    const trackCompareAt = !!priceOpts && wantedFields(priceOpts).wantC;
     return plan.toCreate
         .map((v) => {
             const sku = plan.skuOf(v);
@@ -1527,7 +1623,10 @@ function createdRowsFromNodes(plan, productId, nodes) {
                 barcode: v.ean_code || null,
                 shopifyProductId: productId,
                 shopifyVariantId: node.id,
-                shopifyInventoryItemId: node.inventoryItem?.id || null
+                shopifyInventoryItemId: node.inventoryItem?.id || null,
+                // What the variant was born with, so a later run can tell the portal's own
+                // compare-at from a sale the merchant added (see the existing-sale policy).
+                lastCompareAt: trackCompareAt ? resolveCreatePrices(v, priceOpts, nowMs).compareAtPrice : undefined
             };
         })
         .filter(Boolean);
@@ -1615,7 +1714,7 @@ async function pushNewProducts({ connection, token, scopedProducts, unmatched, m
                 variantNodes = vData.productVariantsBulkCreate.productVariants;
             }
 
-            const rows = createdRowsFromNodes(plan, productId, variantNodes);
+            const rows = createdRowsFromNodes(plan, productId, variantNodes, priceOpts, nowMs);
             for (const r of rows) { created.push(r); createdSkus.add(r.sku); }
             if (rows.length) {
                 counts.createdVariants += rows.length;
@@ -1673,6 +1772,7 @@ function scopeLabel(sc) {
 const SCOPE_CONFIG_KEYS = [
     'ownership', 'syncStock', 'syncNewProducts', 'syncPrices', 'syncDescriptions', 'syncImages',
     'syncTags', 'priceVatMode', 'futureDatedGuard', 'pricelistPriority', 'priceFactor', 'priceRounding',
+    'compareAtPricelist', 'priceFields', 'existingSalePolicy',
     'publicationIds', 'variantOptionName', 'titlePrefix'
 ];
 
@@ -1791,6 +1891,9 @@ async function runScopeTarget({ connection, token, job, scopedProducts, items, l
                 // Inventory (at this location), price + content were all set at creation → mark
                 // synced and record the stock location so future runs use the fast batched set.
                 await productMap.bulkSetState(connection._id, createdRows.map((r) => ({ sku: r.sku, state: 'synced', error: null, stockLocationId: locationId })));
+                // Remember the compare-at each variant was created with (merchant-sale detection).
+                const withCompareAt = createdRows.filter((r) => r.lastCompareAt !== undefined);
+                if (withCompareAt.length) await productMap.bulkSetHashes(connection._id, withCompareAt.map((r) => ({ sku: r.sku, lastCompareAt: r.lastCompareAt })));
                 // Make created products visible to the image step so they get their gallery this
                 // run too (create doesn't push media).
                 for (const r of createdRows) {
@@ -2264,7 +2367,10 @@ module.exports = {
     buildExternalScope,
     resolvePriceOpts,
     resolvePushPrice,
+    resolvePushCompareAt,
+    resolveCreatePrices,
     pushNewProducts,
+    pushPortalAuthoritative,
     pushImages,
     resolveOptionValues,
     planOptionValueRepair,

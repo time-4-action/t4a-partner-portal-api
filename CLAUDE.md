@@ -112,20 +112,14 @@ A product is a **parent** with an optional `child_products` array of **variants*
 
 - **Parent:** `code`, `token` (handle), `product_name`, `short_description`/`detailed_description` (HTML), `images[]`, `categories[]` (PNV path), `ai_categories[]`, `published`, `active`, `archived`, `stock_amount` (often `0` — variants carry stock), `pricelist[]` (often empty — variants carry pricing), `ean_code`, `size`.
 - **Variant (`child_products[]`):** `code` (**SKU**), `ean_code` (**barcode**), `token`, `product_name`, `size` (variant option, e.g. `"77"`), `stock_amount`, `images[]`, per-variant flags (`published`, `archived`, `cart`, `new`, `recomended`), and `pricelist[]`.
-- **`pricelist[]`:** array of `{ name, valid_from, price, vat }` — e.g. `RRP 2025` (`vat: 22`) and a future-dated `RRP 2026` (`vat: 0`). No single price field; resolve via `getPriceFromPriority(variant, pricelistPriority)` in `customExport.service.js`. VAT and `valid_from` vary per list.
+- **`pricelist[]`:** array of `{ name, valid_from, price, vat }` — e.g. `RRP 2025` (`vat: 22`) and a future-dated `RRP 2026` (`vat: 0`). No single price field; resolve via `getPriceFromPriority(variant, pricelistPriority)` in `customExport.service.js`. VAT and `valid_from` vary per list. The Shopify push resolves the sell price that way and, optionally, a compare-at ("was") price from ONE named list (`compareAtPricelist` → `resolvePushCompareAt` in `shopifySync.service.js`); see `../shopify_integration_progress.md` §9 for the fields/sale-policy semantics.
 - **`ai_categories[]`:** `{ exportId, categoryId, categoryName }` — categorization is per export, keyed by `exportId`.
 - **Publishing:** parents and variants each have a `published` flag; a published parent may contain unpublished variants. Exports are **always published-only** — `applyFilters` drops unpublished parents and narrows `child_products` to published variants.
 - **No-variant products:** if `child_products` is empty, the parent is the sellable item (use its own `code`/`pricelist`/`stock_amount`).
 
-### Planned: Shopify integration (not yet started on the backend)
+### Shopify integration (built — see `../shopify_integration_progress.md`)
 
-A full design for letting partners connect their own Shopify store and receive an automated one-way product push lives in `shopify_integration.md` at this repo's root. **No backend code exists for it yet** — the partner-facing UI has been built in the `t4a-partner-portal-ui` repo against mock data, but none of the API pieces below are implemented:
-
-- New endpoints under `/api/export/shopify/*` — OAuth `connect`/`callback`, `status`, per-connection `config`, `sync`, `disconnect`, and HMAC-verified Shopify webhooks (design §10).
-- New Mongo collections `shopify_connections`, `shopify_product_map`, `shopify_sync_jobs` (design §6).
-- A rate-limited per-shop sync engine that turns the parent/`child_products` shape into Shopify Admin API calls, reusing `getPriceFromPriority` for price resolution and the existing published-only narrowing (design §8).
-
-When picking this up, start from `shopify_integration.md` — its §0 status checklist tracks what's done, and §11 lists open questions (pricing/VAT handling, ownership default, secrets location) to settle before coding.
+Partners connect their own Shopify store and receive an automated one-way product push. Everything under `src/services/shopify/` + `src/controllers/shopifyController.js` is live: OAuth connect/callback, per-connection config (per-source `scopes[]`), the rate-limited per-shop sync engine (`shopifySync.service.js` — match → create → stock → price/content → images/publish), and the `shopify_connections` / `shopify_product_map` / `shopify_sync_jobs` collections. The design is `shopify_integration.md` (repo root); **the accurate status doc is `../shopify_integration_progress.md`** — its numbered sections (price factor §6, multi-location §7, rounding §8, compare-at + sale policy §9) record the decisions behind each pricing setting. Start there before touching pricing or ownership behaviour.
 
 ## Environment variables
 

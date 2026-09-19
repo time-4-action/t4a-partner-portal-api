@@ -103,7 +103,7 @@ async function bulkSetState(connectionId, updates) {
  * push (Phase C). Kept separate from {@link bulkSetState} so a price/content update doesn't
  * disturb the row's stock sync state.
  * @param {ObjectId|string} connectionId
- * @param {Array<{sku:string, priceHash?:string, contentHash?:string, imageHash?:string, allLocationsKey?:string}>} updates
+ * @param {Array<{sku:string, priceHash?:string, lastCompareAt?:string|null, contentHash?:string, imageHash?:string, allLocationsKey?:string}>} updates
  */
 async function bulkSetHashes(connectionId, updates) {
     if (!updates.length) return;
@@ -112,6 +112,9 @@ async function bulkSetHashes(connectionId, updates) {
     const ops = updates.map((u) => {
         const set = { updatedAt: now };
         if (u.priceHash !== undefined) set.priceHash = u.priceHash;
+        // The compare-at the portal last pushed (null = it cleared it). Lets the next run tell its
+        // own compare-at from a sale the merchant added in-store (existing-sale policy).
+        if (u.lastCompareAt !== undefined) set.lastCompareAt = u.lastCompareAt;
         if (u.contentHash !== undefined) set.contentHash = u.contentHash;
         if (u.imageHash !== undefined) set.imageHash = u.imageHash;
         if (u.imageMedia !== undefined) set.imageMedia = u.imageMedia; // [{url, mediaId}] — tracks our pushed images
