@@ -44,6 +44,8 @@ Internal admin surface (bearer-gated by `internalAdminToken` / `PARTNER_ADMIN_TO
 | `/api/admin/partners` | `src/routes/adminPartnersRoutes.js` — per-partner insight |
 | `/api/admin/system` | `src/routes/adminSystemRoutes.js` — scheduler status + manual triggers (`GET /sync`, `POST /sync/pnv/run` full pipeline, `POST /sync/own-sources/:feedId/run`). Backed by `pnvScheduler.getStatus()` / `runManualRefresh()`. |
 
+The **Sources API** (`/api/v1`, `src/routes/sourcesApiRoutes.js`, design `docs/sources-api.md`) is a versioned machine contract for another product (Recharge Hub) to configure and run ONE connected store's Shopify sources. Bearer-gated by a per-connection API key (`sourcesApiAuth.js`) bound to the store's domain; not JWT. It is a translation over `shopify_connections.config.scopes[]` and `shopify_sync_jobs` (`sourcesApi.service.js`) — scopes carry a stable `id`/`name`/`enabled` for it, and a run can target specific scope ids. Smoke test: `scripts/sources-api-smoke.js`.
+
 ### Authentication
 
 Two middleware options are available:
@@ -51,6 +53,7 @@ Two middleware options are available:
 - **`src/middleware/auth0.js`** — Auth0 JWT bearer (`express-oauth2-jwt-bearer`). Currently commented out in `src/routes/export/index.js`.
 - **`src/middleware/dualAuth.js`** — Tries JWT first (`Authorization: Bearer`), falls back to API key (`X-Api-Key` header or `api_key` body field). Sets `req.authContext` on success.
 - **`src/middleware/webhookApiKey.js`** — Simple static key check for webhook endpoints (`x-api-key` header vs `WEBHOOK_API_KEY` env var).
+- **`src/middleware/sourcesApiAuth.js`** — Bearer key for `/api/v1` (`Authorization: Bearer sk_t4a_…` + `X-Shop-Domain`), resolved against `shopify_connections.apiKeys[]` by `connectionApiKey.service.js`. 401 unknown key, 403 wrong shop, 409 store not active.
 
 ### PNV sync pipeline
 

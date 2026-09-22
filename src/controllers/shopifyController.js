@@ -6,6 +6,7 @@ const shopifyGraphql = require('../services/shopify/shopifyGraphql.service');
 const syncService = require('../services/shopify/shopifySync.service');
 const syncJobs = require('../services/shopify/shopifySyncJobs.service');
 const productMap = require('../services/shopify/shopifyProductMap.service');
+const connectionApiKeys = require('../services/shopify/connectionApiKey.service');
 const { getDistinctPricelists } = require('../services/customExport.service');
 const { verifyOAuthHmac, verifyWebhookHmac, verifyWebhookHmacWithSecret, decryptToken, hashClaimToken } = require('../services/shopify/crypto.service');
 const { recordActivity } = require('../services/activity.service');
@@ -713,6 +714,57 @@ exports.disconnect = async (req, res) => {
         await productMap.deleteForConnection(connection._id);
         await syncJobs.deleteForConnection(connection._id);
         res.json({ success: true, message: 'Disconnected' });
+    } catch (error) {
+        handleError(res, error);
+    }
+};
+
+/**
+ * GET /shopify/connection/:id/keys — the store's Sources API keys, without hashes. Owner-checked.
+ */
+exports.listApiKeys = async (req, res) => {
+    try {
+        const connection = await loadOwned(req);
+        res.json({ success: true, keys: await connectionApiKeys.listConnectionApiKeys(connection._id) });
+    } catch (error) {
+        handleError(res, error);
+    }
+};
+
+/**
+ * POST /shopify/connection/:id/keys — mint a Sources API key for the store. Body `{ name? }`.
+ * The raw key is in this response and nowhere else, ever: only its hash is stored.
+ */
+exports.createApiKey = async (req, res) => {
+    try {
+        const connection = await loadOwned(req);
+        const { sub } = authUser(req);
+        const { rawKey, keyRecord } = await connectionApiKeys.createConnectionApiKey(connection._id, req.body?.name, sub);
+        recordActivity('shopify_api_key_created', {
+            ownerSub: connection.ownerSub, email: connection.ownerEmail,
+            resourceType: 'shopify_connection', resourceId: connection._id,
+            metadata: { shopDomain: connection.shopDomain, keyId: keyRecord.keyId, name: keyRecord.name }
+        });
+        res.status(201).json({ success: true, warning: 'Save this key — it will not be shown again.', key: { ...keyRecord, rawKey } });
+    } catch (error) {
+        handleError(res, error);
+    }
+};
+
+/**
+ * DELETE /shopify/connection/:id/keys/:keyId — revoke a Sources API key. The other product is
+ * refused from its next call on; the record stays so the trail of what the key did survives.
+ */
+exports.revokeApiKey = async (req, res) => {
+    try {
+        const connection = await loadOwned(req);
+        await connectionApiKeys.revokeConnectionApiKey(connection._id, req.params.keyId);
+        recordActivity('shopify_api_key_revoked', {
+            ownerSub: connection.ownerSub, email: connection.ownerEmail,
+            resourceType: 'shopify_connection', resourceId: connection._id,
+            metadata: { shopDomain: connection.shopDomain, keyId: req.params.keyId }
+        });
+        res.json({ success: true });
     } catch (error) {
         handleError(res, error);
     }

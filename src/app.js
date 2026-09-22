@@ -34,4 +34,11 @@ app.use('/api/admin/partners', internalAdminToken, adminPartnersRoutes);
 // Scheduler status + manual triggers for the t4a-admin "Catalogue Sync" page. Same bearer gate.
 app.use('/api/admin/system', internalAdminToken, adminSystemRoutes);
 
+// The Sources API (docs/sources-api.md): a versioned machine contract for another product
+// (Recharge Hub) to configure and run ONE connected store's sources, gated by a per-connection
+// API key a partner generates on the Shopify integration page. Versioned in the path so it can
+// move on without breaking a client.
+const sourcesApiRoutes = require('./routes/sourcesApiRoutes');
+app.use('/api/v1', sourcesApiRoutes);
+
 module.exports = { app };

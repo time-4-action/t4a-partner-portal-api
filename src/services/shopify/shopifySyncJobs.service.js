@@ -30,13 +30,16 @@ const EMPTY_COUNTS = { inScope: 0, matched: 0, pushed: 0, unmatched: 0, failed: 
  * @param {{ type?: string, trigger?: string }} [opts]
  * @returns {Promise<Object>} the inserted job document
  */
-async function startRun(connectionId, shopDomain, { type = 'inventory', trigger = 'manual' } = {}) {
+async function startRun(connectionId, shopDomain, { type = 'inventory', trigger = 'manual', scopeIds = null } = {}) {
     const now = new Date();
     const doc = {
         connectionId: toObjectId(connectionId),
         shopDomain,
         type,
         trigger,
+        // The scope ids this run was asked to cover (null = every enabled scope). Recorded at start,
+        // so a run that is still going can be attributed to a source before `scopes[]` is written.
+        scopeIds: Array.isArray(scopeIds) ? scopeIds : null,
         status: 'running',
         attempts: 1,
         counts: { ...EMPTY_COUNTS },
@@ -95,6 +98,36 @@ async function listRecentRuns(connectionId, limit = 20) {
 }
 
 /**
+ * The most recent runs that covered one scope, newest first: a run asked for that scope
+ * (`scopeIds`), a run whose per-scope summary names it, or a legacy whole-connection run that
+ * predates scope ids (`scopeIds` null and no summary ids — it ran every scope there was).
+ * @param {ObjectId|string} connectionId
+ * @param {string} scopeId
+ * @param {number} [limit]
+ */
+async function listRunsForScope(connectionId, scopeId, limit = 20) {
+    return getDb()
+        .collection(COLLECTION_NAME)
+        .find({
+            connectionId: toObjectId(connectionId),
+            $or: [
+                { scopeIds: scopeId },
+                { 'scopes.id': scopeId },
+                { scopeIds: null, 'scopes.id': { $exists: false } }
+            ]
+        })
+        .sort({ startedAt: -1 })
+        .limit(limit)
+        .toArray();
+}
+
+/** One run by id, or null. The caller checks it belongs to the connection it is asking for. */
+async function getRun(jobId) {
+    if (!ObjectId.isValid(jobId)) return null;
+    return getDb().collection(COLLECTION_NAME).findOne({ _id: toObjectId(jobId) });
+}
+
+/**
  * The latest run for a connection, or null. Source of the live "Needs attention" report.
  * @param {ObjectId|string} connectionId
  * @returns {Promise<Object|null>}
@@ -139,6 +172,8 @@ module.exports = {
     startRun,
     finishRun,
     listRecentRuns,
+    listRunsForScope,
+    getRun,
     getLatestRun,
     failStaleRuns,
     deleteForConnection

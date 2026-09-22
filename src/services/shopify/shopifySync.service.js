@@ -1751,12 +1751,17 @@ async function pushNewProducts({ connection, token, scopedProducts, unmatched, m
  *
  * @returns {Array<{ type:string, exportConfigId?:string, feedId?:string, locationId:string|null }>}
  */
-function getScopeList(connection) {
+function getScopeList(connection, { scopeIds = null, includeDisabled = false } = {}) {
     const cfg = connection.config || {};
     if (Array.isArray(cfg.scopes) && cfg.scopes.length) {
         // Preserve the whole scope (it carries its own per-source push config), only defaulting
         // the location to the connection-level one when the scope doesn't set its own.
-        return cfg.scopes.map((s) => ({ ...s, locationId: s.locationId || connection.shopifyLocationId || null }));
+        // A scope switched off (Sources API `enabled: false`) does not run; a run asked for
+        // specific scope ids runs those alone.
+        return cfg.scopes
+            .filter((s) => s && (includeDisabled || s.enabled !== false))
+            .filter((s) => !scopeIds || scopeIds.includes(s.id))
+            .map((s) => ({ ...s, locationId: s.locationId || connection.shopifyLocationId || null }));
     }
     const single = cfg.scope
         ?? (cfg.exportConfigId ? { type: 'export_config', exportConfigId: cfg.exportConfigId } : null);
@@ -2050,9 +2055,9 @@ async function executeRun(connection, job, token) {
     const staleSkus = new Set();
 
     try {
-        const scopeList = getScopeList(connection);
+        const scopeList = getScopeList(connection, { scopeIds: job.scopeIds || null });
         if (!scopeList.length) {
-            throw Object.assign(new Error('No "Products to sync" source selected'), { code: 'NO_EXPORT_CONFIG' });
+            throw Object.assign(new Error(job.scopeIds ? 'The requested source is not on this connection or is switched off' : 'No "Products to sync" source selected'), { code: 'NO_EXPORT_CONFIG' });
         }
 
         // Build each scope target: resolve its source (products + items) and validate its location.
@@ -2115,6 +2120,8 @@ async function executeRun(connection, job, token) {
 
         for (const t of targets) {
             scopes.push({
+                // The scope's stable id, so a run can be attributed to a source afterwards.
+                ...(t.id ? { id: t.id } : {}),
                 type: t.type || 'export_config',
                 // Own-source products carry their brand as `vendor`; Patrik scopes name their export.
                 source: t.type === 'own_source'
@@ -2282,7 +2289,7 @@ async function executeRun(connection, job, token) {
  * @param {{ trigger?: string }} [opts]
  * @returns {Promise<Object>} the started job
  */
-async function startStockSync(connectionId, { trigger = 'manual' } = {}) {
+async function startStockSync(connectionId, { trigger = 'manual', scopeIds = null } = {}) {
     const connection = await connectionService.getConnectionWithToken(connectionId);
     if (!connection) {
         throw Object.assign(new Error('Connection not found'), { code: 'NOT_FOUND' });
@@ -2300,7 +2307,7 @@ async function startStockSync(connectionId, { trigger = 'manual' } = {}) {
 
     // Clean up any zombie 'running' rows from a prior crash before opening a fresh run.
     await syncJobs.failStaleRuns(connection._id);
-    const job = await syncJobs.startRun(connection._id, connection.shopDomain, { type: 'inventory', trigger });
+    const job = await syncJobs.startRun(connection._id, connection.shopDomain, { type: 'inventory', trigger, scopeIds });
 
     // Fire-and-forget under the per-shop lock; the controller already has the job id.
     queue.runExclusive(connection.shopDomain, () => executeRun(connection, job, token)).catch((err) => {

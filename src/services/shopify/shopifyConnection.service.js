@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const { getDb } = require('../db/mongo.service');
 const { ObjectId } = require('mongodb');
 const { encryptToken } = require('./crypto.service');
@@ -47,6 +48,74 @@ const TITLE_PREFIX_MAX = 40;
 function normalizeTitlePrefix(value) {
     if (typeof value !== 'string') return '';
     return value.trim().slice(0, TITLE_PREFIX_MAX);
+}
+
+/**
+ * Scope identity (the Sources API, `../../../docs/sources-api.md`).
+ *
+ * A scope used to be identified only by what it is — `(type, exportConfigId|feedId, locationId)`
+ * — which is fine for the portal UI (it always saves the whole array) but not for an external
+ * client that addresses one source over time. Every scope now carries a stable random `id`, an
+ * optional `name` and an `enabled` flag. The portal UI re-saves scopes with a whitelist that
+ * pre-dates these keys, so {@link reconcileScopeIdentity} carries them across a save that dropped
+ * them, matching the incoming scope to the stored one by what it is.
+ */
+function newScopeId() {
+    return `sc_${crypto.randomBytes(6).toString('hex')}`;
+}
+
+/** The identity part of a scope: what it pushes and where. */
+function scopeSourceKey(s) {
+    return `${s.type || 'export_config'}:${s.type === 'own_source' ? s.feedId : s.exportConfigId}`;
+}
+
+/**
+ * Gives every incoming scope an `id`, `enabled` and `name`, carried over from the stored scopes
+ * when the caller did not send them (a save from a UI that does not know the keys), assigned
+ * fresh when the scope is new. Matching is by source + location first, then by source alone when
+ * that is unambiguous (a partner moving a source to another location keeps its identity).
+ */
+function reconcileScopeIdentity(existingScopes, incomingScopes) {
+    const existing = Array.isArray(existingScopes) ? existingScopes.filter(Boolean) : [];
+    const taken = new Set();
+    const claim = (match) => {
+        if (!match || taken.has(match.id)) return null;
+        taken.add(match.id);
+        return match;
+    };
+    return incomingScopes.map((s) => {
+        if (!s) return s;
+        let match = null;
+        if (s.id) match = claim(existing.find((e) => e.id === s.id));
+        if (!match) {
+            match = claim(existing.find((e) => e.id && scopeSourceKey(e) === scopeSourceKey(s) && (e.locationId || null) === (s.locationId || null)));
+        }
+        if (!match) {
+            const sameSource = existing.filter((e) => e.id && !taken.has(e.id) && scopeSourceKey(e) === scopeSourceKey(s));
+            if (sameSource.length === 1) match = claim(sameSource[0]);
+        }
+        const out = { ...s };
+        out.id = s.id || match?.id || newScopeId();
+        out.enabled = typeof s.enabled === 'boolean' ? s.enabled : (typeof match?.enabled === 'boolean' ? match.enabled : true);
+        const name = typeof s.name === 'string' ? s.name.trim() : (match?.name || '');
+        if (name) out.name = name.slice(0, 80); else delete out.name;
+        return out;
+    });
+}
+
+/**
+ * Stamps ids onto a connection's stored scopes that pre-date scope identity, persisting them so
+ * the id an external client sees is the one it sees next time. Returns the public connection.
+ */
+async function ensureScopeIds(connection) {
+    const scopes = connection?.config?.scopes;
+    if (!Array.isArray(scopes) || scopes.every((s) => !s || s.id)) return connection;
+    const stamped = scopes.map((s) => (s && !s.id ? { ...s, id: newScopeId(), enabled: s.enabled !== false } : s));
+    await getDb().collection(COLLECTION_NAME).updateOne(
+        { _id: new ObjectId(connection._id) },
+        { $set: { 'config.scopes': stamped, updatedAt: new Date() } }
+    );
+    return { ...connection, config: { ...connection.config, scopes: stamped } };
 }
 
 /** Default per-connection sync config — safe defaults: stock-only, no image push. */
@@ -585,6 +654,10 @@ async function updateConnectionConfig(id, patch) {
         if ('config.priceFields' in set) set['config.priceFields'] = normalizePriceFields(set['config.priceFields']);
         if ('config.existingSalePolicy' in set) set['config.existingSalePolicy'] = normalizeExistingSalePolicy(set['config.existingSalePolicy']);
         if (Array.isArray(set['config.scopes'])) {
+            // Identity first, so a save from a client that does not know `id`/`enabled`/`name`
+            // cannot strip them from a source an external client is addressing.
+            const current = await collection.findOne({ _id: new ObjectId(id) }, { projection: { 'config.scopes': 1 } });
+            set['config.scopes'] = reconcileScopeIdentity(current?.config?.scopes, set['config.scopes']);
             set['config.scopes'] = set['config.scopes'].map((s) => {
                 if (!s) return s;
                 const out = { ...s };
@@ -766,6 +839,9 @@ module.exports = {
     DEFAULT_SCOPES,
     DEFAULT_CONFIG,
     canPublish,
+    newScopeId,
+    reconcileScopeIdentity,
+    ensureScopeIds,
     upsertConnection,
     upsertCustomAppConnection,
     upsertCustomOAuthConnection,
