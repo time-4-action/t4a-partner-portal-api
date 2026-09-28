@@ -190,7 +190,7 @@ async function describeFields(scope, facts, pricelists) {
         // variant option / title prefix / category settings. Groups are ordered by first field, so
         // it sits right after What to sync, next to the New products switch it qualifies.
         { key: 'reviewNewProducts', label: 'Hold new products for review', type: 'boolean', group: G_REVIEW,
-          help: 'Each product this source creates stays a hidden draft until someone approves it on the Review page. Needs New products on. Products already in the store, and new variants added to them, are not affected.' },
+          help: 'New products wait as hidden drafts until someone approves them on the Review page. Works with New products on; products already in the store are not held.' },
 
         { key: 'pricelistPriority', label: 'Pricelist priority', type: 'text', group: G_PRICING,
           placeholder: pricelists.slice(0, 3).join(', '),
