@@ -66,6 +66,7 @@ const ROUNDING_MODE_OPTIONS = [
 
 const G_STORE = 'Store';
 const G_SYNC = 'What to sync';
+const G_REVIEW = 'Review before publish';
 const G_PRICING = 'Pricing';
 const G_ROUNDING = 'Price rounding';
 const G_CREATED = 'Products the portal creates';
@@ -185,6 +186,12 @@ async function describeFields(scope, facts, pricelists) {
         { key: 'syncTags', label: 'Tags', type: 'boolean', group: G_SYNC, help: 'Whether tags reach products already in the store is decided by the ownership mode.' },
         { key: 'syncImages', label: 'Images', type: 'boolean', group: G_SYNC },
 
+        // A group of its own: it changes what happens to a NEW product, and shares nothing with the
+        // variant option / title prefix / category settings. Groups are ordered by first field, so
+        // it sits right after What to sync, next to the New products switch it qualifies.
+        { key: 'reviewNewProducts', label: 'Hold new products for review', type: 'boolean', group: G_REVIEW,
+          help: 'Each product this source creates stays a hidden draft until someone approves it on the Review page. Needs New products on. Products already in the store, and new variants added to them, are not affected.' },
+
         { key: 'pricelistPriority', label: 'Pricelist priority', type: 'text', group: G_PRICING,
           placeholder: pricelists.slice(0, 3).join(', '),
           help: `Pricelist names in the order to try, comma-separated. Known: ${pricelists.join(', ') || 'none yet'}.` },
@@ -206,11 +213,7 @@ async function describeFields(scope, facts, pricelists) {
         { key: 'variantOptionName', label: 'Variant option name', type: 'text', group: G_CREATED, placeholder: 'Size', help: 'What shoppers see next to the variant choices of a product the portal creates, e.g. Size or Volume. Empty uses the default.' },
         { key: 'titlePrefix', label: 'Title prefix', type: 'text', group: G_CREATED, placeholder: 'WINDSURF -', help: 'Prepended to every pushed product title. Empty for none.' },
         { key: 'aiExportId', label: 'Category set for tags', type: 'select', group: G_CREATED, options: sets,
-          help: sets.length ? 'Which AI category set supplies this store\'s tags.' : 'No category set is available for this source.' },
-        // Last in its group on purpose: a group that OPENS with a switch reads, to a client, as a
-        // feature and its settings (folded away while off). This one does not gate the fields above.
-        { key: 'reviewNewProducts', label: 'Hold new products for review', type: 'boolean', group: G_CREATED,
-          help: 'New products are created as drafts tagged awaiting-review and go live only when someone approves them. Variants added to a product already in the store are not held.' }
+          help: sets.length ? 'Which AI category set supplies this store\'s tags.' : 'No category set is available for this source.' }
     ];
     if (facts.publishingEnabled) {
         for (const pub of facts.publications) {

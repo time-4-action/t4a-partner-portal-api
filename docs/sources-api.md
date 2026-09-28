@@ -98,7 +98,7 @@ sync** (`ownership`, the six `sync*` booleans) · **Pricing** (`pricelistPriorit
 comma-separated text of names, `priceVatMode`, `priceFactor`, `futureDatedGuard`,
 `compareAtPricelist` from the catalogue's distinct pricelists, `priceFields`,
 `existingSalePolicy`) · **Price rounding** (`rounding_enabled|mode|step|offset|always_advance`,
-one object on the scope) · **Products the portal creates** (`reviewNewProducts`, `variantOptionName`, `titlePrefix`,
+one object on the scope) · **Review before publish** (`reviewNewProducts`) · **Products the portal creates** (`variantOptionName`, `titlePrefix`,
 `aiExportId` from the category sets the source may use) · **Sales channels** (one boolean per
 publication, `publication:<gid>`, only when the token can publish).
 
