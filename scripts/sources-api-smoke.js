@@ -37,6 +37,10 @@ graphql.listLocations = async () => [
     { id: 'gid://shopify/Location/3', name: '3PL', active: true, fulfillmentServiceId: 'gid://shopify/FulfillmentService/9' }
 ];
 graphql.listPublications = async () => [{ id: 'gid://shopify/Publication/10', name: 'Online Store' }];
+// The engine's one GraphQL entry point, stubbed before the engine is loaded (it destructures it).
+// Only the review-before-publish checks at the end answer anything; every other run writes nothing.
+let onGraphql = async () => { throw new Error('unexpected Shopify call'); };
+graphql.graphqlRequest = (...args) => onGraphql(...args);
 const tokenService = require('../src/services/shopify/shopifyToken.service');
 tokenService.getValidAccessToken = async () => 'shpat_test';
 // The push itself is the REAL engine: the feed below has no imported products, so the run
@@ -48,6 +52,7 @@ const { connectToDb, getDb } = require('../src/services/db/mongo.service');
 const connectionService = require('../src/services/shopify/shopifyConnection.service');
 const { encryptToken } = require('../src/services/shopify/crypto.service');
 const { createConnectionApiKey } = require('../src/services/shopify/connectionApiKey.service');
+const syncService = require('../src/services/shopify/shopifySync.service');
 
 const SHOP = 'recharge-smoke.myshopify.com';
 
@@ -116,6 +121,8 @@ async function main() {
             const loc = r.body.types[0].fields.find((f) => f.key === 'locationId');
             assert.equal(loc.options.length, 2, '3PL location excluded');
             assert.ok(r.body.types[0].fields.some((f) => f.key === 'publication:gid://shopify/Publication/10'));
+            const review = r.body.types[0].fields.find((f) => f.key === 'reviewNewProducts');
+            assert.equal(review?.type, 'boolean', 'review before publish is a switch');
         });
 
         console.log('list (legacy scope stamped)');
@@ -138,7 +145,8 @@ async function main() {
         });
         r = await call('POST', '/sources', { body: { kind: 'own_source:point7', name: 'Point-7 corner', values: {
             locationId: 'gid://shopify/Location/2', ownership: 'create_then_handoff', syncNewProducts: true, priceFactor: 1.2,
-            rounding_enabled: true, rounding_step: 10, rounding_offset: 9, 'publication:gid://shopify/Publication/10': true, pricelistPriority: 'RRP 2026, RRP 2025'
+            rounding_enabled: true, rounding_step: 10, rounding_offset: 9, 'publication:gid://shopify/Publication/10': true, pricelistPriority: 'RRP 2026, RRP 2025',
+            reviewNewProducts: true
         } } });
         check('created with values applied', () => {
             assert.equal(r.status, 201); const s = r.body.source;
@@ -147,6 +155,7 @@ async function main() {
             assert.equal(s.values.priceFactor, 1.2); assert.equal(s.values.rounding_enabled, true); assert.equal(s.values.rounding_offset, 9);
             assert.equal(s.values['publication:gid://shopify/Publication/10'], true);
             assert.equal(s.values.pricelistPriority, 'RRP 2026, RRP 2025');
+            assert.equal(s.values.reviewNewProducts, true);
             assert.equal(s.schedule.mode, 'automatic'); assert.match(s.schedule.description, /Every day at 04:00/);
             assert.equal(s.destination, 'Recharge smoke · Brand corner');
         });
@@ -174,6 +183,7 @@ async function main() {
             const ids = r.body.sources.map((s) => s.id).sort(); assert.deepEqual(ids, [legacyId, feedSourceId].sort());
             assert.equal(r.body.sources.find((s) => s.id === feedSourceId).name, 'Point-7 (brand corner)');
         });
+        r = await call('GET', `/sources/${feedSourceId}`); check('review setting survives a whitelist save', () => assert.equal(r.body.source.values.reviewNewProducts, true));
 
         console.log('runs');
         r = await call('POST', `/sources/${feedSourceId}/runs`, { body: {} });
@@ -196,6 +206,65 @@ async function main() {
         r = await call('GET', `/sources/${feedSourceId}`); check('gone → 404', () => assert.equal(r.status, 404));
         r = await call('GET', '/sources'); check('the other source remains', () => { assert.equal(r.body.sources.length, 1); assert.equal(r.body.sources[0].id, legacyId); });
         r = await call('GET', '/nope'); check('unknown endpoint → 404 in contract shape', () => { assert.equal(r.status, 404); assert.ok(r.body.error.code); });
+
+        console.log('review before publish (engine, Shopify stubbed)');
+        const connId = (await getDb().collection('shopify_connections').findOne({ shopDomain: SHOP }))._id;
+        const created = async (config) => {
+            const sent = [];
+            onGraphql = async (_shop, _token, _query, vars) => {
+                sent.push(vars.input);
+                return { productSet: { userErrors: [], product: { id: 'gid://shopify/Product/1', variants: { nodes: [{ id: 'gid://shopify/ProductVariant/1', sku: 'NEW-1', inventoryItem: { id: 'gid://shopify/InventoryItem/1' } }] } } } };
+            };
+            const counts = { createdProducts: 0, createdVariants: 0 };
+            const errors = [];
+            await syncService.pushNewProducts({
+                connection: { _id: connId, shopDomain: SHOP, scopeId: 'sc_review', config }, token: 'shpat_test',
+                scopedProducts: [{ code: 'NEW-1', product_name: 'Foil', categories: ['Foils'], child_products: [], images: [] }],
+                unmatched: [{ sku: 'NEW-1', reason: 'No SKU / barcode match in store' }], matchInfoBySku: new Map(),
+                exportConfig: null, locationId: 'gid://shopify/Location/1', counts, errors
+            });
+            return { input: sent[0], counts, errors };
+        };
+        let out = await created({ ownership: 'portal_authoritative', syncNewProducts: true, reviewNewProducts: true });
+        check('held: created as a draft tagged for review and with its source', () => {
+            assert.deepEqual(out.errors, []); assert.equal(out.input.status, 'DRAFT');
+            assert.deepEqual(out.input.tags, ['Foils', 'awaiting-review', 'portal-source:sc_review']);
+            assert.equal(out.counts.createdForReview, 1);
+        });
+        out = await created({ ownership: 'portal_authoritative', syncNewProducts: true, reviewNewProducts: true, syncTags: false });
+        check('held with tag sync off: still carries the review tags', () => assert.deepEqual(out.input.tags, ['awaiting-review', 'portal-source:sc_review']));
+        out = await created({ ownership: 'portal_authoritative', syncNewProducts: true });
+        check('not held: active, no review tags', () => {
+            assert.equal(out.input.status, 'ACTIVE'); assert.deepEqual(out.input.tags, ['Foils']); assert.equal(out.counts.createdForReview, undefined);
+        });
+
+        const maintained = async (liveTags, { liveFails = false } = {}) => {
+            const updates = [];
+            onGraphql = async (_shop, _token, query, vars) => {
+                if (/query ProductContent/.test(query)) {
+                    if (liveFails) throw new Error('boom');
+                    return { nodes: [{ id: 'gid://shopify/Product/1', title: 'Foil', descriptionHtml: '', tags: liveTags }] };
+                }
+                updates.push(vars.product);
+                return { productUpdate: { userErrors: [] } };
+            };
+            await syncService.pushPortalAuthoritative({
+                connection: { _id: connId, shopDomain: SHOP, config: { ownership: 'portal_authoritative', syncTags: true, syncDescriptions: liveFails } },
+                token: 'shpat_test', scopedProducts: [{ code: 'NEW-1', product_name: 'Foil', categories: ['Foils', 'Wing'], child_products: [] }],
+                matchInfoBySku: new Map([['NEW-1', { shopifyProductId: 'gid://shopify/Product/1', shopifyVariantId: 'gid://shopify/ProductVariant/1' }]]),
+                existingMap: new Map(), exportConfig: null, counts: { contentPushed: 0, failed: 0 }, errors: [], staleSkus: new Set(), unmatched: []
+            });
+            return updates;
+        };
+        let ups = await maintained(['Foils', 'awaiting-review', 'portal-source:sc_review']);
+        check('a later tag sync keeps the review tags on a draft', () => {
+            assert.equal(ups.length, 1); assert.deepEqual([...ups[0].tags].sort(), ['Foils', 'Wing', 'awaiting-review', 'portal-source:sc_review']);
+            assert.equal(ups[0].status, undefined, 'status is never written on update');
+        });
+        ups = await maintained(['Foils', 'Wing', 'awaiting-review', 'portal-source:sc_review']);
+        check('the review tags alone are not drift', () => assert.equal(ups.length, 0));
+        ups = await maintained([], { liveFails: true });
+        check('blind to the live tags, tags are not written', () => { assert.equal(ups.length, 1); assert.equal(ups[0].tags, undefined); assert.equal(ups[0].title, 'Foil'); });
     } finally {
         server.close();
     }

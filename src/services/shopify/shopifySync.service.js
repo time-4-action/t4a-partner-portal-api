@@ -275,6 +275,26 @@ function applyTitlePrefix(title, prefix) {
 }
 
 /**
+ * Review before publish (docs/sources-api.md § Review before publish). A source with
+ * `reviewNewProducts` on creates each NEW product as a DRAFT carrying these two tags; a person
+ * approves it in the client (Recharge Hub), which sets it ACTIVE and removes `REVIEW_TAG`. The
+ * tags are the whole contract, so the portal must never strip them when it maintains tags.
+ */
+const REVIEW_TAG = 'awaiting-review';
+const SOURCE_TAG_PREFIX = 'portal-source:';
+
+/** A tag the portal keeps on a product whatever its tag sync says (the review contract's). */
+function isReservedTag(tag) {
+    const t = String(tag || '').trim();
+    return t === REVIEW_TAG || t.startsWith(SOURCE_TAG_PREFIX);
+}
+
+/** The review tags a product created under review is born with. */
+function reviewTags(scopeId) {
+    return scopeId ? [REVIEW_TAG, `${SOURCE_TAG_PREFIX}${scopeId}`] : [REVIEW_TAG];
+}
+
+/**
  * Resolves the connection's export config into the in-scope catalogue: the published-only,
  * filtered products ({@link applyFilters}) AND the flat list of sellable inventory items
  * derived from them (one per variant, or the parent for no-variant products — design §3.4;
@@ -512,7 +532,8 @@ function contentDrifted(candidate, live) {
         if ((candidate.product.title || '') !== (live.title || '')) return true;
         if ((candidate.product.descriptionHtml || '').trim() !== (live.descriptionHtml || '').trim()) return true;
     }
-    if (candidate.wantTags && tagsKey(candidate.product.tags) !== tagsKey(live.tags)) return true;
+    // The review tags are not the source's to manage: compare without them.
+    if (candidate.wantTags && tagsKey(candidate.product.tags) !== tagsKey((live.tags || []).filter((t) => !isReservedTag(t)))) return true;
     return false;
 }
 
@@ -740,8 +761,21 @@ async function pushPortalAuthoritative({ connection, token, scopedProducts, matc
             if (liveById) {
                 const live = liveById.get(c.productId);
                 if (!live) continue; // vanished in store — existence/stale paths handle it, not content
-                if (contentDrifted(c, live)) contentOps.push(op);
+                if (!contentDrifted(c, live)) continue;
+                // `tags` replaces the whole list, so carry the review tags a product still has —
+                // stripping `awaiting-review` would drop a draft out of the review queue.
+                const reserved = (live.tags || []).filter(isReservedTag);
+                if (c.wantTags && reserved.length) op.product = { ...c.product, tags: [...c.product.tags, ...reserved] };
+                contentOps.push(op);
             } else if (existingMap.get(c.skus[0])?.contentHash !== c.contentHash) {
+                // Blind to the live tags, a tag write could strip the review tags: leave tags to a
+                // run that can read them, and push only title/description now.
+                if (c.wantTags) {
+                    if (!c.wantContent) continue;
+                    op.product = { ...c.product };
+                    delete op.product.tags;
+                    op.contentHash = undefined; // tags not pushed → do not record them as synced
+                }
                 contentOps.push(op);
             }
         }
@@ -1557,7 +1591,7 @@ function buildCreateVariantInput(plan, v, locationId, priceOpts, nowMs, variantO
  * images linked (design §3.5). Each variant's own image becomes its variant image; the parent
  * gallery + all variant images form the product files. price/barcode/sku/inventory set inline.
  */
-function buildProductSetInput(plan, exportConfig, locationId, priceOpts, nowMs, wantTags = true, variantOptionName = 'Size', titlePrefix = '') {
+function buildProductSetInput(plan, exportConfig, locationId, priceOpts, nowMs, wantTags = true, variantOptionName = 'Size', titlePrefix = '', review = null) {
     const product = plan.product;
     const parentImages = [...new Set(product.images || [])].filter(Boolean);
     const variantImageUrls = [];
@@ -1593,8 +1627,13 @@ function buildProductSetInput(plan, exportConfig, locationId, priceOpts, nowMs, 
         // Own-source products carry their own brand as `vendor`; Patrik products have none → default.
         vendor: product.vendor || 'Patrik International',
         productType: product.categories?.[0] || '',
-        status: 'ACTIVE',
-        tags: wantTags ? (resolveTagsArray(product, exportConfig) || []) : [],
+        // Under review the product is born a draft — published to its channels but shown on none
+        // until a person approves it. This is the ONLY place the portal writes `status`.
+        status: review ? 'DRAFT' : 'ACTIVE',
+        tags: [
+            ...(wantTags ? (resolveTagsArray(product, exportConfig) || []) : []),
+            ...(review ? reviewTags(review.scopeId) : [])
+        ],
         variants
     };
     // productSet requires productOptions whenever variants are provided (even the single
@@ -1658,6 +1697,9 @@ async function pushNewProducts({ connection, token, scopedProducts, unmatched, m
         || 'Size';
     // Per-source title prefix (e.g. "WINDSURF -") applied to every product this source creates.
     const titlePrefix = cfg.titlePrefix || '';
+    // Review before publish: new products wait as tagged drafts. A variant added to a product
+    // that already exists is not held — it goes live with its product.
+    const review = cfg.reviewNewProducts ? { scopeId: connection.scopeId || null } : null;
     const nowMs = Date.now();
 
     // Only create SKUs that truly aren't in the store — never duplicates / ambiguous / untracked.
@@ -1697,7 +1739,7 @@ async function pushNewProducts({ connection, token, scopedProducts, unmatched, m
 
             if (!plan.existingProductId) {
                 // New product → productSet (links each variant's own image to the variant).
-                const input = buildProductSetInput(plan, exportConfig, locationId, priceOpts, nowMs, wantTags, variantOptionName, titlePrefix);
+                const input = buildProductSetInput(plan, exportConfig, locationId, priceOpts, nowMs, wantTags, variantOptionName, titlePrefix, review);
                 const data = await graphqlRequest(shop, token, PRODUCT_SET_MUTATION, { input, synchronous: true });
                 const ue = data?.productSet?.userErrors || [];
                 if (ue.length) throw new Error(ue.map((e) => e.message).join('; '));
@@ -1718,7 +1760,10 @@ async function pushNewProducts({ connection, token, scopedProducts, unmatched, m
             for (const r of rows) { created.push(r); createdSkus.add(r.sku); }
             if (rows.length) {
                 counts.createdVariants += rows.length;
-                if (!plan.existingProductId) counts.createdProducts += 1;
+                if (!plan.existingProductId) {
+                    counts.createdProducts += 1;
+                    if (review) counts.createdForReview = (counts.createdForReview || 0) + 1;
+                }
             }
 
             // Publish the freshly-created product to the chosen sales channels (Online Store,
@@ -1778,7 +1823,7 @@ const SCOPE_CONFIG_KEYS = [
     'ownership', 'syncStock', 'syncNewProducts', 'syncPrices', 'syncDescriptions', 'syncImages',
     'syncTags', 'priceVatMode', 'futureDatedGuard', 'pricelistPriority', 'priceFactor', 'priceRounding',
     'compareAtPricelist', 'priceFields', 'existingSalePolicy',
-    'publicationIds', 'variantOptionName', 'titlePrefix'
+    'publicationIds', 'variantOptionName', 'titlePrefix', 'reviewNewProducts'
 ];
 
 /**
@@ -2238,7 +2283,8 @@ async function executeRun(connection, job, token) {
         // downstream push helper (which reads `connection.config.*`) works unchanged.
         for (const t of targets) {
             if (!t.items.length) continue;
-            const scopeConn = { ...connection, config: resolveScopeConfig(connection, t), shopifyLocationId: t.locationId };
+            // `scopeId` names the source on the products it creates for review.
+            const scopeConn = { ...connection, config: resolveScopeConfig(connection, t), shopifyLocationId: t.locationId, scopeId: t.id || null };
             // Per-source AI-categorization for tags: override the export config's aiExportId when
             // the scope sets one. An own-source scope has no export config at all, so it gets a
             // synthetic one carrying just the filter — `resolveTagsArray` then merges the feed's

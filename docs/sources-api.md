@@ -98,7 +98,7 @@ sync** (`ownership`, the six `sync*` booleans) · **Pricing** (`pricelistPriorit
 comma-separated text of names, `priceVatMode`, `priceFactor`, `futureDatedGuard`,
 `compareAtPricelist` from the catalogue's distinct pricelists, `priceFields`,
 `existingSalePolicy`) · **Price rounding** (`rounding_enabled|mode|step|offset|always_advance`,
-one object on the scope) · **Products the portal creates** (`variantOptionName`, `titlePrefix`,
+one object on the scope) · **Products the portal creates** (`reviewNewProducts`, `variantOptionName`, `titlePrefix`,
 `aiExportId` from the category sets the source may use) · **Sales channels** (one boolean per
 publication, `publication:<gid>`, only when the token can publish).
 
@@ -108,6 +108,29 @@ shows is what will push. Writes go through `updateConnectionConfig`, so the same
 not make sense is a 422, not a silently disabled rule.
 
 No `secret` fields exist today; the contract reserves the type (the client never echoes one).
+
+## Review before publish
+
+`reviewNewProducts` (a per-scope boolean, default off) holds a source's new products for a person
+instead of putting them live. The contract with the client is Shopify tags alone; nothing about a
+product under review is stored here.
+
+- **Creation** (`pushNewProducts` → `buildProductSetInput`): a product the run creates is
+  `status: DRAFT` and carries `awaiting-review` and `portal-source:<scope id>` on top of its own
+  tags (even with tag sync off). It is published to the scope's channels as usual; a draft shows
+  on none. A variant added to a product already in the store is not held. The run counts them
+  (`counts.createdForReview`), and the run message says `N awaiting review`.
+- **Later runs never write `status`** — the only `status` the engine sends is at creation — so a
+  run can neither publish a draft nor unpublish an approved product.
+- **Tag maintenance keeps the review tags** (`isReservedTag`): the drift check ignores them, and a
+  tag write carries whichever of them the live product still has. When the live tags cannot be
+  read, tags are not written that run (title/description still are), since a blind write would
+  drop a draft out of the queue.
+- **Approval is the client's**: Recharge Hub sets the product `ACTIVE` and removes
+  `awaiting-review`; `portal-source:<id>` stays as provenance.
+
+The portal UI shows the same switch under *Product creation* in the source modal, and carries it
+through every scope save.
 
 ## Not in v1
 

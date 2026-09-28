@@ -145,7 +145,10 @@ const DEFAULT_CONFIG = {
     syncImages: false,
     ownership: 'stock_only', // 'stock_only' | 'portal_authoritative' | 'create_then_handoff'
     publicationIds: [], // sales channels (publications) to publish created products to
-    titlePrefix: '' // prepended to every pushed product title, per source (e.g. "WINDSURF -")
+    titlePrefix: '', // prepended to every pushed product title, per source (e.g. "WINDSURF -")
+    // New products are created as drafts tagged `awaiting-review` for a person to approve in the
+    // client (Recharge Hub) instead of going live (docs/sources-api.md § Review before publish).
+    reviewNewProducts: false
 };
 
 /**
@@ -627,6 +630,8 @@ async function updateConnectionConfig(id, patch) {
         // Text prepended to every pushed product TITLE for a source (e.g. "WINDSURF -").
         // Per-source value lives on the scope; this is the connection-level fallback.
         'titlePrefix',
+        // Hold new products as drafts for review (per-source value lives on the scope).
+        'reviewNewProducts',
         // `scope` selects WHAT this connection pushes: { type:'export_config', exportConfigId }
         // (default/back-compat) or { type:'own_source', feedId } (an external brand feed).
         'scope',

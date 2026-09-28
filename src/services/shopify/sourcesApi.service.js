@@ -203,6 +203,8 @@ async function describeFields(scope, facts, pricelists) {
         { key: 'rounding_offset', label: 'Ending', type: 'number', group: G_ROUNDING, help: 'Between 0 and the step.' },
         { key: 'rounding_always_advance', label: 'Move a price that already ends right', type: 'boolean', group: G_ROUNDING, help: 'Off is the safe reading: a price that already fits is left alone.' },
 
+        { key: 'reviewNewProducts', label: 'Hold new products for review', type: 'boolean', group: G_CREATED,
+          help: 'New products are created as drafts tagged awaiting-review and go live only when someone approves them. Variants added to a product already in the store are not held.' },
         { key: 'variantOptionName', label: 'Variant option name', type: 'text', group: G_CREATED, placeholder: 'Size', help: 'The Shopify option name for variants of products the portal creates. Empty uses the default.' },
         { key: 'titlePrefix', label: 'Title prefix', type: 'text', group: G_CREATED, placeholder: 'WINDSURF -', help: 'Prepended to every pushed product title. Empty for none.' },
         { key: 'aiExportId', label: 'Category set for tags', type: 'select', group: G_CREATED, options: sets,
@@ -254,6 +256,7 @@ function valuesFor(connection, scope, facts) {
         rounding_always_advance: !!rounding.alwaysAdvance,
         variantOptionName: cfg.variantOptionName || '',
         titlePrefix: cfg.titlePrefix || '',
+        reviewNewProducts: !!cfg.reviewNewProducts,
         aiExportId: scope.aiExportId || null
     };
     if (facts.publishingEnabled) {
@@ -299,7 +302,7 @@ function applyValues(scope, values, fields, facts) {
         if (v === null) fail(key, `${byKey.get(key).label} is required.`);
         else if (v !== undefined) out[key] = v;
     }
-    for (const key of ['syncStock', 'syncNewProducts', 'syncPrices', 'syncDescriptions', 'syncTags', 'syncImages', 'futureDatedGuard']) {
+    for (const key of ['syncStock', 'syncNewProducts', 'syncPrices', 'syncDescriptions', 'syncTags', 'syncImages', 'futureDatedGuard', 'reviewNewProducts']) {
         const v = bool(key);
         if (v !== undefined) out[key] = v;
     }
@@ -370,6 +373,7 @@ function runMessage(job) {
     if (job.error) bits.push(job.error);
     if (c.pushed) bits.push(`${c.pushed} stock`);
     if (c.createdProducts) bits.push(`${c.createdProducts} created`);
+    if (c.createdForReview) bits.push(`${c.createdForReview} awaiting review`);
     if (c.pricesPushed) bits.push(`${c.pricesPushed} prices`);
     if (c.compareAtPushed) bits.push(`${c.compareAtPushed} compare-at`);
     if (c.contentPushed) bits.push(`${c.contentPushed} content`);
@@ -582,7 +586,7 @@ function newScopeFrom(connection, parsedKind) {
     const scope = { ...parsedKind, id: connectionService.newScopeId(), enabled: true, locationId: null };
     for (const k of ['ownership', 'syncStock', 'syncNewProducts', 'syncPrices', 'syncDescriptions', 'syncTags', 'syncImages',
         'priceVatMode', 'futureDatedGuard', 'pricelistPriority', 'priceFactor', 'priceRounding',
-        'compareAtPricelist', 'priceFields', 'existingSalePolicy', 'publicationIds', 'variantOptionName', 'titlePrefix']) {
+        'compareAtPricelist', 'priceFields', 'existingSalePolicy', 'publicationIds', 'variantOptionName', 'titlePrefix', 'reviewNewProducts']) {
         if (base[k] !== undefined) scope[k] = base[k];
     }
     return scope;
