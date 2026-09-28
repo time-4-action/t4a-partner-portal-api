@@ -203,12 +203,14 @@ async function describeFields(scope, facts, pricelists) {
         { key: 'rounding_offset', label: 'Ending', type: 'number', group: G_ROUNDING, help: 'Between 0 and the step.' },
         { key: 'rounding_always_advance', label: 'Move a price that already ends right', type: 'boolean', group: G_ROUNDING, help: 'Off is the safe reading: a price that already fits is left alone.' },
 
-        { key: 'reviewNewProducts', label: 'Hold new products for review', type: 'boolean', group: G_CREATED,
-          help: 'New products are created as drafts tagged awaiting-review and go live only when someone approves them. Variants added to a product already in the store are not held.' },
-        { key: 'variantOptionName', label: 'Variant option name', type: 'text', group: G_CREATED, placeholder: 'Size', help: 'The Shopify option name for variants of products the portal creates. Empty uses the default.' },
+        { key: 'variantOptionName', label: 'Variant option name', type: 'text', group: G_CREATED, placeholder: 'Size', help: 'What shoppers see next to the variant choices of a product the portal creates, e.g. Size or Volume. Empty uses the default.' },
         { key: 'titlePrefix', label: 'Title prefix', type: 'text', group: G_CREATED, placeholder: 'WINDSURF -', help: 'Prepended to every pushed product title. Empty for none.' },
         { key: 'aiExportId', label: 'Category set for tags', type: 'select', group: G_CREATED, options: sets,
-          help: sets.length ? 'Which AI category set supplies this store\'s tags.' : 'No category set is available for this source.' }
+          help: sets.length ? 'Which AI category set supplies this store\'s tags.' : 'No category set is available for this source.' },
+        // Last in its group on purpose: a group that OPENS with a switch reads, to a client, as a
+        // feature and its settings (folded away while off). This one does not gate the fields above.
+        { key: 'reviewNewProducts', label: 'Hold new products for review', type: 'boolean', group: G_CREATED,
+          help: 'New products are created as drafts tagged awaiting-review and go live only when someone approves them. Variants added to a product already in the store are not held.' }
     ];
     if (facts.publishingEnabled) {
         for (const pub of facts.publications) {
