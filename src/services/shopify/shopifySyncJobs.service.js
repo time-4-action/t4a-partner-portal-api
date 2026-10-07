@@ -157,6 +157,24 @@ async function failStaleRuns(connectionId) {
 }
 
 /**
+ * Marks EVERY still-`running` run failed, for every connection — called once at startup.
+ * Runs execute in-process (`shopifyQueue.runExclusive`) and a single API instance is assumed,
+ * so a run that is `running` when the process starts was killed with the previous one: a
+ * deploy or a crash mid-sync. Without this the run stays `running` until the next run of that
+ * store happens to start, and every client watching it (the portal UI, Recharge Hub's Sources
+ * pages, which disable "Run now" while a run is going) waits for ever.
+ * @returns {Promise<number>} runs marked
+ */
+async function failInterruptedRuns() {
+    const now = new Date();
+    const result = await getDb().collection(COLLECTION_NAME).updateMany(
+        { status: 'running' },
+        { $set: { status: 'failed', error: 'Interrupted — the portal restarted during this run. Run it again.', finishedAt: now, updatedAt: now } }
+    );
+    return result.modifiedCount || 0;
+}
+
+/**
  * Removes every sync-run record for a connection. Called on portal disconnect and on the
  * `shop/redact` GDPR webhook so no run history (shop domain, SKU lists) outlives the
  * connection it belongs to.
@@ -176,5 +194,6 @@ module.exports = {
     getRun,
     getLatestRun,
     failStaleRuns,
+    failInterruptedRuns,
     deleteForConnection
 };

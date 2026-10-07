@@ -22,6 +22,8 @@ const { ensureIndexes: ensureActivityIndexes } = require('./src/services/activit
 const externalScheduler = require('./src/services/external/externalScheduler.service');
 const pnvScheduler = require('./src/services/pnv/pnvScheduler.service');
 const shopifyPendingCleanup = require('./src/services/shopify/pendingCleanup.service');
+const { failInterruptedRuns } = require('./src/services/shopify/shopifySyncJobs.service');
+const { failInterruptedCategorizationRuns } = require('./src/services/ai/categoryIdentification.service');
 
 const PORT = process.env.PORT || 3000;
 
@@ -33,6 +35,15 @@ const startServer = async () => {
   await ensureExternalIndexes();
   await ensureActivityIndexes();
   await pnvScheduler.ensureIndexes();
+
+  // Runs execute in this process, so any still marked running died with the previous one
+  // (a deploy or a crash mid-run). Close them before serving, or they spin for ever and the
+  // store's next manual run is blocked behind a run that no longer exists.
+  const interrupted = await failInterruptedRuns();
+  const interruptedAi = await failInterruptedCategorizationRuns();
+  if (interrupted || interruptedAi) {
+    console.log(`Closed ${interrupted} interrupted sync run(s) and ${interruptedAi} categorization run(s).`);
+  }
 
   app.listen(PORT, () => {
     console.log(`Server is running on http://localhost:${PORT}`);

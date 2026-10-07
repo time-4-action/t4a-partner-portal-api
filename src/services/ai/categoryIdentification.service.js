@@ -527,7 +527,23 @@ async function categorizeExternalProducts(exportId, products) {
     return { results: allResults };
 }
 
+/**
+ * Marks every still-`running` categorization progress doc failed — called once at startup, for
+ * the same reason as `shopifySyncJobs.failInterruptedRuns`: a run is in-process, so one that is
+ * `running` when the process starts died with the previous one and would otherwise spin in the
+ * UI for ever.
+ * @returns {Promise<number>} runs marked
+ */
+async function failInterruptedCategorizationRuns() {
+    const result = await getDb().collection(RUNS_COLLECTION).updateMany(
+        { status: 'running' },
+        { $set: { status: 'failed', error: 'Interrupted — the portal restarted during this run. Run it again.', updatedAt: new Date() } }
+    );
+    return result.modifiedCount || 0;
+}
+
 module.exports = {
+    failInterruptedCategorizationRuns,
     identifyProductCategories,
     identifyFeedProductCategories,
     ensureFeedCategorized,
