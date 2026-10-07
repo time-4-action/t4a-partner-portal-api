@@ -120,6 +120,10 @@ product under review is stored here.
   tags (even with tag sync off). It is published to the scope's channels as usual; a draft shows
   on none. A variant added to a product already in the store is not held. The run counts them
   (`counts.createdForReview`), and the run message says `N awaiting review`.
+- **Every created product names its source.** Outside review mode a product the run creates is
+  `ACTIVE` and carries `portal-source:<scope id>` alone (even with tag sync off), so a client can
+  tell which source any new product came from — Recharge Hub's AI categorization per source
+  reads it from products/create. The tag is reserved like the review ones (`isReservedTag`).
 - **Later runs never write `status`** — the only `status` the engine sends is at creation — so a
   run can neither publish a draft nor unpublish an approved product.
 - **Tag maintenance keeps the review tags** (`isReservedTag`): the drift check ignores them, and a

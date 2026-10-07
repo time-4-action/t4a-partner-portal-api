@@ -295,6 +295,15 @@ function reviewTags(scopeId) {
 }
 
 /**
+ * The provenance tag every product a source creates is born with, held for review or not: it is
+ * how a client tells which source a new product came from (Recharge Hub's AI categorization per
+ * source reads it off products/create).
+ */
+function sourceTags(scopeId) {
+    return scopeId ? [`${SOURCE_TAG_PREFIX}${scopeId}`] : [];
+}
+
+/**
  * Resolves the connection's export config into the in-scope catalogue: the published-only,
  * filtered products ({@link applyFilters}) AND the flat list of sellable inventory items
  * derived from them (one per variant, or the parent for no-variant products — design §3.4;
@@ -1591,7 +1600,7 @@ function buildCreateVariantInput(plan, v, locationId, priceOpts, nowMs, variantO
  * images linked (design §3.5). Each variant's own image becomes its variant image; the parent
  * gallery + all variant images form the product files. price/barcode/sku/inventory set inline.
  */
-function buildProductSetInput(plan, exportConfig, locationId, priceOpts, nowMs, wantTags = true, variantOptionName = 'Size', titlePrefix = '', review = null) {
+function buildProductSetInput(plan, exportConfig, locationId, priceOpts, nowMs, wantTags = true, variantOptionName = 'Size', titlePrefix = '', review = null, scopeId = null) {
     const product = plan.product;
     const parentImages = [...new Set(product.images || [])].filter(Boolean);
     const variantImageUrls = [];
@@ -1632,7 +1641,7 @@ function buildProductSetInput(plan, exportConfig, locationId, priceOpts, nowMs, 
         status: review ? 'DRAFT' : 'ACTIVE',
         tags: [
             ...(wantTags ? (resolveTagsArray(product, exportConfig) || []) : []),
-            ...(review ? reviewTags(review.scopeId) : [])
+            ...(review ? reviewTags(review.scopeId) : sourceTags(scopeId))
         ],
         variants
     };
@@ -1739,7 +1748,7 @@ async function pushNewProducts({ connection, token, scopedProducts, unmatched, m
 
             if (!plan.existingProductId) {
                 // New product → productSet (links each variant's own image to the variant).
-                const input = buildProductSetInput(plan, exportConfig, locationId, priceOpts, nowMs, wantTags, variantOptionName, titlePrefix, review);
+                const input = buildProductSetInput(plan, exportConfig, locationId, priceOpts, nowMs, wantTags, variantOptionName, titlePrefix, review, connection.scopeId || null);
                 const data = await graphqlRequest(shop, token, PRODUCT_SET_MUTATION, { input, synchronous: true });
                 const ue = data?.productSet?.userErrors || [];
                 if (ue.length) throw new Error(ue.map((e) => e.message).join('; '));
@@ -2283,7 +2292,7 @@ async function executeRun(connection, job, token) {
         // downstream push helper (which reads `connection.config.*`) works unchanged.
         for (const t of targets) {
             if (!t.items.length) continue;
-            // `scopeId` names the source on the products it creates for review.
+            // `scopeId` names the source on every product it creates (`portal-source:<id>`).
             const scopeConn = { ...connection, config: resolveScopeConfig(connection, t), shopifyLocationId: t.locationId, scopeId: t.id || null };
             // Per-source AI-categorization for tags: override the export config's aiExportId when
             // the scope sets one. An own-source scope has no export config at all, so it gets a

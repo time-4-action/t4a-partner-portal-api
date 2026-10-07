@@ -234,9 +234,11 @@ async function main() {
         out = await created({ ownership: 'portal_authoritative', syncNewProducts: true, reviewNewProducts: true, syncTags: false });
         check('held with tag sync off: still carries the review tags', () => assert.deepEqual(out.input.tags, ['awaiting-review', 'portal-source:sc_review']));
         out = await created({ ownership: 'portal_authoritative', syncNewProducts: true });
-        check('not held: active, no review tags', () => {
-            assert.equal(out.input.status, 'ACTIVE'); assert.deepEqual(out.input.tags, ['Foils']); assert.equal(out.counts.createdForReview, undefined);
+        check('not held: active, tagged with its source but not for review', () => {
+            assert.equal(out.input.status, 'ACTIVE'); assert.deepEqual(out.input.tags, ['Foils', 'portal-source:sc_review']); assert.equal(out.counts.createdForReview, undefined);
         });
+        out = await created({ ownership: 'portal_authoritative', syncNewProducts: true, syncTags: false });
+        check('not held with tag sync off: still carries its source', () => assert.deepEqual(out.input.tags, ['portal-source:sc_review']));
 
         const maintained = async (liveTags, { liveFails = false } = {}) => {
             const updates = [];
