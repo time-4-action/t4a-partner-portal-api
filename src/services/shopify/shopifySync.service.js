@@ -2,6 +2,7 @@ const crypto = require('crypto');
 const { getDb } = require('../db/mongo.service');
 const { getValidAccessToken } = require('./shopifyToken.service');
 const connectionService = require('./shopifyConnection.service');
+const titlePattern = require('./titlePattern');
 const { getExportConfigById, applyFilters, getPriceFromPriority, resolveTagsArray } = require('../customExport.service');
 const { matchVariants } = require('./shopifyMatch.service');
 const productMap = require('./shopifyProductMap.service');
@@ -257,20 +258,42 @@ const chunk = (arr, size) => {
  */
 const isStaleError = (msg) => /could not be found|does not exist|doesn'?t exist|not found|no longer exists|was deleted|been deleted|couldn'?t be stocked|could not be stocked/i.test(msg || '');
 
+/** Brand written to Shopify's `vendor`: own-source products carry their own, Patrik products have none. */
+const DEFAULT_VENDOR = 'Patrik International';
+const productVendor = (product) => (product && product.vendor) || DEFAULT_VENDOR;
+
 /**
  * Prepends a source's title prefix to a product title (design: per-source branding, e.g. a
- * windsurf feed listed as "WINDSURF - Naish Foil"). The prefix is stored trimmed and joined with
- * a single space, so what the partner typed can't hide a leading/trailing whitespace bug.
- * Already-prefixed titles are left alone, so a re-push can never stack the prefix twice.
+ * windsurf feed listed as "WINDSURF - Naish Foil").
+ *
+ * The prefix is a pattern (`titlePattern.js`, the Hub's name-pattern syntax): "{vendor} -" gives
+ * "Dakine - …" and "Unifiber - …" from one Unifiber feed, "{category|upper} -" gives
+ * "WINDSURF - …" from the store's AI category. A pattern whose tokens all come out empty adds
+ * nothing, so a product without a category is not left with a stray "-".
+ *
+ * Already-prefixed titles are left alone, so a re-push can never stack the prefix twice; for a
+ * pattern that is also a title that already opens with what the prefix names ("Dakine Harness"
+ * under "{vendor} -" does not become "Dakine - Dakine Harness").
  *
  * Only the SHOPIFY title is affected — SKU, barcode and handle-matching are untouched, so
  * turning a prefix on/off never re-identifies a product.
  */
-function applyTitlePrefix(title, prefix) {
-    const p = typeof prefix === 'string' ? prefix.trim() : '';
+function applyTitlePrefix(title, prefix, product = {}, exportConfig = null) {
+    const raw = typeof prefix === 'string' ? prefix.trim() : '';
     const t = title || '';
+    if (!raw) return t;
+    const facts = titlePattern.titleFacts(product, {
+        vendor: productVendor(product),
+        categoryExportId: exportConfig?.filters?.aiExportId || null
+    });
+    const p = titlePattern.renderTitlePrefix(raw, facts);
     if (!p) return t;
-    if (t.toLowerCase().startsWith(p.toLowerCase())) return t;
+    const lower = t.toLowerCase();
+    if (lower.startsWith(p.toLowerCase())) return t;
+    if (titlePattern.usesTokens(raw)) {
+        const core = p.replace(/[\s\-–—/|,;:·]+$/, '').toLowerCase();
+        if (core && lower.startsWith(core)) return t;
+    }
     return `${p} ${t}`.trim();
 }
 
@@ -623,7 +646,7 @@ async function pushPortalAuthoritative({ connection, token, scopedProducts, matc
     if (!wantPrices && !wantContent && !wantTags) return;
 
     const priceOpts = resolvePriceOpts(cfg);
-    // Per-source title prefix (e.g. "WINDSURF -"). It's part of the pushed title, so it also
+    // Per-source title prefix (e.g. "WINDSURF -" or "{vendor} -"). It's part of the pushed title, so it also
     // feeds the contentHash below — changing the prefix re-pushes every title on the next sync.
     const titlePrefix = cfg.titlePrefix || '';
     const nowMs = Date.now();
@@ -676,7 +699,7 @@ async function pushPortalAuthoritative({ connection, token, scopedProducts, matc
             const productUpdate = { id: productId };
             const hashParts = {};
             if (wantContent) {
-                productUpdate.title = applyTitlePrefix(product.product_name || '', titlePrefix);
+                productUpdate.title = applyTitlePrefix(product.product_name || '', titlePrefix, product, exportConfig);
                 productUpdate.descriptionHtml = product.detailed_description || product.short_description || '';
                 hashParts.title = productUpdate.title;
                 hashParts.descriptionHtml = productUpdate.descriptionHtml;
@@ -1631,10 +1654,9 @@ function buildProductSetInput(plan, exportConfig, locationId, priceOpts, nowMs, 
         .map((url) => ({ originalSource: toFetchableUrl(url), contentType: 'IMAGE', alt: url }));
 
     const input = {
-        title: applyTitlePrefix(product.product_name || product.code || 'Untitled', titlePrefix),
+        title: applyTitlePrefix(product.product_name || product.code || 'Untitled', titlePrefix, product, exportConfig),
         descriptionHtml: product.detailed_description || product.short_description || '',
-        // Own-source products carry their own brand as `vendor`; Patrik products have none → default.
-        vendor: product.vendor || 'Patrik International',
+        vendor: productVendor(product),
         productType: product.categories?.[0] || '',
         // Under review the product is born a draft — published to its channels but shown on none
         // until a person approves it. This is the ONLY place the portal writes `status`.
@@ -2419,6 +2441,7 @@ async function syncConnectionsForFeed(feedId, { trigger = 'feed' } = {}) {
 
 module.exports = {
     startStockSync,
+    applyTitlePrefix,
     syncAllConnections,
     syncConnectionsForFeed,
     // exported for tests / future triggers (PNV delta, n8n reconcile)

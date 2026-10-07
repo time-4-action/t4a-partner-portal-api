@@ -6,6 +6,8 @@ const shopifyGraphql = require('./shopifyGraphql.service');
 const { getAllExportConfigs, getExportConfigById, getDistinctPricelists } = require('../customExport.service');
 const { getAiEnabledExports } = require('../exports.service');
 const ownSource = require('../external/ownSource.service');
+const titlePattern = require('./titlePattern');
+const { getDb } = require('../db/mongo.service');
 const pnvScheduler = require('../pnv/pnvScheduler.service');
 const { normalizePriceFactor } = require('./priceFactor.util');
 const { normalizePriceRounding, DEFAULT_PRICE_ROUNDING } = require('./priceRounding.util');
@@ -167,11 +169,39 @@ async function categorySetOptions(scope) {
 }
 
 /**
+ * One real product of this source, for the title prefix's examples and preview: what each
+ * `{field}` comes to, and the product it would sit in front of. Null when the source has no
+ * products yet (the client then shows the fields without inventing an example).
+ */
+async function titleSample(scope, sets) {
+    try {
+        const db = getDb();
+        const query = { active: { $ne: false }, product_name: { $nin: [null, ''] } };
+        let product = null;
+        if (scope.type === 'own_source') {
+            if (!scope.feedId) return null;
+            product = await db.collection('external_products').findOne({ ...query, feedId: scope.feedId }, { sort: { product_name: 1 } });
+        } else {
+            product = await db.collection('products').findOne(query, { sort: { product_name: 1 } });
+        }
+        if (!product) return null;
+        const facts = titlePattern.titleFacts(product, {
+            vendor: product.vendor || 'Patrik International',
+            categoryExportId: scope.aiExportId || sets[0]?.value || null
+        });
+        return { facts, label: product.code || product.product_name, title: product.product_name };
+    } catch {
+        return null; // a preview is never worth failing the settings page over
+    }
+}
+
+/**
  * The field list for one scope (or for a kind, when `scope` is a bare `{type, …}`), with the
  * store's live choices baked into the selects.
  */
 async function describeFields(scope, facts, pricelists) {
     const sets = await categorySetOptions(scope);
+    const sample = await titleSample(scope, sets);
     const pricelistOptions = pricelists.map((p) => ({ value: p, label: p }));
     const fields = [
         { key: 'locationId', label: 'Location', type: 'select', required: true, group: G_STORE,
@@ -211,7 +241,13 @@ async function describeFields(scope, facts, pricelists) {
         { key: 'rounding_always_advance', label: 'Move a price that already ends right', type: 'boolean', group: G_ROUNDING, help: 'Off is the safe reading: a price that already fits is left alone.' },
 
         { key: 'variantOptionName', label: 'Variant option name', type: 'text', group: G_CREATED, placeholder: 'Size', help: 'What shoppers see next to the variant choices of a product the portal creates, e.g. Size or Volume. Empty uses the default.' },
-        { key: 'titlePrefix', label: 'Title prefix', type: 'text', group: G_CREATED, placeholder: 'WINDSURF -', help: 'Prepended to every pushed product title. Empty for none.' },
+        // `tokens` lists the fields the pattern may use, each with what it comes to for one real
+        // product; `sample` is that product, so the client can preview the title it would get
+        // (docs/sources-api.md § Fields). A client without a pattern editor shows plain text.
+        { key: 'titlePrefix', label: 'Title prefix', type: 'text', group: G_CREATED, placeholder: '{vendor} -',
+          help: 'Put before every pushed product title. Pick fields such as the vendor or category; each product fills in its own. Empty for none.',
+          tokens: titlePattern.TITLE_FIELDS.map((f) => ({ key: f.key, label: f.label, example: sample ? (sample.facts[f.key] || null) : null })),
+          ...(sample ? { sample: { label: sample.label, after: sample.title } } : {}) },
         { key: 'aiExportId', label: 'Category set for tags', type: 'select', group: G_CREATED, options: sets,
           help: sets.length ? 'Which AI category set supplies this store\'s tags.' : 'No category set is available for this source.' }
     ];
@@ -346,7 +382,12 @@ function applyValues(scope, values, fields, facts) {
     }
 
     const optionName = str('variantOptionName'); if (optionName !== undefined) out.variantOptionName = optionName;
-    const prefix = str('titlePrefix'); if (prefix !== undefined) out.titlePrefix = prefix;
+    const prefix = str('titlePrefix');
+    if (prefix !== undefined) {
+        // A typo in a pattern would reach every pushed title, so it is refused here, not rendered.
+        const problems = titlePattern.lintTitlePattern(prefix);
+        if (problems.length) fail('titlePrefix', problems.join(' ')); else out.titlePrefix = prefix;
+    }
     const set = choice('aiExportId');
     if (set !== undefined) { if (set) out.aiExportId = set; else delete out.aiExportId; }
 

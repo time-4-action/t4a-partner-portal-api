@@ -37,8 +37,8 @@ function canPublish(conn) {
     return PUBLICATION_SCOPES.some((s) => granted.includes(s));
 }
 
-/** Longest accepted title prefix — a Shopify title caps at 255, so leave room for the title. */
-const TITLE_PREFIX_MAX = 40;
+/** Longest accepted title prefix — a Shopify title caps at 255, so leave room for the title. Long enough for a pattern with filters (`{category|upper|suffix:" -"}`). */
+const TITLE_PREFIX_MAX = 120;
 
 /**
  * Cleans a title prefix for storage: a trimmed, length-capped string ('' = no prefix). The sync

@@ -109,6 +109,23 @@ not make sense is a 422, not a silently disabled rule.
 
 No `secret` fields exist today; the contract reserves the type (the client never echoes one).
 
+**Tokens.** A `text` field may carry `tokens: [{ key, label, example }]` — the `{key}` fields its
+value may use, each with what it comes to for one real product of the source (`example`, null when
+the source has no products yet) — and `sample: { label, after }`, that product (its code, and the
+text the value is put in front of) so a client can preview the result. A client with a pattern
+editor offers the fields as chips; one without ignores both keys and shows a plain text field.
+
+Only `titlePrefix` has them today. Its value is a pattern in Recharge Hub's name-pattern syntax
+(`src/services/shopify/titlePattern.js`): `{field|filter:arg}` tokens, `[optional groups]` that
+vanish when every token in them is empty, and the Hub's filters (`upper`, `lower`, `trim`,
+`truncate`, `first`, `last`, `replace`, `prefix`, `suffix`, `default`). Fields: `vendor` (alias
+`brand`; the product's own vendor, the one written to Shopify's `vendor`), `product_type`,
+`category` / `subcategory` (the first and last level of the product's AI category in the set the
+store tags with), `code`. So `"{vendor} -"` gives "Dakine - Seeker Vest" and "Unifiber - Surface
+Vest" from one Unifiber feed, and `"{category|upper} -"` gives "WINDSURF - …". A prefix whose
+tokens all come out empty adds nothing; a title that already opens with what the prefix names gets
+none. An unknown field or filter, or broken syntax, is a 422 on `titlePrefix`.
+
 ## Review before publish
 
 `reviewNewProducts` (a per-scope boolean, default off) holds a source's new products for a person
