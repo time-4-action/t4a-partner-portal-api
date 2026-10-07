@@ -1,14 +1,11 @@
+# Local build. The server copy is deploy/docker-compose.yaml (see docs/deployment.md).
 services:
-  app:
-    image: time4action/t4a-partner-portal-api
-    pull_policy: always
-    container_name: t4a-partner-portal-api
-    restart: unless-stopped
+  t4a-partner-portal-api:
+    build: .
+    image: ghcr.io/time-4-action/t4a-partner-portal-api:latest
     ports:
       - "3001:3000"
     env_file:
-      - /data/stack/apps/time-4-action/export/api/data/.env
+      - .env
     volumes:
-      - /data/stack/apps/time-4-action/export/api/data:/data      
-
-
+      - ./data:/data

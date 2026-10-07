@@ -48,5 +48,12 @@ USER node
 # Expose the port your app will run on.
 EXPOSE 3000
 
+# Set by CI to the commit SHA; the deploy checks it after rollout.
+ARG GIT_SHA=unknown
+ENV APP_VERSION=$GIT_SHA
+LABEL org.opencontainers.image.revision=$GIT_SHA
+# Links the GHCR package to the repository (visibility + access follow it).
+LABEL org.opencontainers.image.source=https://github.com/time-4-action/t4a-partner-portal-api
+
 # The command to start your application.
 CMD ["node", "index.js"]

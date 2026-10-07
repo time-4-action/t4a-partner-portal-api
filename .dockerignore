@@ -5,4 +5,4 @@ npm-debug.log
 Dockerfile
 .dockerignore
 .git
-products.csv
+products.csv.github

@@ -1,6 +1,13 @@
 const express = require('express');
 const app = express();
 const path = require('path');
+
+// Liveness probe for the CI deploy and the public verify step. Registered before the request
+// logger and analytics so probes are not recorded, and free of MongoDB/PNV/Metakocka (unlike
+// /api/export/health) so an outage of a dependency never makes a deploy roll back.
+app.get('/api/export/healthz', (_req, res) => {
+    res.set('Cache-Control', 'no-store').type('text/plain').send('ok');
+});
 const logger = require('./middleware/logger');
 const apiAnalyticsLogger = require('./middleware/analytics');
 const exportRoutes = require('./routes/export');

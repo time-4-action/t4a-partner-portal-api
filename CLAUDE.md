@@ -29,6 +29,7 @@ All routes are under `/api/export`:
 
 | Prefix | File |
 |---|---|
+| `/api/export/healthz` | inline in `src/app.js` — bare liveness probe for the CI deploy (no auth, no logging, no DB) |
 | `/api/export/health` | `src/routes/healthRoutes.js` — public, no auth |
 | `/api/export/product` | `src/routes/productRoutes.js` |
 | `/api/export/exports` | `src/routes/exportsRoutes.js` |
