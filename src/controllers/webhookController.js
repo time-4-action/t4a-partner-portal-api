@@ -1,6 +1,7 @@
 const { runPnvProductSync } = require('../services/pnv/pnvProductsSync.service');
-const { identifyProductCategories, categorizeExternalProducts } = require('../services/ai/categoryIdentification.service');
+const { identifyProductCategories, categorizeExternalProducts, ensureFeedCategorized } = require('../services/ai/categoryIdentification.service');
 const { getAiEnabledExports } = require('../services/exports.service');
+const { listFeedIdsForAiExport } = require('../services/external/ownSource.service');
 const { fireCallback } = require('../services/callbackWebhook.service');
 const { syncAllConnections } = require('../services/shopify/shopifySync.service');
 const externalImport = require('../services/external/externalImport.service');
@@ -190,6 +191,19 @@ exports.triggerAiCategorization = async (req, res) => {
 
             try {
                 const stats = await identifyProductCategories(id);
+                // A category set also governs every Own Source feed that switched categorization
+                // on for it — run those too, so "Trigger AI" covers the whole set.
+                const feeds = [];
+                for (const feedId of await listFeedIdsForAiExport(id)) {
+                    const feedStats = await ensureFeedCategorized(feedId, id);
+                    if (feedStats) {
+                        feeds.push({
+                            feedId,
+                            productsFound: feedStats.productsFound,
+                            productsCategorized: feedStats.productsCategorized,
+                        });
+                    }
+                }
                 const exportFinishedAt = new Date();
 
                 results.push({
@@ -198,6 +212,7 @@ exports.triggerAiCategorization = async (req, res) => {
                     durationMs: exportFinishedAt - exportStartedAt,
                     productsFound: stats.productsFound,
                     productsCategorized: stats.productsCategorized,
+                    ...(feeds.length ? { feeds } : {}),
                 });
             } catch (err) {
                 const exportFinishedAt = new Date();

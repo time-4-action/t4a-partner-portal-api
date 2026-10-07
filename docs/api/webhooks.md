@@ -193,10 +193,10 @@ Content-Type: application/json
 ## Recharge XML
 
 ```http
-GET /api/export/recharge/xml
+GET /api/export/recharge/xml/all
 ```
 
-Returns a fixed-format XML feed for the Recharge platform, including products, variants, stock, prices, and AI-assigned Katalog categories.
+Returns a fixed-format XML feed for the Recharge platform, including products, variants, stock, prices, and AI-assigned Katalog categories. See [Recharge XML Feed](recharge.md) for details.
 
 ---
 

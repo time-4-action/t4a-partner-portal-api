@@ -53,6 +53,13 @@ router.post('/connection/:id/recreate', jwtCheck, requireExportRole, shopifyCont
 router.get('/connection/:id/activity', jwtCheck, requireExportRole, shopifyController.activity);
 router.delete('/connection/:id', jwtCheck, requireExportRole, shopifyController.disconnect);
 
+// ─── API keys for the Sources API (docs/sources-api.md) ─────────────────────
+// A partner mints a key for ONE connected store and pastes it into the other product (Recharge
+// Hub). Owner-checked like every connection route; the raw key is returned once, on create.
+router.get('/connection/:id/keys', jwtCheck, requireExportRole, shopifyController.listApiKeys);
+router.post('/connection/:id/keys', jwtCheck, requireExportRole, shopifyController.createApiKey);
+router.delete('/connection/:id/keys/:keyId', jwtCheck, requireExportRole, shopifyController.revokeApiKey);
+
 // ─── Webhooks ───────────────────────────────────────────────────────────────
 // HMAC-verified against the raw body (captured in app.js). No JWT — Shopify calls this.
 router.post('/webhooks', shopifyController.webhook);

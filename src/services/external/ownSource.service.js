@@ -30,6 +30,17 @@ const DEFAULT_SCHEDULE = {
     timezone: 'Europe/Ljubljana'
 };
 
+/**
+ * Per-feed AI categorization (§7.1). The FEED owns whether its products are categorized and
+ * against which category sets — it can maintain SEVERAL at once, and each Shopify source then
+ * picks which one supplies its tags. Off by default: categorization costs money per set, so it's
+ * always an explicit opt-in.
+ */
+const DEFAULT_AI_CATEGORIZATION = {
+    enabled: false,
+    exportIds: [] // category sets (`exports` _ids) this feed is categorized against
+};
+
 const REMOVAL_POLICIES = ['delist', 'zero_stock', 'keep'];
 const FREQUENCIES = ['every_hours', 'daily', 'weekly'];
 
@@ -128,7 +139,14 @@ function toPublic(doc) {
     const safeFeed = feed
         ? { url: feed.url, authHeaderName: feed.authHeaderName || null, hasAuthToken: !!feed.authTokenEnc }
         : null;
-    return { ...rest, _id: doc._id.toString(), feed: safeFeed };
+    return {
+        ...rest,
+        _id: doc._id.toString(),
+        feed: safeFeed,
+        // Feeds registered before per-feed categorization existed have no such field, and early
+        // ones stored a single `exportId` — normalize both so every caller reads one shape.
+        aiCategorization: readAiCategorization(doc.aiCategorization)
+    };
 }
 
 /** Normalizes + clamps a caller-supplied options patch to the allowed shape. */
@@ -139,6 +157,37 @@ function sanitizeOptions(input = {}) {
     if (Number.isFinite(input.maxStalenessHours) && input.maxStalenessHours > 0) out.maxStalenessHours = Math.floor(input.maxStalenessHours);
     if (typeof input.allowEmptyFeed === 'boolean') out.allowEmptyFeed = input.allowEmptyFeed;
     return out;
+}
+
+/**
+ * Reads the AI-categorization block off a raw doc, tolerating both the current shape and the
+ * original single-set one (`exportId`) that predates multi-set support.
+ */
+function readAiCategorization(raw) {
+    const ai = raw || {};
+    const ids = Array.isArray(ai.exportIds)
+        ? ai.exportIds
+        : (ai.exportId ? [ai.exportId] : []); // legacy single-set form
+    return {
+        enabled: !!ai.enabled && ids.length > 0,
+        exportIds: [...new Set(ids.filter((id) => typeof id === 'string' && id.trim()))]
+    };
+}
+
+/**
+ * Normalizes a caller-supplied AI-categorization patch. Enabling without naming any category set
+ * is meaningless, so that combination is stored as OFF rather than half-configured.
+ */
+function sanitizeAiCategorization(input = {}, existing) {
+    const merged = readAiCategorization(existing);
+    if ('exportIds' in input) {
+        merged.exportIds = Array.isArray(input.exportIds)
+            ? [...new Set(input.exportIds.filter((id) => typeof id === 'string' && id.trim()).map((id) => id.trim()))]
+            : [];
+    }
+    if (typeof input.enabled === 'boolean') merged.enabled = input.enabled;
+    if (!merged.exportIds.length) merged.enabled = false;
+    return { enabled: merged.enabled, exportIds: merged.exportIds };
 }
 
 /** Normalizes a caller-supplied schedule patch. */
@@ -158,7 +207,7 @@ function sanitizeSchedule(input = {}) {
  * `nextRunAt` from the schedule.
  * @returns {Promise<Object>} public-shaped feed
  */
-async function createSource({ ownerSub, ownerEmail, brand, url, authHeaderName, authToken, schedule, options }) {
+async function createSource({ ownerSub, ownerEmail, brand, url, authHeaderName, authToken, schedule, options, aiCategorization }) {
     const db = getDb();
     const now = new Date();
     const sched = { ...DEFAULT_SCHEDULE, ...sanitizeSchedule(schedule) };
@@ -178,6 +227,7 @@ async function createSource({ ownerSub, ownerEmail, brand, url, authHeaderName, 
         lockedUntil: null,
         runningBy: null,
         options: { ...DEFAULT_OPTIONS, ...sanitizeOptions(options) },
+        aiCategorization: sanitizeAiCategorization(aiCategorization),
         health: {
             lastFetchAt: null, lastValidatedAt: null, lastImportAt: null,
             lastResult: null, lastError: null,
@@ -201,6 +251,33 @@ async function listSourcesForUser(ownerSub) {
 async function getSourceByFeedId(feedId) {
     const db = getDb();
     return toPublic(await db.collection(COLLECTION_NAME).findOne({ feedId }));
+}
+
+/**
+ * Feeds that have AI categorization switched ON and include a given category set among the sets
+ * they maintain. This is what the Categories page uses to decide which feed products it lists:
+ * switch a feed off (or drop the set) and its products disappear from that set and stop being
+ * categorized against it; add it back and they return.
+ *
+ * @param {string} exportId
+ * @returns {Promise<string[]>} feedIds
+ */
+async function listFeedIdsForAiExport(exportId) {
+    const db = getDb();
+    const docs = await db.collection(COLLECTION_NAME)
+        .find(
+            {
+                'aiCategorization.enabled': true,
+                // `exportIds` is the current shape; `exportId` is the original single-set one.
+                $or: [
+                    { 'aiCategorization.exportIds': exportId },
+                    { 'aiCategorization.exportId': exportId }
+                ]
+            },
+            { projection: { feedId: 1 } }
+        )
+        .toArray();
+    return docs.map((d) => d.feedId);
 }
 
 /** Returns the RAW feed doc (incl. encrypted token) by feedId — internal use only. */
@@ -233,6 +310,11 @@ async function updateSource(feedId, patch = {}) {
         }
     }
     if (patch.options) Object.assign(set, prefix('options', sanitizeOptions(patch.options)));
+    // Written whole (not dotted): the two fields constrain each other — an empty set list must
+    // land as OFF, which a per-key patch couldn't guarantee.
+    if (patch.aiCategorization) {
+        set.aiCategorization = sanitizeAiCategorization(patch.aiCategorization, existing.aiCategorization);
+    }
     if (patch.schedule) {
         const merged = { ...existing.schedule, ...sanitizeSchedule(patch.schedule) };
         Object.assign(set, prefix('schedule', sanitizeSchedule(patch.schedule)));
@@ -349,6 +431,8 @@ async function ensureIndexes() {
         await db.collection(COLLECTION_NAME).createIndex({ feedId: 1 }, { unique: true });
         await db.collection(COLLECTION_NAME).createIndex({ ownerSub: 1 });
         await db.collection(COLLECTION_NAME).createIndex({ 'schedule.enabled': 1, nextRunAt: 1 });
+        // Backs the Categories page's "which feeds does this set cover" lookup (multikey).
+        await db.collection(COLLECTION_NAME).createIndex({ 'aiCategorization.exportIds': 1, 'aiCategorization.enabled': 1 });
 
         await db.collection('external_products').createIndex({ feedId: 1, externalId: 1 }, { unique: true });
         await db.collection('external_products').createIndex({ ownerSub: 1, feedId: 1 });
@@ -366,9 +450,11 @@ module.exports = {
     COLLECTION_NAME,
     DEFAULT_OPTIONS,
     DEFAULT_SCHEDULE,
+    DEFAULT_AI_CATEGORIZATION,
     computeNextRunAt,
     createSource,
     listSourcesForUser,
+    listFeedIdsForAiExport,
     getSourceByFeedId,
     getRawByFeedId,
     updateSource,

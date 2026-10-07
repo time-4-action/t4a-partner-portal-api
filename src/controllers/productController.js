@@ -51,7 +51,8 @@ exports.clearAiCategoriesForExport = async (req, res) => {
 
 exports.getAllProducts = async (req, res) => {
     try {
-        const data = await productService.getAllProducts({ publishedOnly: true });
+        // A valid x-api-key unlocks the full catalogue (incl. unpublished/inactive).
+        const data = await productService.getAllProducts({ publishedOnly: !req.hasFullAccess });
         res.json({ success: true, data });
     } catch (error) {
         res.status(500).json({ success: false, message: error.message });
@@ -61,7 +62,7 @@ exports.getAllProducts = async (req, res) => {
 exports.getProductByIdentifier = async (req, res) => {
     try {
         const { code } = req.params;
-        const product = await productService.getProductByIdentifier(code, { publishedOnly: true });
+        const product = await productService.getProductByIdentifier(code, { publishedOnly: !req.hasFullAccess });
         if (!product) {
             return res.status(404).json({ success: false, message: `Product with code ${code} not found.` });
         }
@@ -77,7 +78,9 @@ exports.searchProducts = async (req, res) => {
         if (!q || q.trim().length < 2) {
             return res.status(400).json({ success: false, message: 'Query param q must be at least 2 characters.' });
         }
-        const data = await productService.searchProducts(q.trim(), cat || null);
+        const data = await productService.searchProducts(q.trim(), cat || null, {
+            includeUnpublished: Boolean(req.hasFullAccess),
+        });
         res.json({ success: true, data });
     } catch (error) {
         res.status(500).json({ success: false, message: error.message });

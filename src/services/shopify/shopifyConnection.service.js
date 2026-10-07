@@ -1,6 +1,13 @@
+const crypto = require('crypto');
 const { getDb } = require('../db/mongo.service');
 const { ObjectId } = require('mongodb');
 const { encryptToken } = require('./crypto.service');
+const { normalizePriceFactor } = require('./priceFactor.util');
+const { normalizePriceRounding, DEFAULT_PRICE_ROUNDING } = require('./priceRounding.util');
+const {
+    normalizeCompareAtPricelist, normalizePriceFields, normalizeExistingSalePolicy,
+    DEFAULT_PRICE_FIELDS, DEFAULT_EXISTING_SALE_POLICY
+} = require('./comparePrice.util');
 
 /**
  * Data-access layer for the `shopify_connections` collection — one document per
@@ -30,19 +37,118 @@ function canPublish(conn) {
     return PUBLICATION_SCOPES.some((s) => granted.includes(s));
 }
 
+/** Longest accepted title prefix — a Shopify title caps at 255, so leave room for the title. */
+const TITLE_PREFIX_MAX = 40;
+
+/**
+ * Cleans a title prefix for storage: a trimmed, length-capped string ('' = no prefix). The sync
+ * engine joins it to the title with a single space, so storing it trimmed keeps what's saved
+ * identical to what the partner sees previewed.
+ */
+function normalizeTitlePrefix(value) {
+    if (typeof value !== 'string') return '';
+    return value.trim().slice(0, TITLE_PREFIX_MAX);
+}
+
+/**
+ * Scope identity (the Sources API, `../../../docs/sources-api.md`).
+ *
+ * A scope used to be identified only by what it is — `(type, exportConfigId|feedId, locationId)`
+ * — which is fine for the portal UI (it always saves the whole array) but not for an external
+ * client that addresses one source over time. Every scope now carries a stable random `id`, an
+ * optional `name` and an `enabled` flag. The portal UI re-saves scopes with a whitelist that
+ * pre-dates these keys, so {@link reconcileScopeIdentity} carries them across a save that dropped
+ * them, matching the incoming scope to the stored one by what it is.
+ */
+function newScopeId() {
+    return `sc_${crypto.randomBytes(6).toString('hex')}`;
+}
+
+/** The identity part of a scope: what it pushes and where. */
+function scopeSourceKey(s) {
+    return `${s.type || 'export_config'}:${s.type === 'own_source' ? s.feedId : s.exportConfigId}`;
+}
+
+/**
+ * Gives every incoming scope an `id`, `enabled` and `name`, carried over from the stored scopes
+ * when the caller did not send them (a save from a UI that does not know the keys), assigned
+ * fresh when the scope is new. Matching is by source + location first, then by source alone when
+ * that is unambiguous (a partner moving a source to another location keeps its identity).
+ */
+function reconcileScopeIdentity(existingScopes, incomingScopes) {
+    const existing = Array.isArray(existingScopes) ? existingScopes.filter(Boolean) : [];
+    const taken = new Set();
+    const claim = (match) => {
+        if (!match || taken.has(match.id)) return null;
+        taken.add(match.id);
+        return match;
+    };
+    return incomingScopes.map((s) => {
+        if (!s) return s;
+        let match = null;
+        if (s.id) match = claim(existing.find((e) => e.id === s.id));
+        if (!match) {
+            match = claim(existing.find((e) => e.id && scopeSourceKey(e) === scopeSourceKey(s) && (e.locationId || null) === (s.locationId || null)));
+        }
+        if (!match) {
+            const sameSource = existing.filter((e) => e.id && !taken.has(e.id) && scopeSourceKey(e) === scopeSourceKey(s));
+            if (sameSource.length === 1) match = claim(sameSource[0]);
+        }
+        const out = { ...s };
+        out.id = s.id || match?.id || newScopeId();
+        out.enabled = typeof s.enabled === 'boolean' ? s.enabled : (typeof match?.enabled === 'boolean' ? match.enabled : true);
+        const name = typeof s.name === 'string' ? s.name.trim() : (match?.name || '');
+        if (name) out.name = name.slice(0, 80); else delete out.name;
+        return out;
+    });
+}
+
+/**
+ * Stamps ids onto a connection's stored scopes that pre-date scope identity, persisting them so
+ * the id an external client sees is the one it sees next time. Returns the public connection.
+ */
+async function ensureScopeIds(connection) {
+    const scopes = connection?.config?.scopes;
+    if (!Array.isArray(scopes) || scopes.every((s) => !s || s.id)) return connection;
+    const stamped = scopes.map((s) => (s && !s.id ? { ...s, id: newScopeId(), enabled: s.enabled !== false } : s));
+    await getDb().collection(COLLECTION_NAME).updateOne(
+        { _id: new ObjectId(connection._id) },
+        { $set: { 'config.scopes': stamped, updatedAt: new Date() } }
+    );
+    return { ...connection, config: { ...connection.config, scopes: stamped } };
+}
+
 /** Default per-connection sync config — safe defaults: stock-only, no image push. */
 const DEFAULT_CONFIG = {
     exportConfigId: null,
     pricelistPriority: [],
     priceVatMode: 'inclusive', // 'inclusive' | 'exclusive'
+    // Multiplier applied to every pushed price (currency conversion / uplift). 1 = unchanged.
+    priceFactor: 1,
+    // Shelf-price rounding applied AFTER the factor (e.g. "always end in 9"). Off by default.
+    priceRounding: { ...DEFAULT_PRICE_ROUNDING },
     futureDatedGuard: true,
+    // Pricelist whose price is pushed as Shopify `compareAtPrice` (the struck-through "was"
+    // price). null = off: `compareAtPrice` is never sent and the payload is exactly the old one.
+    compareAtPricelist: null,
+    // With a compare-at list: which of `price` / `compareAtPrice` the portal maintains.
+    priceFields: DEFAULT_PRICE_FIELDS, // 'price_and_compare_at' | 'price_only' | 'compare_at_only'
+    // What to do with a variant the merchant has put on sale in Shopify themselves (live
+    // compare-at the portal did not set). 'overwrite' = today's behaviour, portal wins.
+    existingSalePolicy: DEFAULT_EXISTING_SALE_POLICY, // 'overwrite' | 'leave' | 'price_only' | 'compare_at_only'
     syncStock: true,
     syncNewProducts: false,
     syncPrices: false,
     syncDescriptions: false,
+    // Tags have their own toggle but default ON (they used to ride along with descriptions).
+    syncTags: true,
     syncImages: false,
     ownership: 'stock_only', // 'stock_only' | 'portal_authoritative' | 'create_then_handoff'
-    publicationIds: [] // sales channels (publications) to publish created products to
+    publicationIds: [], // sales channels (publications) to publish created products to
+    titlePrefix: '', // prepended to every pushed product title, per source (e.g. "WINDSURF -")
+    // New products are created as drafts tagged `awaiting-review` for a person to approve in the
+    // client (Recharge Hub) instead of going live (docs/sources-api.md § Review before publish).
+    reviewNewProducts: false
 };
 
 /**
@@ -510,12 +616,22 @@ async function updateConnectionConfig(id, patch) {
     const collection = db.collection(COLLECTION_NAME);
 
     const allowed = [
-        'exportConfigId', 'pricelistPriority', 'priceVatMode', 'futureDatedGuard',
-        'syncStock', 'syncNewProducts', 'syncPrices', 'syncDescriptions', 'syncImages', 'ownership',
+        'exportConfigId', 'pricelistPriority', 'priceVatMode', 'priceFactor', 'priceRounding', 'futureDatedGuard',
+        // Compare-at price source + which price fields the portal owns + merchant-sale policy.
+        'compareAtPricelist', 'priceFields', 'existingSalePolicy',
+        // `syncTags` is its own toggle (tags used to ride along with `syncDescriptions`); it must
+        // be writable at the connection level too, or a source that doesn't set its own falls back
+        // to the default-ON instead of what the partner chose.
+        'syncStock', 'syncNewProducts', 'syncPrices', 'syncDescriptions', 'syncTags', 'syncImages', 'ownership',
         'publicationIds',
         // Shopify Option1 name for variants of newly-created products (e.g. "Size", "Volume").
         // Per-source override lives on the scope; this is the connection-level fallback.
         'variantOptionName',
+        // Text prepended to every pushed product TITLE for a source (e.g. "WINDSURF -").
+        // Per-source value lives on the scope; this is the connection-level fallback.
+        'titlePrefix',
+        // Hold new products as drafts for review (per-source value lives on the scope).
+        'reviewNewProducts',
         // `scope` selects WHAT this connection pushes: { type:'export_config', exportConfigId }
         // (default/back-compat) or { type:'own_source', feedId } (an external brand feed).
         'scope',
@@ -527,6 +643,37 @@ async function updateConnectionConfig(id, patch) {
     if (patch.config) {
         for (const key of allowed) {
             if (key in patch.config) set[`config.${key}`] = patch.config[key];
+        }
+        // The price multiplier is stored already-clean (positive, ≤ 6 dp) at BOTH levels, so the
+        // sync engine and every read of the config see the same number the partner will be shown.
+        if ('config.priceFactor' in set) set['config.priceFactor'] = normalizePriceFactor(set['config.priceFactor']);
+        // Same for the rounding rule — stored complete and key-ordered, so the engine, the portal's
+        // unsaved-changes check and a hand-read of the document all see the identical object.
+        if ('config.priceRounding' in set) set['config.priceRounding'] = normalizePriceRounding(set['config.priceRounding']);
+        // Same for the title prefix: stored trimmed + length-capped at both levels, so the pushed
+        // title is exactly what the partner was shown and can't carry invisible whitespace.
+        if ('config.titlePrefix' in set) set['config.titlePrefix'] = normalizeTitlePrefix(set['config.titlePrefix']);
+        // Compare-at settings: stored as the exact enum / trimmed name the engine will read, so a
+        // junk value can't sit in the document and be interpreted differently by each reader.
+        if ('config.compareAtPricelist' in set) set['config.compareAtPricelist'] = normalizeCompareAtPricelist(set['config.compareAtPricelist']);
+        if ('config.priceFields' in set) set['config.priceFields'] = normalizePriceFields(set['config.priceFields']);
+        if ('config.existingSalePolicy' in set) set['config.existingSalePolicy'] = normalizeExistingSalePolicy(set['config.existingSalePolicy']);
+        if (Array.isArray(set['config.scopes'])) {
+            // Identity first, so a save from a client that does not know `id`/`enabled`/`name`
+            // cannot strip them from a source an external client is addressing.
+            const current = await collection.findOne({ _id: new ObjectId(id) }, { projection: { 'config.scopes': 1 } });
+            set['config.scopes'] = reconcileScopeIdentity(current?.config?.scopes, set['config.scopes']);
+            set['config.scopes'] = set['config.scopes'].map((s) => {
+                if (!s) return s;
+                const out = { ...s };
+                if ('priceFactor' in s) out.priceFactor = normalizePriceFactor(s.priceFactor);
+                if ('priceRounding' in s) out.priceRounding = normalizePriceRounding(s.priceRounding);
+                if ('titlePrefix' in s) out.titlePrefix = normalizeTitlePrefix(s.titlePrefix);
+                if ('compareAtPricelist' in s) out.compareAtPricelist = normalizeCompareAtPricelist(s.compareAtPricelist);
+                if ('priceFields' in s) out.priceFields = normalizePriceFields(s.priceFields);
+                if ('existingSalePolicy' in s) out.existingSalePolicy = normalizeExistingSalePolicy(s.existingSalePolicy);
+                return out;
+            });
         }
     }
     if ('shopifyLocationId' in patch) set.shopifyLocationId = patch.shopifyLocationId;
@@ -697,6 +844,9 @@ module.exports = {
     DEFAULT_SCOPES,
     DEFAULT_CONFIG,
     canPublish,
+    newScopeId,
+    reconcileScopeIdentity,
+    ensureScopeIds,
     upsertConnection,
     upsertCustomAppConnection,
     upsertCustomOAuthConnection,

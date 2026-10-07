@@ -44,6 +44,8 @@ Internal admin surface (bearer-gated by `internalAdminToken` / `PARTNER_ADMIN_TO
 | `/api/admin/partners` | `src/routes/adminPartnersRoutes.js` — per-partner insight |
 | `/api/admin/system` | `src/routes/adminSystemRoutes.js` — scheduler status + manual triggers (`GET /sync`, `POST /sync/pnv/run` full pipeline, `POST /sync/own-sources/:feedId/run`). Backed by `pnvScheduler.getStatus()` / `runManualRefresh()`. |
 
+The **Sources API** (`/api/v1`, `src/routes/sourcesApiRoutes.js`, design `docs/sources-api.md`) is a versioned machine contract for another product (Recharge Hub) to configure and run ONE connected store's Shopify sources. Bearer-gated by a per-connection API key (`sourcesApiAuth.js`) bound to the store's domain; not JWT. It is a translation over `shopify_connections.config.scopes[]` and `shopify_sync_jobs` (`sourcesApi.service.js`) — scopes carry a stable `id`/`name`/`enabled` for it, and a run can target specific scope ids. Smoke test: `scripts/sources-api-smoke.js`.
+
 ### Authentication
 
 Two middleware options are available:
@@ -51,6 +53,7 @@ Two middleware options are available:
 - **`src/middleware/auth0.js`** — Auth0 JWT bearer (`express-oauth2-jwt-bearer`). Currently commented out in `src/routes/export/index.js`.
 - **`src/middleware/dualAuth.js`** — Tries JWT first (`Authorization: Bearer`), falls back to API key (`X-Api-Key` header or `api_key` body field). Sets `req.authContext` on success.
 - **`src/middleware/webhookApiKey.js`** — Simple static key check for webhook endpoints (`x-api-key` header vs `WEBHOOK_API_KEY` env var).
+- **`src/middleware/sourcesApiAuth.js`** — Bearer key for `/api/v1` (`Authorization: Bearer sk_t4a_…` + `X-Shop-Domain`), resolved against `shopify_connections.apiKeys[]` by `connectionApiKey.service.js`. 401 unknown key, 403 wrong shop, 409 store not active.
 
 ### PNV sync pipeline
 
@@ -65,6 +68,23 @@ Triggered by `POST /api/export/webhooks/sync/pnv`. Responds `202` immediately an
 ### AI categorization
 
 Triggered by `POST /api/export/webhooks/sync/ai-categorization`. Uses Anthropic Claude (`@anthropic-ai/sdk`, model `claude-haiku-4-5`, structured outputs) to assign categories to uncategorized products. Categories are stored as an `ai_categories` array on each product document, keyed by `exportId`.
+
+It runs over **two catalogues**:
+
+- **Patrik (`products`)** — `identifyProductCategories(exportId)`. Gated by the export's `aiCategorizationEnabled` flag; run by the PNV scheduler. Categorizes every product with no entry for the set.
+- **Own Source feeds (`external_products`)** — `identifyFeedProductCategories(feedId, exportId)`. Configured **per feed**, on the feed itself: `own_sources.aiCategorization = { enabled, exportIds[] }`. A feed can maintain **several** category sets at once; `executeRun` categorizes every one of them right before reading the feed's products, so every trigger (manual sync, post-import push, PNV fan-out) gets fresh categories. **Incremental** — a row is re-sent only when it has no entry for that set or its `contentHash` changed since the entry was written, so re-importing an unchanged feed makes no AI call. An entry with `manual: true` (a partner's override from the Categories page) is never re-categorized. Feed rows are sent as a compact view (name, vendor, supplier type/tags, de-HTML'd description, variant codes/sizes) rather than the whole document.
+
+A categorization failure (empty category set, bad API key, provider outage) **never aborts the sync** — stock and prices still go out and tags fall back to the feed's own — but `ensureFeedCategorized` returns an `error` that `executeRun` records on the run's `errors[]`. Don't make it silent again: a swallowed failure is indistinguishable from "the sync worked but my tags never updated".
+
+**Who decides what:** the feed decides *which sets exist*; the Shopify scope's `aiExportId` decides *which one of them supplies that store's tags*. If the scope names a set the feed no longer maintains (or names none), the engine falls back to the feed's first set — a store can never tag from a set the feed isn't categorizing.
+
+A feed appears on `/categories` under each set it maintains (`ownSource.listFeedIdsForAiExport`); switching the feed off, or dropping a set, removes its products from that list and stops categorization, but keeps the stored categories so re-enabling costs nothing.
+
+Run progress lives in `ai_categorization_runs`, keyed by `exportId` for the catalogue and `<exportId>:<feedId>` for a feed. **The `exportId` field on that doc IS the key** — a progress patch must never set it (feed runs carry the plain set id as `setId`).
+
+Tags: `resolveTagsArray` gives a categorized product its **AI categories alone** — they replace whatever taxonomy the source shipped (PNV's `categories` for Patrik, the supplier's `tags` + expanded `categoryPaths` for a feed), so a store carries one taxonomy rather than two merged. A product with no category for the selected set falls back to its source's own tags rather than being stripped bare.
+
+**Whether tags reach products already in the store is decided by the ownership mode, not by categorization** (`shopifySync.service.js:456`): `portal_authoritative` maintains them every sync; `create_then_handoff` sets them only at creation (`pricesOnly` forces `wantTags = false`); `stock_only` never touches content at all. `syncTags: false` also stops maintenance. The Shopify source panel warns about all three next to the category picker — if "tags aren't updating", check the mode before suspecting the categorizer.
 
 ### Custom exports (`src/services/customExport.service.js`)
 
@@ -81,6 +101,8 @@ The **inventory preset** uses a dedicated code path (`generateInventoryRows()`) 
 | Collection | Purpose |
 |---|---|
 | `products` | Synced PNV products with Metakocka enrichment and AI categories |
+| `external_products` | Own Source feed catalogues (internal product shape); carries `ai_categories` when a Shopify source enables categorization |
+| `ai_categorization_runs` | Latest AI run per key (`exportId`, or `<exportId>:<feedId>` for a feed) |
 | `exports` | Export definitions (name, AI categorization enabled, roles/users) |
 | `export_configs` | Custom export configurations (fields, filters, presets) |
 | `analytics` | Function performance and API request logs |
@@ -91,22 +113,16 @@ The **inventory preset** uses a dedicated code path (`generateInventoryRows()`) 
 
 A product is a **parent** with an optional `child_products` array of **variants**. Variants are normally the sellable SKUs; the parent groups them.
 
-- **Parent:** `code`, `token` (handle), `product_name`, `short_description`/`detailed_description` (HTML), `images[]`, `categories[]` (PNV path), `ai_categories[]`, `published`, `active`, `archived`, `stock_amount` (often `0` — variants carry stock), `pricelist[]` (often empty — variants carry pricing), `ean_code`, `size`.
+- **Parent:** `code`, `token` (handle), `product_name`, `short_description`/`detailed_description` (HTML), `images[]`, `additional_content[]` (raw HTML blocks from PNV "Dodatna vsebina N" — spec tables, text, links; empty slots dropped), `categories[]` (PNV path), `ai_categories[]`, `published`, `active`, `archived`, `stock_amount` (often `0` — variants carry stock), `pricelist[]` (often empty — variants carry pricing), `ean_code`, `size`.
 - **Variant (`child_products[]`):** `code` (**SKU**), `ean_code` (**barcode**), `token`, `product_name`, `size` (variant option, e.g. `"77"`), `stock_amount`, `images[]`, per-variant flags (`published`, `archived`, `cart`, `new`, `recomended`), and `pricelist[]`.
-- **`pricelist[]`:** array of `{ name, valid_from, price, vat }` — e.g. `RRP 2025` (`vat: 22`) and a future-dated `RRP 2026` (`vat: 0`). No single price field; resolve via `getPriceFromPriority(variant, pricelistPriority)` in `customExport.service.js`. VAT and `valid_from` vary per list.
+- **`pricelist[]`:** array of `{ name, valid_from, price, vat }` — e.g. `RRP 2025` (`vat: 22`) and a future-dated `RRP 2026` (`vat: 0`). No single price field; resolve via `getPriceFromPriority(variant, pricelistPriority)` in `customExport.service.js`. VAT and `valid_from` vary per list. The Shopify push resolves the sell price that way and, optionally, a compare-at ("was") price from ONE named list (`compareAtPricelist` → `resolvePushCompareAt` in `shopifySync.service.js`); see `../shopify_integration_progress.md` §9 for the fields/sale-policy semantics.
 - **`ai_categories[]`:** `{ exportId, categoryId, categoryName }` — categorization is per export, keyed by `exportId`.
 - **Publishing:** parents and variants each have a `published` flag; a published parent may contain unpublished variants. Exports are **always published-only** — `applyFilters` drops unpublished parents and narrows `child_products` to published variants.
 - **No-variant products:** if `child_products` is empty, the parent is the sellable item (use its own `code`/`pricelist`/`stock_amount`).
 
-### Planned: Shopify integration (not yet started on the backend)
+### Shopify integration (built — see `../shopify_integration_progress.md`)
 
-A full design for letting partners connect their own Shopify store and receive an automated one-way product push lives in `shopify_integration.md` at this repo's root. **No backend code exists for it yet** — the partner-facing UI has been built in the `t4a-partner-portal-ui` repo against mock data, but none of the API pieces below are implemented:
-
-- New endpoints under `/api/export/shopify/*` — OAuth `connect`/`callback`, `status`, per-connection `config`, `sync`, `disconnect`, and HMAC-verified Shopify webhooks (design §10).
-- New Mongo collections `shopify_connections`, `shopify_product_map`, `shopify_sync_jobs` (design §6).
-- A rate-limited per-shop sync engine that turns the parent/`child_products` shape into Shopify Admin API calls, reusing `getPriceFromPriority` for price resolution and the existing published-only narrowing (design §8).
-
-When picking this up, start from `shopify_integration.md` — its §0 status checklist tracks what's done, and §11 lists open questions (pricing/VAT handling, ownership default, secrets location) to settle before coding.
+Partners connect their own Shopify store and receive an automated one-way product push. Everything under `src/services/shopify/` + `src/controllers/shopifyController.js` is live: OAuth connect/callback, per-connection config (per-source `scopes[]`), the rate-limited per-shop sync engine (`shopifySync.service.js` — match → create → stock → price/content → images/publish), and the `shopify_connections` / `shopify_product_map` / `shopify_sync_jobs` collections. The design is `shopify_integration.md` (repo root); **the accurate status doc is `../shopify_integration_progress.md`** — its numbered sections (price factor §6, multi-location §7, rounding §8, compare-at + sale policy §9) record the decisions behind each pricing setting. Start there before touching pricing or ownership behaviour.
 
 ## Environment variables
 

@@ -12,6 +12,9 @@ module.exports = {
         { csvHeader: 'Podroben opis', jsonKey: 'detailed_description' },
         { csvHeader: 'Kategorije', jsonKey: 'categories', transform: splitStringByBackslash },
         { jsonKey: 'images', csvHeaders: ['Prikazna slika', 'Dodatna fotografija 1', 'Dodatna fotografija 2', 'Dodatna fotografija 3', 'Dodatna fotografija 4', 'Dodatna fotografija 5', 'Dodatna fotografija 6', 'Dodatna fotografija 7', 'Dodatna fotografija 8'] },
+        // Raw HTML content blocks (spec tables, text, links). PNV currently exports 8 slots,
+        // but the pattern picks up however many "Dodatna vsebina N" columns the CSV contains.
+        { jsonKey: 'additional_content', csvHeaderPattern: /^Dodatna vsebina (\d+)$/ },
         { csvHeader: 'Objavljeno', jsonKey: 'published', transform: transformToBoolean },
         { csvHeader: 'Arhivirano', jsonKey: 'archived', transform: transformToBoolean },
         { csvHeader: 'Košarica', jsonKey: 'cart', transform: transformToBoolean },

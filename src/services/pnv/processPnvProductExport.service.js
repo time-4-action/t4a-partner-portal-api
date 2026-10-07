@@ -59,10 +59,31 @@ const parseProductsCsv = () => {
 };
 
 /**
+ * Resolves the CSV headers that match a numbered-column pattern (e.g. /^Dodatna vsebina (\d+)$/),
+ * ordered by the captured number. Lets a mapping absorb however many "Foo 1", "Foo 2", ... columns
+ * the export happens to contain instead of hard-coding a fixed list.
+ *
+ * @function resolvePatternHeaders
+ * @param {Object} product - A raw CSV row (keys are headers).
+ * @param {RegExp} pattern - Pattern with a single numeric capture group used for ordering.
+ * @returns {string[]} Matching header names, sorted ascending by the captured number.
+ */
+const resolvePatternHeaders = (product, pattern) => {
+    return Object.keys(product)
+        .map(header => {
+            const match = header.match(pattern);
+            return match ? { header, index: Number(match[1]) } : null;
+        })
+        .filter(Boolean)
+        .sort((a, b) => a.index - b.index)
+        .map(({ header }) => header);
+};
+
+/**
  * Transforms a single raw product object from the CSV into a structured JSON object, enriching it with external data.
  *
  * This function performs several key operations:
- * 1.  Applies the declarative `columnMapping` to transform CSV columns to JSON keys. It supports direct mapping, array mapping (multiple columns to one array), and custom transform functions.
+ * 1.  Applies the declarative `columnMapping` to transform CSV columns to JSON keys. It supports direct mapping, array mapping (multiple columns to one array, listed explicitly or matched by a numbered header pattern), and custom transform functions.
  * 2.  Enriches the product data by fetching its stock amount from the Metakocka warehouse service.
  * 3.  Enriches the product data further by fetching its pricelist from the Metakocka price service.
  *
@@ -90,8 +111,11 @@ const mapProduct = async (product, columnMapping, warehouseStock) => {
             }
         }
         // Case 2: Mapping multiple CSV headers (e.g., 'Image1', 'Image2') into a single array under one JSON key.
-        else if (mapping.csvHeaders) {
-            const { csvHeaders, jsonKey, transform } = mapping;
+        // Headers are either listed explicitly (`csvHeaders`) or discovered from the row by a numbered
+        // pattern (`csvHeaderPattern`), so the column count can grow without a config change.
+        else if (mapping.csvHeaders || mapping.csvHeaderPattern) {
+            const { jsonKey, transform } = mapping;
+            const csvHeaders = mapping.csvHeaders || resolvePatternHeaders(product, mapping.csvHeaderPattern);
             const values = csvHeaders
                 .map(header => product[header])
                 .filter(value => value !== undefined && value !== ''); // Filter out empty or undefined image links
@@ -246,4 +270,4 @@ const processPnvProductExport = async (columnMapping = productMapping) => {
     }
 };
 
-module.exports = { processPnvProductExport };
+module.exports = { processPnvProductExport, resolvePatternHeaders };
