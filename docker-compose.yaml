@@ -1,0 +1,11 @@
+# Local build. The server copy is deploy/docker-compose.yaml (see docs/deployment.md).
+services:
+  t4a-partner-portal-api:
+    build: .
+    image: ghcr.io/time-4-action/t4a-partner-portal-api:latest
+    ports:
+      - "3001:3000"
+    env_file:
+      - .env
+    volumes:
+      - ./data:/data

@@ -139,13 +139,10 @@ docker run -d \
   patrik-export-api
 ```
 
-Or use the included build script:
+Production images are built and deployed by GitHub Actions on every push to `main`
+(`ghcr.io/time-4-action/t4a-partner-portal-api`).
 
-```bash
-./scripts/build-and-push.sh
-```
-
-> See [Deployment Guide](docs/deployment.md) for full Docker and production setup instructions.
+> See [Deployment Guide](docs/deployment.md#cicd) for the CI/CD pipeline and server setup.
 
 ## Documentation
 
@@ -183,7 +180,7 @@ patrik-products-automation/
 │       └── pnv/              # PNV sync & CSV processing
 ├── docs/                     # Documentation
 │   └── api/                  # API reference docs
-├── scripts/                  # Build & deploy scripts
+├── scripts/                  # Diagnostic & smoke-test scripts
 ├── public/                   # Static assets
 └── data/                     # Runtime data files (CSV, XML)
 ```
