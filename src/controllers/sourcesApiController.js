@@ -107,3 +107,25 @@ exports.getRun = async (req, res) => {
         handleError(res, error);
     }
 };
+
+/*
+ * AI autofill (`docs/sources-api-ai.md`): the portal's categorizer and attribute reader, run
+ * against the caller's own model of its catalogue. Stateless; nothing is written to the store.
+ */
+const productAutofill = require('../services/ai/productAutofill.service');
+
+exports.categorize = async (req, res) => {
+    try {
+        res.json(await productAutofill.categorize(tenant(req), req.body || {}));
+    } catch (error) {
+        handleError(res, error);
+    }
+};
+
+exports.extractAttributes = async (req, res) => {
+    try {
+        res.json(await productAutofill.extractAttributes(tenant(req), req.body || {}));
+    } catch (error) {
+        handleError(res, error);
+    }
+};
