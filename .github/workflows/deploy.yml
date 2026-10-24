@@ -41,10 +41,15 @@ jobs:
           cache: npm
 
       - run: npm ci --no-audit --no-fund
-      # There is no test suite yet; this at least fails a pull request that
-      # does not parse instead of the deploy that would crash-loop on it.
+      # The syntax check covers every file, including ones no test loads, so a
+      # pull request that does not parse fails here instead of crash-looping
+      # the deploy. The unit tests (node:test, test/) are offline: no MongoDB,
+      # MetaKocka, PNV, Shopify or Anthropic.
       - name: Syntax check
         run: find index.js src -name '*.js' -exec node --check {} +
+
+      - name: Unit tests
+        run: npm test
 
   deploy:
     needs: check
