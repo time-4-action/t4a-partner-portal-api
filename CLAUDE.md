@@ -8,9 +8,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 npm run dev       # Start with NODE_ENV=development (loads .env then .env.development)
 npm start         # Start with NODE_ENV=production
 npm run docs      # Generate README.md from JSDoc comments
+npm test          # Unit tests (node:test, test/**/*.test.js) — offline, no DB or env needed
+node --test test/feedValidator.test.js   # one file
 ```
 
-No test suite exists (`npm test` just exits with an error).
+Tests use Node's built-in `node:test` runner (no framework dependency) and cover the pure logic: MetaKocka stock math (`warehouse.service.js` → `accumulateStockRows`), the Shopify pricing utils, title patterns, SKU matching (GraphQL stubbed), the sync engine's pure helpers, the feed validator and the schema route. They must stay offline — never call MetaKocka, PNV, Shopify or Anthropic; stub the module instead (see `test/shopifyMatch.test.js`). A module that drags in `mongo.service` / the AI service needs dummy `MONGO_URI`/`MONGO_DB_NAME`/`ANTHROPIC_API_KEY` set before it is required (see `test/shopifySync.test.js`). CI runs `npm test` after the syntax check.
 
 ## Architecture
 
@@ -31,6 +33,7 @@ All routes are under `/api/export`:
 |---|---|
 | `/api/export/healthz` | inline in `src/app.js` — bare liveness probe for the CI deploy (no auth, no logging, no DB) |
 | `/api/export/health` | `src/routes/healthRoutes.js` — public, no auth |
+| `/api/export/schemas/own-source.v1.json` | `src/routes/schemaRoutes.js` — public, no auth, no DB. Serves `src/services/external/schema/own-source.v1.json` verbatim (`application/schema+json`, cacheable, ETag). The single source of truth for the Own Source feed format; recharge-partners-integration-api vendors a copy and compares against it, so a schema change is a contract change. |
 | `/api/export/product` | `src/routes/productRoutes.js` |
 | `/api/export/exports` | `src/routes/exportsRoutes.js` |
 | `/api/export/categories` | `src/routes/categoriesRoutes.js` |

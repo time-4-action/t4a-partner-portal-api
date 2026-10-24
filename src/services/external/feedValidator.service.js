@@ -40,14 +40,17 @@ function issue(path, message, value) {
  * pointer points at the offending key, not its parent.
  */
 function ajvErrorToIssue(err) {
-    let pointer = err.instancePath || '/';
+    // `instancePath` is '' at the root, so append to it (not to the '/' fallback) or a root-level
+    // key would come out as '//extra'.
+    const base = err.instancePath || '';
+    let pointer = base || '/';
     let message = err.message || 'is invalid';
     if (err.keyword === 'additionalProperties') {
         const extra = err.params.additionalProperty;
-        pointer = `${pointer}/${extra}`;
+        pointer = `${base}/${extra}`;
         message = `unexpected property "${extra}" — the feed contract is closed (remove it)`;
     } else if (err.keyword === 'required') {
-        pointer = `${pointer}/${err.params.missingProperty}`;
+        pointer = `${base}/${err.params.missingProperty}`;
         message = `missing required property "${err.params.missingProperty}"`;
     } else if (err.keyword === 'enum') {
         message = `${message} (${(err.params.allowedValues || []).map((v) => JSON.stringify(v)).join(', ')})`;

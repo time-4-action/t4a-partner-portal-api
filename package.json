@@ -2,20 +2,23 @@
   "name": "export-api",
   "version": "1.0.0",
   "description": "",
-  "homepage": "https://github.com/etiam-si/patrik-products-automation#readme",
+  "homepage": "https://github.com/time-4-action/t4a-partner-portal-api#readme",
   "bugs": {
-    "url": "https://github.com/etiam-si/patrik-products-automation/issues"
+    "url": "https://github.com/time-4-action/t4a-partner-portal-api/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/etiam-si/patrik-products-automation.git"
+    "url": "git+https://github.com/time-4-action/t4a-partner-portal-api.git"
   },
   "license": "ISC",
   "author": "",
   "type": "commonjs",
   "main": "index.js",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "node --test \"test/**/*.test.js\"",
     "start": "cross-env NODE_ENV=production node index.js",
     "dev": "cross-env NODE_ENV=development node index.js",
     "docs": "jsdoc2md src/**/*.js > README.md"

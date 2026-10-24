@@ -27,6 +27,7 @@ strategy the endpoints below reference.
 | [API Keys & Access](api/api-keys-and-access.md) | `/api/export/custom-export/:id` | Per-export API keys & access grants |
 | [Shopify Integration](api/shopify.md) | `/api/export/shopify` | Store OAuth, connections, sync |
 | [Own Sources](api/own-sources.md) | `/api/export/external` | External supplier feed ingest |
+| [Own Source feed schema](api/own-sources.md#the-feed-contract) | `/api/export/schemas/own-source.v1.json` | Public JSON Schema of the feed format |
 | [Recharge XML Feed](api/recharge.md) | `/api/export/recharge` | Fixed-format XML product feed |
 | [Webhooks](api/webhooks.md) | `/api/export/webhooks` | PNV sync, AI categorization, Shopify/external triggers |
 | [AI Categorization](api/ai-categorization.md) | `/api/export/webhooks/categorize` | Synchronous categorization for integrations |

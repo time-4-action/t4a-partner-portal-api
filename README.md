@@ -69,8 +69,8 @@ This API serves as the backbone of the Patrik product management pipeline. It co
 ### Installation
 
 ```bash
-git clone https://github.com/etiam-si/patrik-products-automation.git
-cd patrik-products-automation
+git clone git@github.com:time-4-action/t4a-partner-portal-api.git
+cd t4a-partner-portal-api
 npm install
 ```
 
@@ -159,7 +159,7 @@ Production images are built and deployed by GitHub Actions on every push to `mai
 ## Project Structure
 
 ```
-patrik-products-automation/
+t4a-partner-portal-api/
 ├── index.js                  # Entry point & server startup
 ├── src/
 │   ├── app.js                # Express app setup & route mounting
