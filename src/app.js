@@ -26,11 +26,14 @@ app.set('trust proxy', true);
 app.use(express.static(path.join(__dirname, '..', 'public')));
 
 const healthRoutes = require('./routes/healthRoutes');
+const schemaRoutes = require('./routes/schemaRoutes');
 const productRoutes = require('./routes/productRoutes');
 const internalAdminToken = require('./middleware/internalAdminToken');
 const adminPartnersRoutes = require('./routes/adminPartnersRoutes');
 const adminSystemRoutes = require('./routes/adminSystemRoutes');
 app.use('/api/export/health', healthRoutes);
+// The Own Source feed JSON Schema, public — the single source of truth for the feed format.
+app.use('/api/export/schemas', schemaRoutes);
 app.use('/api/product', productRoutes);
 app.use('/api/export', exportRoutes);
 

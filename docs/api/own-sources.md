@@ -30,6 +30,18 @@ Feeds must serve JSON matching the fixed **`own-source.v1`** schema
 is the label and the generated `feedId` is the scope key. Validate a feed before
 (or after) saving with the `test` endpoints.
 
+The schema is published, unauthenticated, at:
+
+```http
+GET /api/export/schemas/own-source.v1.json
+```
+
+It returns `src/services/external/schema/own-source.v1.json` byte for byte — the
+same file the validator compiles — as `application/schema+json`, with
+`Cache-Control: public, max-age=3600` and an ETag (`If-None-Match` → `304`).
+This is the single source of truth for the feed format: other repos (e.g.
+recharge-partners-integration-api) vendor a copy and compare against it.
+
 ### Public feed object
 
 ```jsonc

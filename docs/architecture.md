@@ -102,6 +102,7 @@ admin surface lives under `/api/admin`.
 | Route prefix | File | Auth | Docs |
 |--------------|------|------|------|
 | `/api/export/health` | `src/routes/healthRoutes.js` | Public | [health](api/health.md) |
+| `/api/export/schemas` | `src/routes/schemaRoutes.js` | Public | [own-sources](api/own-sources.md#the-feed-contract) |
 | `/api/product`, `/api/export/product` | `src/routes/productRoutes.js` | Optional webhook key (full catalogue) | [products](api/products.md) |
 | `/api/export/exports` | `src/routes/exportsRoutes.js` | — | [exports](api/exports.md) |
 | `/api/export/categories` | `src/routes/categoriesRoutes.js` | — | [categories](api/categories.md) |
