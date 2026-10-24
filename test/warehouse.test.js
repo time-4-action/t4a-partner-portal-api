@@ -55,6 +55,16 @@ test('accumulateStockRows skips code-less rows and keeps summing across pages', 
     assert.equal(map.get('A').free, 3);
 });
 
+test('accumulateStockRows drops rows for another warehouse (wh_id_list is not proven to filter)', () => {
+    const map = accumulateStockRows(new Map(), [
+        { code: 'A', warehouse_id: '626700000004', amount: '3' },
+        { code: 'A', warehouse_id: '626700000099', amount: '7' },
+        { code: 'B', amount: '2' }, // no warehouse_id on the row → kept
+    ], '626700000004');
+    assert.equal(map.get('A').free, 3);
+    assert.equal(map.get('B').free, 2);
+});
+
 test('getProductStockAmount returns the free amount, never raw amount', () => {
     const map = accumulateStockRows(new Map(), [{ code: 'A', amount: '10', reserved_amount: '6', free_amount: '4' }]);
     assert.equal(getProductStockAmount(map, 'A'), 4);

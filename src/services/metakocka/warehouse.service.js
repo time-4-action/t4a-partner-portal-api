@@ -19,13 +19,18 @@ function rowFreeAmount(row) {
  * Multiple rows for the same code (e.g. different microlocations) are SUMMED — overwriting would
  * drop stock. Pure (no I/O) so the stock math can be tested without Metakocka.
  * @param {Map<string, {code: string, free: number, amount: number, reserved: number, count_code: string, mk_id: string}>} stockMap - mutated in place
+ *
+ * Rows for another warehouse are dropped: `wh_id_list` is not proven to filter server-side
+ * (Recharge Hub's docs/metakocka-verification.md), and folding them in would over-count.
  * @param {Array<Object>} rows - `stock_list` rows from `warehouse_stock`
+ * @param {string} [warehouseId] - the warehouse asked for; rows carrying a different `warehouse_id` are skipped
  * @returns {Map<string, {code: string, free: number, amount: number, reserved: number, count_code: string, mk_id: string}>} the same Map
  */
-function accumulateStockRows(stockMap, rows) {
+function accumulateStockRows(stockMap, rows, warehouseId) {
     for (const row of rows) {
         const { code, count_code, mk_id } = row;
         if (!code) continue;
+        if (warehouseId && row.warehouse_id != null && String(row.warehouse_id) !== String(warehouseId)) continue;
         const existing = stockMap.get(code);
         if (existing) {
             existing.free += rowFreeAmount(row);
@@ -76,7 +81,7 @@ async function getWarehouseStock(warehouseId = warehouse.t4aMainWarehouseId) {
             break;
         }
 
-        accumulateStockRows(allStock, stockList);
+        accumulateStockRows(allStock, stockList, warehouseId);
         offset += limit;
     }
 
