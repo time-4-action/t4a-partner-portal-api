@@ -27,6 +27,7 @@ process.env.SHOPIFY_API_SECRET = process.env.SHOPIFY_API_SECRET || 'x';
 process.env.SHOPIFY_APP_URL = process.env.SHOPIFY_APP_URL || 'https://example.test';
 
 const assert = require('node:assert/strict');
+const rec = require('./lib/fixtureRecorder');
 
 const { app } = require('../src/app');
 const { connectToDb, getDb } = require('../src/services/db/mongo.service');
@@ -138,6 +139,7 @@ async function main() {
             { code: 'B', categoryId: 'invented', confidence: 0.99, reason: 'not offered' }
         ] };
         r = await call('/ai/categorize', { products: [PRODUCT, { code: 'B', name: 'Mystery', variants: [] }, { code: 'C', name: 'Unanswered' }], categories: CATEGORIES });
+        rec.save('ai-categorize', r.body);
         check('one result per product, in order', () => {
             assert.equal(r.status, 200);
             assert.deepEqual(r.body.results.map((x) => x.code), [PRODUCT_GID, 'B', 'C']);
@@ -179,6 +181,7 @@ async function main() {
             { attributeId: 'unknown', variantId: '', value: 'x', choices: [] }
         ] };
         r = await call('/ai/extract-attributes', { product: PRODUCT, attributes: ATTRIBUTES });
+        rec.save('ai-extract-attributes', r.body);
         check('only values the caller can use, once each', () => {
             assert.equal(r.status, 200);
             assert.deepEqual(r.body.values, [
@@ -190,11 +193,19 @@ async function main() {
 
         nextStop = 'refusal';
         r = await call('/ai/extract-attributes', { product: PRODUCT, attributes: ATTRIBUTES });
+        rec.save('error-502', r.body);
         check('a refusal → 502 ai_failed', () => { assert.equal(r.status, 502); assert.equal(r.body.error.code, 'ai_failed'); });
         nextStop = 'end_turn';
+        const apiKey = process.env.ANTHROPIC_API_KEY;
+        delete process.env.ANTHROPIC_API_KEY;
+        r = await call('/ai/categorize', { products: [PRODUCT], categories: CATEGORIES });
+        process.env.ANTHROPIC_API_KEY = apiKey;
+        rec.save('error-503', r.body);
+        check('AI not configured → 503 ai_unavailable', () => { assert.equal(r.status, 503); assert.equal(r.body.error.code, 'ai_unavailable'); });
     } finally {
         server.close();
     }
+    if (failures === 0) rec.flush();
     console.log(failures === 0 ? '\nall good' : `\n${failures} failure(s)`);
     process.exit(failures === 0 ? 0 : 1);
 }

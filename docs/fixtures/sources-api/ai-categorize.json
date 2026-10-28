@@ -1,0 +1,22 @@
+{
+  "results": [
+    {
+      "code": "gid://shopify/Product/42",
+      "categoryId": "wave",
+      "confidence": 0.93,
+      "reason": "A wave sail by name and supplier category."
+    },
+    {
+      "code": "B",
+      "categoryId": null,
+      "confidence": null,
+      "reason": "not offered"
+    },
+    {
+      "code": "C",
+      "categoryId": null,
+      "confidence": null,
+      "reason": null
+    }
+  ]
+}

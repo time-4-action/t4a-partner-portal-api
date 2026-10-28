@@ -1,0 +1,14 @@
+{
+  "run": {
+    "id": "000000000000000000000004",
+    "sourceId": "sc_fixture1",
+    "status": "running",
+    "triggeredBy": "api:Recharge Hub",
+    "queuedAt": "2026-01-01T09:02:00.000Z",
+    "startedAt": "2026-01-01T09:02:00.000Z",
+    "finishedAt": null,
+    "itemCount": 0,
+    "message": "Running",
+    "downloadUrl": null
+  }
+}

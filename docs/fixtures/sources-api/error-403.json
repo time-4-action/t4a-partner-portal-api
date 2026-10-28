@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "shop_mismatch",
+    "message": "This API key was issued for a different store."
+  }
+}

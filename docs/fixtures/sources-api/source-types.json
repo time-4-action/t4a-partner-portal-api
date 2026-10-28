@@ -1,0 +1,595 @@
+{
+  "types": [
+    {
+      "kind": "export_config:000000000000000000000002",
+      "label": "Recharge catalogue",
+      "description": "A filtered view of the Time 4 Action catalogue, pushed to one location.",
+      "fields": [
+        {
+          "key": "locationId",
+          "label": "Location",
+          "type": "select",
+          "required": true,
+          "group": "Store",
+          "help": "The Shopify location this source stocks. Other locations are activated at zero, never written.",
+          "options": [
+            {
+              "value": "gid://shopify/Location/1",
+              "label": "Main warehouse"
+            },
+            {
+              "value": "gid://shopify/Location/2",
+              "label": "Brand corner"
+            }
+          ]
+        },
+        {
+          "key": "ownership",
+          "label": "How much the portal owns",
+          "type": "select",
+          "required": true,
+          "group": "What to sync",
+          "options": [
+            {
+              "value": "stock_only",
+              "label": "Stock only — the portal writes stock, nothing else"
+            },
+            {
+              "value": "create_then_handoff",
+              "label": "Create, then hand off — new products are created, then the store owns them"
+            },
+            {
+              "value": "portal_authoritative",
+              "label": "Portal authoritative — the portal maintains every synced field"
+            }
+          ]
+        },
+        {
+          "key": "syncStock",
+          "label": "Stock",
+          "type": "boolean",
+          "group": "What to sync",
+          "help": "Free-to-sell quantities, every run."
+        },
+        {
+          "key": "syncNewProducts",
+          "label": "New products",
+          "type": "boolean",
+          "group": "What to sync",
+          "help": "Products the store does not have yet are created. Needs an ownership mode other than stock only."
+        },
+        {
+          "key": "syncPrices",
+          "label": "Prices",
+          "type": "boolean",
+          "group": "What to sync"
+        },
+        {
+          "key": "syncDescriptions",
+          "label": "Descriptions",
+          "type": "boolean",
+          "group": "What to sync"
+        },
+        {
+          "key": "syncTags",
+          "label": "Tags",
+          "type": "boolean",
+          "group": "What to sync",
+          "help": "Whether tags reach products already in the store is decided by the ownership mode."
+        },
+        {
+          "key": "syncImages",
+          "label": "Images",
+          "type": "boolean",
+          "group": "What to sync"
+        },
+        {
+          "key": "reviewNewProducts",
+          "label": "Hold new products for review",
+          "type": "boolean",
+          "group": "Review before publish",
+          "help": "New products wait as hidden drafts until someone approves them on the Review page. Works with New products on; products already in the store are not held."
+        },
+        {
+          "key": "pricelistPriority",
+          "label": "Pricelist priority",
+          "type": "text",
+          "group": "Pricing",
+          "placeholder": "RRP 2026",
+          "help": "Pricelist names in the order to try, comma-separated. Known: RRP 2026."
+        },
+        {
+          "key": "priceVatMode",
+          "label": "VAT in pricelists",
+          "type": "select",
+          "group": "Pricing",
+          "options": [
+            {
+              "value": "inclusive",
+              "label": "Pricelist prices include VAT"
+            },
+            {
+              "value": "exclusive",
+              "label": "Pricelist prices exclude VAT"
+            }
+          ]
+        },
+        {
+          "key": "priceFactor",
+          "label": "Price multiplier",
+          "type": "number",
+          "group": "Pricing",
+          "help": "1 leaves prices unchanged. Applied before rounding."
+        },
+        {
+          "key": "futureDatedGuard",
+          "label": "Ignore future-dated pricelists",
+          "type": "boolean",
+          "group": "Pricing"
+        },
+        {
+          "key": "compareAtPricelist",
+          "label": "Compare-at pricelist",
+          "type": "select",
+          "group": "Pricing",
+          "help": "The pricelist pushed as the struck-through \"was\" price. Leave empty to never send a compare-at.",
+          "options": [
+            {
+              "value": "RRP 2026",
+              "label": "RRP 2026"
+            }
+          ]
+        },
+        {
+          "key": "priceFields",
+          "label": "Price fields the portal maintains",
+          "type": "select",
+          "group": "Pricing",
+          "options": [
+            {
+              "value": "price_and_compare_at",
+              "label": "Price and compare-at"
+            },
+            {
+              "value": "price_only",
+              "label": "Price only"
+            },
+            {
+              "value": "compare_at_only",
+              "label": "Compare-at only"
+            }
+          ],
+          "help": "Only matters with a compare-at pricelist."
+        },
+        {
+          "key": "existingSalePolicy",
+          "label": "When the store already runs a sale",
+          "type": "select",
+          "group": "Pricing",
+          "options": [
+            {
+              "value": "overwrite",
+              "label": "Overwrite the sale with the portal prices"
+            },
+            {
+              "value": "leave",
+              "label": "Leave the sale alone"
+            },
+            {
+              "value": "price_only",
+              "label": "Update the price, keep the compare-at"
+            },
+            {
+              "value": "compare_at_only",
+              "label": "Update the compare-at, keep the price"
+            }
+          ]
+        },
+        {
+          "key": "rounding_enabled",
+          "label": "Round shelf prices",
+          "type": "boolean",
+          "group": "Price rounding",
+          "help": "Snap every pushed price to a step and an ending, after the multiplier."
+        },
+        {
+          "key": "rounding_mode",
+          "label": "Direction",
+          "type": "select",
+          "group": "Price rounding",
+          "options": [
+            {
+              "value": "up",
+              "label": "Up"
+            },
+            {
+              "value": "down",
+              "label": "Down"
+            },
+            {
+              "value": "nearest",
+              "label": "Nearest"
+            }
+          ]
+        },
+        {
+          "key": "rounding_step",
+          "label": "Step",
+          "type": "number",
+          "group": "Price rounding",
+          "help": "10 with an ending of 9 gives 2039; 1 with 0.99 gives 2039.99."
+        },
+        {
+          "key": "rounding_offset",
+          "label": "Ending",
+          "type": "number",
+          "group": "Price rounding",
+          "help": "Between 0 and the step."
+        },
+        {
+          "key": "rounding_always_advance",
+          "label": "Move a price that already ends right",
+          "type": "boolean",
+          "group": "Price rounding",
+          "help": "Off is the safe reading: a price that already fits is left alone."
+        },
+        {
+          "key": "variantOptionName",
+          "label": "Variant option name",
+          "type": "text",
+          "group": "Products the portal creates",
+          "placeholder": "Size",
+          "help": "What shoppers see next to the variant choices of a product the portal creates, e.g. Size or Volume. Empty uses the default."
+        },
+        {
+          "key": "titlePrefix",
+          "label": "Title prefix",
+          "type": "text",
+          "group": "Products the portal creates",
+          "placeholder": "{vendor} -",
+          "help": "Put before every pushed product title. Pick fields such as the vendor or category; each product fills in its own. Empty for none.",
+          "tokens": [
+            {
+              "key": "vendor",
+              "label": "Vendor",
+              "example": null
+            },
+            {
+              "key": "product_type",
+              "label": "Product type",
+              "example": null
+            },
+            {
+              "key": "category",
+              "label": "Category",
+              "example": null
+            },
+            {
+              "key": "subcategory",
+              "label": "Subcategory",
+              "example": null
+            },
+            {
+              "key": "code",
+              "label": "Product code",
+              "example": null
+            }
+          ]
+        },
+        {
+          "key": "aiExportId",
+          "label": "Category set for tags",
+          "type": "select",
+          "group": "Products the portal creates",
+          "options": [
+            {
+              "value": "000000000000000000000003",
+              "label": "Recharge categories"
+            }
+          ],
+          "help": "Which AI category set supplies this store's tags."
+        },
+        {
+          "key": "publication:gid://shopify/Publication/10",
+          "label": "Online Store",
+          "type": "boolean",
+          "group": "Sales channels",
+          "help": "Products the portal creates are published to this channel."
+        }
+      ]
+    },
+    {
+      "kind": "own_source:point7",
+      "label": "Point-7",
+      "description": "An Own Source feed the portal imports, pushed to one location.",
+      "fields": [
+        {
+          "key": "locationId",
+          "label": "Location",
+          "type": "select",
+          "required": true,
+          "group": "Store",
+          "help": "The Shopify location this source stocks. Other locations are activated at zero, never written.",
+          "options": [
+            {
+              "value": "gid://shopify/Location/1",
+              "label": "Main warehouse"
+            },
+            {
+              "value": "gid://shopify/Location/2",
+              "label": "Brand corner"
+            }
+          ]
+        },
+        {
+          "key": "ownership",
+          "label": "How much the portal owns",
+          "type": "select",
+          "required": true,
+          "group": "What to sync",
+          "options": [
+            {
+              "value": "stock_only",
+              "label": "Stock only — the portal writes stock, nothing else"
+            },
+            {
+              "value": "create_then_handoff",
+              "label": "Create, then hand off — new products are created, then the store owns them"
+            },
+            {
+              "value": "portal_authoritative",
+              "label": "Portal authoritative — the portal maintains every synced field"
+            }
+          ]
+        },
+        {
+          "key": "syncStock",
+          "label": "Stock",
+          "type": "boolean",
+          "group": "What to sync",
+          "help": "Free-to-sell quantities, every run."
+        },
+        {
+          "key": "syncNewProducts",
+          "label": "New products",
+          "type": "boolean",
+          "group": "What to sync",
+          "help": "Products the store does not have yet are created. Needs an ownership mode other than stock only."
+        },
+        {
+          "key": "syncPrices",
+          "label": "Prices",
+          "type": "boolean",
+          "group": "What to sync"
+        },
+        {
+          "key": "syncDescriptions",
+          "label": "Descriptions",
+          "type": "boolean",
+          "group": "What to sync"
+        },
+        {
+          "key": "syncTags",
+          "label": "Tags",
+          "type": "boolean",
+          "group": "What to sync",
+          "help": "Whether tags reach products already in the store is decided by the ownership mode."
+        },
+        {
+          "key": "syncImages",
+          "label": "Images",
+          "type": "boolean",
+          "group": "What to sync"
+        },
+        {
+          "key": "reviewNewProducts",
+          "label": "Hold new products for review",
+          "type": "boolean",
+          "group": "Review before publish",
+          "help": "New products wait as hidden drafts until someone approves them on the Review page. Works with New products on; products already in the store are not held."
+        },
+        {
+          "key": "pricelistPriority",
+          "label": "Pricelist priority",
+          "type": "text",
+          "group": "Pricing",
+          "placeholder": "RRP 2026",
+          "help": "Pricelist names in the order to try, comma-separated. Known: RRP 2026."
+        },
+        {
+          "key": "priceVatMode",
+          "label": "VAT in pricelists",
+          "type": "select",
+          "group": "Pricing",
+          "options": [
+            {
+              "value": "inclusive",
+              "label": "Pricelist prices include VAT"
+            },
+            {
+              "value": "exclusive",
+              "label": "Pricelist prices exclude VAT"
+            }
+          ]
+        },
+        {
+          "key": "priceFactor",
+          "label": "Price multiplier",
+          "type": "number",
+          "group": "Pricing",
+          "help": "1 leaves prices unchanged. Applied before rounding."
+        },
+        {
+          "key": "futureDatedGuard",
+          "label": "Ignore future-dated pricelists",
+          "type": "boolean",
+          "group": "Pricing"
+        },
+        {
+          "key": "compareAtPricelist",
+          "label": "Compare-at pricelist",
+          "type": "select",
+          "group": "Pricing",
+          "help": "The pricelist pushed as the struck-through \"was\" price. Leave empty to never send a compare-at.",
+          "options": [
+            {
+              "value": "RRP 2026",
+              "label": "RRP 2026"
+            }
+          ]
+        },
+        {
+          "key": "priceFields",
+          "label": "Price fields the portal maintains",
+          "type": "select",
+          "group": "Pricing",
+          "options": [
+            {
+              "value": "price_and_compare_at",
+              "label": "Price and compare-at"
+            },
+            {
+              "value": "price_only",
+              "label": "Price only"
+            },
+            {
+              "value": "compare_at_only",
+              "label": "Compare-at only"
+            }
+          ],
+          "help": "Only matters with a compare-at pricelist."
+        },
+        {
+          "key": "existingSalePolicy",
+          "label": "When the store already runs a sale",
+          "type": "select",
+          "group": "Pricing",
+          "options": [
+            {
+              "value": "overwrite",
+              "label": "Overwrite the sale with the portal prices"
+            },
+            {
+              "value": "leave",
+              "label": "Leave the sale alone"
+            },
+            {
+              "value": "price_only",
+              "label": "Update the price, keep the compare-at"
+            },
+            {
+              "value": "compare_at_only",
+              "label": "Update the compare-at, keep the price"
+            }
+          ]
+        },
+        {
+          "key": "rounding_enabled",
+          "label": "Round shelf prices",
+          "type": "boolean",
+          "group": "Price rounding",
+          "help": "Snap every pushed price to a step and an ending, after the multiplier."
+        },
+        {
+          "key": "rounding_mode",
+          "label": "Direction",
+          "type": "select",
+          "group": "Price rounding",
+          "options": [
+            {
+              "value": "up",
+              "label": "Up"
+            },
+            {
+              "value": "down",
+              "label": "Down"
+            },
+            {
+              "value": "nearest",
+              "label": "Nearest"
+            }
+          ]
+        },
+        {
+          "key": "rounding_step",
+          "label": "Step",
+          "type": "number",
+          "group": "Price rounding",
+          "help": "10 with an ending of 9 gives 2039; 1 with 0.99 gives 2039.99."
+        },
+        {
+          "key": "rounding_offset",
+          "label": "Ending",
+          "type": "number",
+          "group": "Price rounding",
+          "help": "Between 0 and the step."
+        },
+        {
+          "key": "rounding_always_advance",
+          "label": "Move a price that already ends right",
+          "type": "boolean",
+          "group": "Price rounding",
+          "help": "Off is the safe reading: a price that already fits is left alone."
+        },
+        {
+          "key": "variantOptionName",
+          "label": "Variant option name",
+          "type": "text",
+          "group": "Products the portal creates",
+          "placeholder": "Size",
+          "help": "What shoppers see next to the variant choices of a product the portal creates, e.g. Size or Volume. Empty uses the default."
+        },
+        {
+          "key": "titlePrefix",
+          "label": "Title prefix",
+          "type": "text",
+          "group": "Products the portal creates",
+          "placeholder": "{vendor} -",
+          "help": "Put before every pushed product title. Pick fields such as the vendor or category; each product fills in its own. Empty for none.",
+          "tokens": [
+            {
+              "key": "vendor",
+              "label": "Vendor",
+              "example": null
+            },
+            {
+              "key": "product_type",
+              "label": "Product type",
+              "example": null
+            },
+            {
+              "key": "category",
+              "label": "Category",
+              "example": null
+            },
+            {
+              "key": "subcategory",
+              "label": "Subcategory",
+              "example": null
+            },
+            {
+              "key": "code",
+              "label": "Product code",
+              "example": null
+            }
+          ]
+        },
+        {
+          "key": "aiExportId",
+          "label": "Category set for tags",
+          "type": "select",
+          "group": "Products the portal creates",
+          "options": [],
+          "help": "No category set is available for this source."
+        },
+        {
+          "key": "publication:gid://shopify/Publication/10",
+          "label": "Online Store",
+          "type": "boolean",
+          "group": "Sales channels",
+          "help": "Products the portal creates are published to this channel."
+        }
+      ]
+    }
+  ]
+}

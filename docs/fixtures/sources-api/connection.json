@@ -1,0 +1,13 @@
+{
+  "tenant": {
+    "id": "000000000000000000000001",
+    "name": "Recharge smoke"
+  },
+  "shop": {
+    "domain": "recharge-smoke.myshopify.com"
+  },
+  "key": {
+    "name": "Recharge Hub",
+    "createdAt": "2026-01-01T09:01:00.000Z"
+  }
+}

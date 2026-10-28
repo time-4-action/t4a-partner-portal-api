@@ -1,0 +1,40 @@
+{
+  "runs": [
+    {
+      "id": "000000000000000000000005",
+      "sourceId": "sc_fixture3",
+      "status": "running",
+      "triggeredBy": "api:Recharge Hub",
+      "queuedAt": "2026-01-01T09:04:00.000Z",
+      "startedAt": "2026-01-01T09:04:00.000Z",
+      "finishedAt": null,
+      "itemCount": 0,
+      "message": "Running",
+      "downloadUrl": null
+    },
+    {
+      "id": "000000000000000000000007",
+      "sourceId": "sc_fixture3",
+      "status": "completed",
+      "triggeredBy": "api:Recharge Hub",
+      "queuedAt": "2026-01-01T09:08:00.000Z",
+      "startedAt": "2026-01-01T09:08:00.000Z",
+      "finishedAt": "2026-01-01T09:09:00.000Z",
+      "itemCount": 12,
+      "message": "12 stock · 12 prices",
+      "downloadUrl": null
+    },
+    {
+      "id": "000000000000000000000008",
+      "sourceId": "sc_fixture3",
+      "status": "failed",
+      "triggeredBy": "api:Recharge Hub",
+      "queuedAt": "2026-01-01T09:10:00.000Z",
+      "startedAt": "2026-01-01T09:10:00.000Z",
+      "finishedAt": "2026-01-01T09:11:00.000Z",
+      "itemCount": 0,
+      "message": "Shopify refused the access token",
+      "downloadUrl": null
+    }
+  ]
+}

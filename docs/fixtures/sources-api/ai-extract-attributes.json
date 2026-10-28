@@ -1,0 +1,21 @@
+{
+  "values": [
+    {
+      "attributeId": "size",
+      "variantId": "gid://shopify/ProductVariant/1",
+      "value": "5.3"
+    },
+    {
+      "attributeId": "battens",
+      "variantId": null,
+      "value": "4"
+    },
+    {
+      "attributeId": "use",
+      "variantId": null,
+      "value": [
+        "wave"
+      ]
+    }
+  ]
+}

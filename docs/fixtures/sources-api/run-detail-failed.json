@@ -1,0 +1,31 @@
+{
+  "run": {
+    "id": "000000000000000000000008",
+    "sourceId": "sc_fixture3",
+    "status": "failed",
+    "triggeredBy": "api:Recharge Hub",
+    "queuedAt": "2026-01-01T09:10:00.000Z",
+    "startedAt": "2026-01-01T09:10:00.000Z",
+    "finishedAt": "2026-01-01T09:11:00.000Z",
+    "itemCount": 0,
+    "message": "Shopify refused the access token",
+    "downloadUrl": null
+  },
+  "log": [
+    {
+      "at": "2026-01-01T09:10:00.000Z",
+      "level": "info",
+      "message": "Started (api:Recharge Hub)."
+    },
+    {
+      "at": "2026-01-01T09:10:00.000Z",
+      "level": "info",
+      "message": "point7: 0 products, stock_only."
+    },
+    {
+      "at": "2026-01-01T09:11:00.000Z",
+      "level": "error",
+      "message": "Finished failed — Shopify refused the access token."
+    }
+  ]
+}
