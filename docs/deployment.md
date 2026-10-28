@@ -4,6 +4,8 @@
 
 ## Environment Variables
 
+The complete list, with defaults and what breaks without each, is `env.md` (checked against the code by a test). The table below is the quick reference.
+
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `PORT` | No | `3000` | HTTP server port |

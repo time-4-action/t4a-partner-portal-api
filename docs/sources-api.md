@@ -88,6 +88,11 @@ SourceSummary { id, name, kind, kindLabel, enabled, destination, schedule, healt
 Run           { id, sourceId, status, triggeredBy, queuedAt, startedAt, finishedAt, itemCount, message, downloadUrl }
   status       running→running · done→completed · partial→completed (message carries the counts) · failed→failed
   itemCount    that scope's `products` from the run summary, else counts.inScope
+  sourceId     always the scope id stored on the run, never "". `GET /runs/:id` for a run that records
+               no scope answers 404 instead.
+Source (detail) = SourceSummary + { fields, values, createdAt, updatedAt, portalUrl }
+  portalUrl    absolute http(s) URL from SHOPIFY_PORTAL_RETURN_URL; the key is omitted (not null, not
+               "/") when the variable is unset or relative. Recharge Hub's contract rejects relative URLs.
 ```
 
 ### Fields
