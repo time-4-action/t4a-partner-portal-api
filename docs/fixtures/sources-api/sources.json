@@ -1,0 +1,86 @@
+{
+  "sources": [
+    {
+      "id": "sc_fixture2",
+      "name": "Recharge catalogue → Main warehouse",
+      "kind": "export_config:000000000000000000000002",
+      "kindLabel": "Recharge catalogue",
+      "enabled": true,
+      "destination": "Recharge smoke · Main warehouse",
+      "schedule": {
+        "mode": "manual",
+        "description": null,
+        "nextRunAt": null
+      },
+      "health": "never_ran",
+      "lastRun": null
+    },
+    {
+      "id": "sc_fixture3",
+      "name": "Point-7 (with runs)",
+      "kind": "own_source:point7",
+      "kindLabel": "Point-7",
+      "enabled": true,
+      "destination": "Recharge smoke · Brand corner",
+      "schedule": {
+        "mode": "automatic",
+        "description": "Every day at 04:00 (Europe/Ljubljana), after the feed imports",
+        "nextRunAt": "2026-01-01T09:03:00.000Z"
+      },
+      "health": "ok",
+      "lastRun": {
+        "id": "000000000000000000000005",
+        "sourceId": "sc_fixture3",
+        "status": "running",
+        "triggeredBy": "api:Recharge Hub",
+        "queuedAt": "2026-01-01T09:04:00.000Z",
+        "startedAt": "2026-01-01T09:04:00.000Z",
+        "finishedAt": null,
+        "itemCount": 0,
+        "message": "Running",
+        "downloadUrl": null
+      }
+    },
+    {
+      "id": "sc_fixture4",
+      "name": "Point-7 (failing)",
+      "kind": "own_source:point7",
+      "kindLabel": "Point-7",
+      "enabled": true,
+      "destination": "Recharge smoke · Brand corner",
+      "schedule": {
+        "mode": "automatic",
+        "description": "Every day at 04:00 (Europe/Ljubljana), after the feed imports",
+        "nextRunAt": "2026-01-01T09:03:00.000Z"
+      },
+      "health": "needs_attention",
+      "lastRun": {
+        "id": "000000000000000000000006",
+        "sourceId": "sc_fixture4",
+        "status": "failed",
+        "triggeredBy": "api:Recharge Hub",
+        "queuedAt": "2026-01-01T09:05:00.000Z",
+        "startedAt": "2026-01-01T09:05:00.000Z",
+        "finishedAt": "2026-01-01T09:06:00.000Z",
+        "itemCount": 0,
+        "message": "Shopify refused the access token",
+        "downloadUrl": null
+      }
+    },
+    {
+      "id": "sc_fixture5",
+      "name": "Point-7 (paused)",
+      "kind": "own_source:point7",
+      "kindLabel": "Point-7",
+      "enabled": false,
+      "destination": "Recharge smoke · Brand corner",
+      "schedule": {
+        "mode": "automatic",
+        "description": "Every day at 04:00 (Europe/Ljubljana), after the feed imports",
+        "nextRunAt": "2026-01-01T09:03:00.000Z"
+      },
+      "health": "off",
+      "lastRun": null
+    }
+  ]
+}

@@ -48,7 +48,7 @@ Internal admin surface (bearer-gated by `internalAdminToken` / `PARTNER_ADMIN_TO
 | `/api/admin/partners` | `src/routes/adminPartnersRoutes.js` — per-partner insight |
 | `/api/admin/system` | `src/routes/adminSystemRoutes.js` — scheduler status + manual triggers (`GET /sync`, `POST /sync/pnv/run` full pipeline, `POST /sync/own-sources/:feedId/run`). Backed by `pnvScheduler.getStatus()` / `runManualRefresh()`. |
 
-The **Sources API** (`/api/v1`, `src/routes/sourcesApiRoutes.js`, design `docs/sources-api.md`) is a versioned machine contract for another product (Recharge Hub) to configure and run ONE connected store's Shopify sources. Bearer-gated by a per-connection API key (`sourcesApiAuth.js`) bound to the store's domain; not JWT. It is a translation over `shopify_connections.config.scopes[]` and `shopify_sync_jobs` (`sourcesApi.service.js`) — scopes carry a stable `id`/`name`/`enabled` for it, and a run can target specific scope ids. Smoke test: `scripts/sources-api-smoke.js`.
+The **Sources API** (`/api/v1`, `src/routes/sourcesApiRoutes.js`, design `docs/sources-api.md`) is a versioned machine contract for another product (Recharge Hub) to configure and run ONE connected store's Shopify sources. Bearer-gated by a per-connection API key (`sourcesApiAuth.js`) bound to the store's domain; not JWT. It is a translation over `shopify_connections.config.scopes[]` and `shopify_sync_jobs` (`sourcesApi.service.js`) — scopes carry a stable `id`/`name`/`enabled` for it, and a run can target specific scope ids. Smoke test: `scripts/sources-api-smoke.js` (`--record` writes the contract fixtures to `docs/fixtures/sources-api/`, see its README; the AI smoke adds the `/ai/*` and 502/503 ones).
 
 ### Authentication
 

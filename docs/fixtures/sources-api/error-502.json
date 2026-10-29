@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "ai_failed",
+    "message": "The AI model declined to answer for this product."
+  }
+}

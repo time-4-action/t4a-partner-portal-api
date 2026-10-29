@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "ai_unavailable",
+    "message": "AI is not configured on the export portal."
+  }
+}

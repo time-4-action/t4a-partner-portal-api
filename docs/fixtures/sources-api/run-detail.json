@@ -1,0 +1,31 @@
+{
+  "run": {
+    "id": "000000000000000000000007",
+    "sourceId": "sc_fixture3",
+    "status": "completed",
+    "triggeredBy": "api:Recharge Hub",
+    "queuedAt": "2026-01-01T09:08:00.000Z",
+    "startedAt": "2026-01-01T09:08:00.000Z",
+    "finishedAt": "2026-01-01T09:09:00.000Z",
+    "itemCount": 12,
+    "message": "12 stock · 12 prices",
+    "downloadUrl": null
+  },
+  "log": [
+    {
+      "at": "2026-01-01T09:08:00.000Z",
+      "level": "info",
+      "message": "Started (api:Recharge Hub)."
+    },
+    {
+      "at": "2026-01-01T09:08:00.000Z",
+      "level": "info",
+      "message": "point7: 12 products, stock_only."
+    },
+    {
+      "at": "2026-01-01T09:09:00.000Z",
+      "level": "info",
+      "message": "Finished done — 12 stock · 12 prices."
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "missing_key",
+    "message": "Send the API key as a bearer token."
+  }
+}

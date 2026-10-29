@@ -28,6 +28,7 @@ process.env.SHOPIFY_API_SECRET = process.env.SHOPIFY_API_SECRET || 'x';
 process.env.SHOPIFY_APP_URL = process.env.SHOPIFY_APP_URL || 'https://example.test';
 
 const assert = require('node:assert/strict');
+const rec = require('./lib/fixtureRecorder');
 
 // ── Stubs: nothing reaches Shopify ──────────────────────────────────────────
 const graphql = require('../src/services/shopify/shopifyGraphql.service');
@@ -53,6 +54,7 @@ const connectionService = require('../src/services/shopify/shopifyConnection.ser
 const { encryptToken } = require('../src/services/shopify/crypto.service');
 const { createConnectionApiKey } = require('../src/services/shopify/connectionApiKey.service');
 const syncService = require('../src/services/shopify/shopifySync.service');
+const syncJobs = require('../src/services/shopify/shopifySyncJobs.service');
 
 const SHOP = 'recharge-smoke.myshopify.com';
 
@@ -106,15 +108,15 @@ async function main() {
 
     try {
         console.log('auth');
-        let r = await call('GET', '/connection', { key: null }); check('no key → 401 missing_key', () => { assert.equal(r.status, 401); assert.equal(r.body.error.code, 'missing_key'); });
+        let r = await call('GET', '/connection', { key: null }); rec.save('error-401', r.body); check('no key → 401 missing_key', () => { assert.equal(r.status, 401); assert.equal(r.body.error.code, 'missing_key'); });
         r = await call('GET', '/connection', { key: 'sk_t4a_deadbeef' }); check('unknown key → 401', () => assert.equal(r.status, 401));
-        r = await call('GET', '/connection', { shop: 'other.myshopify.com' }); check('wrong shop → 403 shop_mismatch', () => { assert.equal(r.status, 403); assert.equal(r.body.error.code, 'shop_mismatch'); });
-        r = await call('GET', '/connection'); check('connection names the tenant, shop and key', () => {
+        r = await call('GET', '/connection', { shop: 'other.myshopify.com' }); rec.save('error-403', r.body); check('wrong shop → 403 shop_mismatch', () => { assert.equal(r.status, 403); assert.equal(r.body.error.code, 'shop_mismatch'); });
+        r = await call('GET', '/connection'); rec.save('connection', r.body); check('connection names the tenant, shop and key', () => {
             assert.equal(r.status, 200); assert.equal(r.body.tenant.name, 'Recharge smoke'); assert.equal(r.body.shop.domain, SHOP); assert.equal(r.body.key.name, 'Recharge Hub');
         });
 
         console.log('source types');
-        r = await call('GET', '/source-types'); check('two kinds with fields and live locations', () => {
+        r = await call('GET', '/source-types'); rec.save('source-types', r.body); check('two kinds with fields and live locations', () => {
             assert.equal(r.status, 200); assert.equal(r.body.types.length, 2);
             const kinds = r.body.types.map((t) => t.kind).sort();
             assert.deepEqual(kinds, [`export_config:${exportId}`, 'own_source:point7']);
@@ -136,6 +138,7 @@ async function main() {
 
         console.log('create');
         r = await call('POST', '/sources', { body: { kind: 'own_source:point7', name: '', values: {} } });
+        rec.save('error-422', r.body);
         check('empty name → 422 with field error', () => { assert.equal(r.status, 422); assert.equal(r.body.errors[0].field, 'name'); });
         r = await call('POST', '/sources', { body: { kind: 'own_source:point7', name: 'Point-7 corner', values: { ownership: 'create_then_handoff', priceFactor: 'abc' } } });
         check('no location + bad factor → 422 naming both', () => {
@@ -172,6 +175,7 @@ async function main() {
             assert.equal(s.values['publication:gid://shopify/Publication/10'], false); assert.equal(s.values.priceFactor, 1.2);
         });
         r = await call('POST', `/sources/${feedSourceId}/runs`, { body: {} });
+        rec.save('error-409', r.body);
         check('running a switched-off source → 409', () => { assert.equal(r.status, 409); assert.equal(r.body.error.code, 'source_off'); });
         r = await call('PATCH', `/sources/${feedSourceId}`, { body: { enabled: true } }); check('turned back on', () => assert.equal(r.body.source.enabled, true));
 
@@ -188,6 +192,7 @@ async function main() {
         console.log('runs');
         r = await call('POST', `/sources/${feedSourceId}/runs`, { body: {} });
         check('run accepted (202) for the one source', () => { assert.equal(r.status, 202); assert.equal(r.body.run.sourceId, feedSourceId); assert.ok(['queued', 'running', 'completed'].includes(r.body.run.status)); });
+        rec.save('run-started', r.body);
         const runId = r.body.run.id;
         await new Promise((resolve) => setTimeout(resolve, 300));
         r = await call('GET', `/sources/${feedSourceId}/runs?limit=5`); check('the run is listed for its source, completed', () => {
@@ -199,7 +204,7 @@ async function main() {
             assert.equal(r.status, 200); assert.equal(r.body.run.id, runId); assert.ok(r.body.log.length >= 2); assert.equal(r.body.log[0].level, 'info');
         });
         r = await call('GET', '/sources'); check('health is ok after a clean run', () => assert.equal(r.body.sources.find((s) => s.id === feedSourceId).health, 'ok'));
-        r = await call('GET', '/runs/000000000000000000000000'); check('unknown run → 404', () => assert.equal(r.status, 404));
+        r = await call('GET', '/runs/000000000000000000000000'); rec.save('error-404', r.body); check('unknown run → 404', () => assert.equal(r.status, 404));
 
         console.log('delete');
         r = await call('DELETE', `/sources/${feedSourceId}`); check('delete → 204', () => assert.equal(r.status, 204));
@@ -267,9 +272,40 @@ async function main() {
         check('the review tags alone are not drift', () => assert.equal(ups.length, 0));
         ups = await maintained([], { liveFails: true });
         check('blind to the live tags, tags are not written', () => { assert.equal(ups.length, 1); assert.equal(ups[0].tags, undefined); assert.equal(ups[0].title, 'Foil'); });
+
+        if (rec.enabled) {
+            // Fixture states the walk above does not reach. Rows are written the way the engine writes
+            // them (startRun / finishRun); the replies still come from the real routes.
+            console.log('recording fixtures (--record)');
+            const mk = async (name, values = {}) => (await call('POST', '/sources', { body: { kind: 'own_source:point7', name, values: { locationId: 'gid://shopify/Location/2', ownership: 'create_then_handoff', ...values } } })).body.source.id;
+            const job = async (sourceId, status, minutesAgo, finish) => {
+                const j = await syncJobs.startRun(connId, SHOP, { trigger: 'api:Recharge Hub', scopeIds: [sourceId] });
+                const at = new Date(Date.now() - minutesAgo * 60_000);
+                await getDb().collection('shopify_sync_jobs').updateOne({ _id: j._id }, { $set: { startedAt: at, createdAt: at } });
+                if (finish) await syncJobs.finishRun(j._id, { status, ...finish, scopes: [{ id: sourceId, type: 'own_source', source: 'point7', products: finish.products ?? 0 }] });
+                return j._id.toString();
+            };
+            const withRuns = await mk('Point-7 (with runs)');
+            await job(withRuns, 'failed', 30, { status: 'failed', error: 'Shopify refused the access token', counts: { inScope: 0 } });
+            const doneId = await job(withRuns, 'done', 20, { status: 'done', counts: { inScope: 12, pushed: 12, pricesPushed: 12 }, products: 12 });
+            await job(withRuns, 'running', 1, null);
+            const failing = await mk('Point-7 (failing)');
+            await job(failing, 'failed', 10, { status: 'failed', error: 'Shopify refused the access token', counts: { inScope: 0 } });
+            const off = await mk('Point-7 (paused)');
+            await call('PATCH', `/sources/${off}`, { body: { enabled: false } });
+            r = await call('GET', '/sources'); rec.save('sources', r.body);
+            check('recorded list has every health', () => assert.deepEqual([...new Set(r.body.sources.map((x) => x.health))].sort(), ['needs_attention', 'never_ran', 'off', 'ok']));
+            r = await call('GET', `/sources/${withRuns}`); rec.save('source', r.body);
+            check('recorded source carries tokens', () => assert.ok(r.body.source.fields.find((f) => f.key === 'titlePrefix').tokens.length > 0));
+            r = await call('GET', `/sources/${withRuns}/runs`); rec.save('runs', r.body);
+            check('recorded runs cover running, completed, failed', () => assert.deepEqual(r.body.runs.map((x) => x.status).sort(), ['completed', 'failed', 'running']));
+            r = await call('GET', `/runs/${doneId}`); rec.save('run-detail', r.body);
+            r = await call('GET', `/runs/${(await call('GET', `/sources/${withRuns}/runs`)).body.runs.find((x) => x.status === 'failed').id}`); rec.save('run-detail-failed', r.body);
+        }
     } finally {
         server.close();
     }
+    if (failures === 0) rec.flush();
     console.log(failures === 0 ? '\nall good' : `\n${failures} failure(s)`);
     process.exit(failures === 0 ? 0 : 1);
 }

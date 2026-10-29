@@ -622,8 +622,24 @@ async function getSource(connectionId, sourceId) {
         values: valuesFor(connection, scope, ctx.facts),
         createdAt: null,
         updatedAt: connection.updatedAt ? new Date(connection.updatedAt).toISOString() : null,
-        portalUrl: process.env.SHOPIFY_PORTAL_RETURN_URL || null
+        portalUrl: portalUrl()
     };
+}
+
+/**
+ * Where "open in the portal" points. The hub's contract wants an absolute URL, so a relative
+ * return URL (the default `/`) or an unset one is left out rather than sent: a bad value here
+ * makes the hub refuse the whole source ("answered in a form this app does not understand").
+ */
+function portalUrl() {
+    const raw = process.env.SHOPIFY_PORTAL_RETURN_URL;
+    if (!raw) return undefined;
+    try {
+        const url = new URL(raw);
+        return url.protocol === 'https:' || url.protocol === 'http:' ? url.toString() : undefined;
+    } catch {
+        return undefined;
+    }
 }
 
 /** The defaults a source created over the API starts from: the connection's own config. */
@@ -721,7 +737,10 @@ async function getRun(connectionId, runId) {
     if (!job || job.connectionId.toString() !== connection._id.toString()) {
         throw new SourcesApiError(404, 'not_found', 'This run no longer exists in the portal.');
     }
-    const scopeId = (job.scopes || []).find((s) => s.id)?.id || job.scopeIds?.[0] || scopesOf(connection)[0]?.id || '';
+    // The id the run was started for, as stored on the job. Never a guess from the connection's
+    // current scopes (that would name another source) and never '' (the hub refuses it).
+    const scopeId = (job.scopes || []).find((s) => s.id)?.id || job.scopeIds?.[0];
+    if (!scopeId) throw new SourcesApiError(404, 'not_found', 'This run no longer exists in the portal.');
     return { run: toRun(job, scopeId), log: toLog(job) };
 }
 
@@ -742,6 +761,7 @@ module.exports = {
     valuesFor,
     describeFields,
     toRun,
+    portalUrl,
     toLog,
     healthFor,
     parseKind
