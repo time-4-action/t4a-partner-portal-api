@@ -1,0 +1,20 @@
+Time 4 Action Product Sync – Shopify App Demo
+
+Time 4 Action Product Sync connects to your Shopify store and performs a one-way
+push of stock, products, prices, descriptions and images from the portal into
+Shopify. The sync is non-destructive — nothing is ever deleted from your store.
+
+In this demo we install the app, connect a Shopify store with a single OAuth
+approval, point a data source at a Shopify location, choose what to sync, run a
+sync, and verify the products in the Shopify admin.
+
+What gets synced:
+• Stock – live inventory quantities
+• New products – created in your store
+• Prices – kept in step with your pricelists
+• Descriptions, tags and images
+
+Key points:
+• One secure OAuth install — no API keys to copy.
+• One-way push only (portal → Shopify). Your Shopify edits stay safe.
+• Connect multiple stores and sync automatically or on demand.

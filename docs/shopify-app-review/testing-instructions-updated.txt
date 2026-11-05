@@ -1,0 +1,56 @@
+SHOPIFY APP — TESTING INSTRUCTIONS
+
+OVERVIEW
+This app is the install bridge for our Export Portal. It does a one-way push of
+stock, products, prices, descriptions and images from the portal into your Shopify
+store. Nothing is ever deleted from your store. A test account with a source is
+already configured for you.
+
+LOGIN (you'll be asked for these during the install, see step 2)
+- Username: demo
+- Password: password is provided via login details
+
+INSTALL (auto-connect via the link)
+1. Open the install link in your browser. You're taken straight to Shopify's
+   app install/consent screen — click "Install". (No store domain entry needed.)
+2. You land on a short welcome page that explains the portal. Click
+   "Sign in to connect" and log in with the credentials above. (A merchant who
+   isn't a partner can instead use "Request access" on this page to ask for an
+   account.)
+3. You're returned to the Shopify Integration page and the store connects
+   automatically — a green "Store connected successfully." banner shows and the
+   store appears as a pill marked "Active". (No store domain entry needed — the
+   link connects automatically.)
+
+AFTER CONNECT — SET UP THE SYNC
+4. Scroll to "Sources & locations".
+5. In the source row, open the "Source" dropdown and pick the pre-configured
+   source "Patrik · Demo accessories". If no row exists, click "Add source" first.
+6. In the "Shopify location" dropdown, choose where products should be stocked.
+7. Click "Configure" on that row. In the modal:
+   - "How much should we manage?": pick "Create, then leave it to you" (recommended).
+   - "What to sync": enable Stock, New products and Prices.
+   - "Pricing": confirm pricelist order and VAT mode ("Includes/Excludes VAT").
+   - "Sales channels": tick where new products publish (e.g. Online Store).
+   - Click "Save changes".
+8. If a bottom bar shows "Unsaved changes", click its "Save changes" too.
+
+RUN & VERIFY
+9. At the top, click "Sync now" (shows "Syncing…" while it runs).
+10. Watch "Sync activity" — the Synced/Pending/Error counts and the recent-runs
+    table update. Click a run for its detail.
+11. In Shopify admin > Products: pushed items appear with titles, images and
+    descriptions; open a product to confirm variants, prices and inventory at the
+    chosen location.
+
+OPTIONAL
+- "Add store": connect a second store; click a store pill to switch.
+- "Needs attention": lists any variant that couldn't be matched, with a reason.
+- "Disconnect" then "Yes, disconnect": stops syncing; Shopify products stay intact.
+
+NOTES FOR THE REVIEWER
+- Install starts OAuth immediately; after you approve on Shopify you reach a
+  welcome page, sign in, and the store then connects on its own.
+- One-way push (portal -> Shopify); the app never deletes store products.
+- Please don't delete the pre-configured source — use it for the sync test.
+- The "Guide" button (top right) gives a 4-step overview.

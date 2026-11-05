@@ -1,0 +1,20 @@
+Patrik International — Partner Catalog Sync
+
+Tagline:
+Always-on sync with the official Patrik International catalog: stock, prices, content and images
+
+Description:
+Connect your store to the Patrik International partner portal and keep listings
+in sync with the authorized catalog. Stock, prices, titles, descriptions, tags
+and images flow from your approved Patrik International range to the matching
+products. Items match by SKU (barcode fallback); unmatched products are created
+automatically. Choose stock-only or full content sync, and set location,
+pricelist, VAT and sales channels. Once connected it just runs — always-on and
+always up to date.
+
+Features:
+Always-on sync of stock, prices, titles, descriptions, tags and images
+Matches products by SKU with barcode fallback; auto-creates unmatched items
+Stock-only or full content sync, configured per connected store
+Set location, pricelist priority, VAT handling and sales channels per store
+Pulls only your authorized catalog, with Patrik International as the vendor
