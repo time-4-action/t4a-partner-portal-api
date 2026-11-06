@@ -198,3 +198,26 @@ Expected response with all services healthy:
 ```
 
 See [Health Check API](api/health.md) for details on status values and troubleshooting.
+
+## Production on t4a (since 2026-11-06)
+
+Production moved from t2 to t4a (Hetzner, `77.42.42.60`; time-4-action/t4a-infra, `servers/t4a`), together with
+the other apps on the shared `t4a` MongoDB database (t4a-partner-portal-api, t4a-admin, t4a-chat-ui, t4a-mcp).
+Where this document says `/data/stack/apps/time-4-action/export/api` or nginx, that was t2.
+
+- `/srv/export-api` (owned by `deploy`) holds `docker-compose.yaml` (= `deploy/docker-compose.t4a.yaml` in this repo: Traefik labels,
+  loopback port 3001 for the deploy's health check) and `data/` (mounted as `/data`: `.env`, `pnv/`). Traefik (`/srv/edge`) routes `https://api.time-4-action.com/api/*` (only `/api/`, as on t2)
+  here, behind Cloudflare.
+- MongoDB is t4a's shared one (`/srv/mongo`): `MONGO_URI` is `mongodb://export-api:...@mongo:27017/t4a?authSource=t4a`
+  (this app's own user, `readWrite` on `t4a`). The container joins the external `mongo` network.
+- CORS: the app sets no CORS headers; Traefik's `api-cors` middleware (labels in the compose file) sends what
+  nginx did: any origin, the usual methods and headers, `Content-Disposition` exposed, preflight answered.
+- The `production` environment overrides the organization's deploy secrets: `PROD_DEPLOY_HOST` (`77.42.42.60`),
+  `PROD_DEPLOY_SSH_KEY` (the key `github-actions@t4a-partner-portal-api-t4a`, public half in `/home/deploy/.ssh/authorized_keys`
+  on t4a), `PROD_DEPLOY_FINGERPRINT` (t4a's **ECDSA** host key, `SHA256:2wkXWs0QETKFiXKXbxbJRASeNd9I6zigPKVQGBtwfTk`;
+  the Ed25519 one fails with "host key fingerprint mismatch") and the variable `DEPLOY_DIR=/srv/export-api`.
+- The move: the four apps stopped on t2 at 14:38 UTC, `mongodump` of `t4a` restored on t4a (all 34 collections'
+  counts equal, 31,838 documents), the same images started on t4a, then the DNS records (proxied CNAMEs to
+  `production.time-4-action.com`, overriding the `*` wildcard that still points at t2). About 4 minutes down.
+  The t2 containers are stopped, not removed. To go back: delete the DNS record(s), the four settings above,
+  copy the `t4a` database back, then `docker compose start` on t2 (for all four apps together).
