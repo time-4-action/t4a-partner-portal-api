@@ -1,0 +1,49 @@
+# Production compose for /srv/export-api on t4a (Hetzner; time-4-action/t4a-infra, servers/t4a).
+# Save it there as docker-compose.yaml. CI exports APP_IMAGE=ghcr.io/time-4-action/t4a-partner-portal-api:<sha>
+# (DEPLOY_DIR=/srv/export-api on the `production` environment); without it this runs :latest. The server
+# never builds; copy changes to this file by hand.
+#
+# Traefik (/srv/edge) routes https://api.time-4-action.com/api/* here, behind Cloudflare. Only /api/ is
+# routed (as nginx on t2 did; anything else is a 404), and the CORS headers nginx added come from the
+# `api-cors` middleware: the app sets none itself. MongoDB is t4a's shared one (/srv/mongo): MONGO_URI in
+# data/.env is mongodb://export-api:...@mongo:27017/t4a.
+services:
+  t4a-partner-portal-api:
+    image: ${APP_IMAGE:-ghcr.io/time-4-action/t4a-partner-portal-api:latest}
+    restart: unless-stopped
+    # Loopback only, for CI's health check (the workflow reads it with `docker compose port`). Docker-
+    # published ports skip ufw, so never 0.0.0.0.
+    ports:
+      - "127.0.0.1:3001:3000"
+    env_file:
+      - ./data/.env
+    volumes:
+      - ./data:/data
+    mem_limit: 1g
+    networks:
+      - edge
+      - mongo
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=edge
+      - traefik.http.routers.export-api.rule=Host(`api.time-4-action.com`) && PathPrefix(`/api/`)
+      - traefik.http.routers.export-api.middlewares=api-cors
+      - traefik.http.services.export-api.loadbalancer.server.port=3000
+      # What nginx on t2 sent: any origin, these methods and headers, preflight cached a day, and
+      # Content-Disposition readable by the browser (file downloads).
+      - traefik.http.middlewares.api-cors.headers.accessControlAllowOriginList=*
+      - traefik.http.middlewares.api-cors.headers.accessControlAllowMethods=GET,POST,PUT,PATCH,DELETE,OPTIONS
+      - traefik.http.middlewares.api-cors.headers.accessControlAllowHeaders=Authorization,Content-Type,Accept,Origin,X-Requested-With
+      - traefik.http.middlewares.api-cors.headers.accessControlExposeHeaders=Content-Disposition
+      - traefik.http.middlewares.api-cors.headers.accessControlMaxAge=86400
+      - traefik.http.middlewares.api-cors.headers.addVaryHeader=true
+    logging:
+      options:
+        max-size: 10m
+        max-file: "3"
+
+networks:
+  edge:
+    external: true
+  mongo:
+    external: true
